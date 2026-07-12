@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Complaint – Flight Bot{% endblock %}
+{% block content %}
+<p><a class="btn" href="{{ url_for('flight_detail', flight_id=flight.id) }}">← Back to flight</a></p>
+
+<div class="card">
+  <h2 style="margin-top:0">
+    {% if kind == 'gaca' %}Complaint to GACA{% else %}Complaint to {{ letter.airline }}{% endif %}
+    <span class="badge {{ letter.assessment.verdict }}">{{ letter.assessment.label }}</span>
+  </h2>
+
+  <div class="field">
+    <span class="label">Subject</span>
+    <span class="value" id="subj">{{ letter.subject }}</span>
+    <button class="copy" onclick="copyText(this, document.getElementById('subj').textContent)">Copy</button>
+  </div>
+  {% if letter.to %}
+  <div class="field">
+    <span class="label">Send to</span>
+    <span class="value" id="toaddr">{{ letter.to }}</span>
+    <button class="copy" onclick="copyText(this, document.getElementById('toaddr').textContent)">Copy</button>
+  </div>
+  {% endif %}
+
+  <p class="muted" style="margin-top:14px">The letter below is pre-filled with
+  everything scraped from the linked emails — edit anything in brackets before
+  sending.</p>
+  <textarea class="letter" id="letter">{{ letter.body }}</textarea>
+
+  <div class="actions">
+    <button class="btn" onclick="copyText(this, document.getElementById('letter').value)">Copy letter</button>
+    {% if kind == 'gaca' %}
+      <a class="btn primary" href="{{ letter.portal_url }}" target="_blank" rel="noopener">Open GACA complaint portal ↗</a>
+    {% else %}
+      {% if letter.mailto %}<a class="btn" href="{{ letter.mailto }}">Open in my email app</a>{% endif %}
+      {% if letter.complaint_url %}<a class="btn" href="{{ letter.complaint_url }}" target="_blank" rel="noopener">Airline complaint page ↗</a>{% endif %}
+      <form method="post" action="{{ url_for('complaint_airline_send', flight_id=flight.id) }}"
+            onsubmit="return confirm('Send this complaint to {{ letter.to or 'the airline' }} now via your configured SMTP account?')">
+        <input type="hidden" name="to" value="{{ letter.to }}">
+        <button class="btn danger">Send now via my email</button>
+      </form>
+    {% endif %}
+  </div>
+
+  {% if kind == 'gaca' %}
+  <p class="muted" style="margin-top:14px">{{ letter.note }} Phone: {{ letter.phone }}.
+  GACA has no public API for filing complaints, so paste the letter into the
+  portal form — every field above has a copy button to make that fast.</p>
+  {% endif %}
+</div>
+{% endblock %}

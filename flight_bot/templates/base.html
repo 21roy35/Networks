@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Flight Bot{% endblock %}</title>
+<style>
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --ink: #1c2733; --muted: #64748b;
+  --accent: #0f6fde; --line: #e2e8f0;
+  --ok: #157347; --warn: #b45309; --bad: #b91c1c; --unk: #64748b;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+       font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { background: var(--card); border-bottom: 1px solid var(--line);
+         padding: 14px 24px; display: flex; align-items: center; gap: 16px;
+         flex-wrap: wrap; }
+header h1 { font-size: 18px; margin: 0; }
+header h1 a { color: var(--ink); text-decoration: none; }
+header form { margin: 0; }
+main { max-width: 980px; margin: 24px auto; padding: 0 16px; }
+.card { background: var(--card); border: 1px solid var(--line);
+        border-radius: 10px; padding: 18px 20px; margin-bottom: 16px; }
+.btn { display: inline-block; border: 1px solid var(--line); cursor: pointer;
+       background: var(--card); color: var(--ink); border-radius: 8px;
+       padding: 7px 14px; font-size: 14px; text-decoration: none; }
+.btn:hover { border-color: var(--accent); color: var(--accent); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover { filter: brightness(1.1); color: #fff; }
+.btn.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+.flash { background: #ecf5ff; border: 1px solid #bcd9ff; color: #084298;
+         border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; }
+.badge { display: inline-block; border-radius: 999px; padding: 2px 10px;
+         font-size: 12px; font-weight: 600; }
+.badge.eligible { background: #d1f0e0; color: var(--ok); }
+.badge.possibly { background: #fdecce; color: var(--warn); }
+.badge.not_eligible { background: #fadcdc; color: var(--bad); }
+.badge.unknown { background: #e6eaf0; color: var(--unk); }
+.badge.kind { background: #e8eef8; color: #33507a; font-weight: 500; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); }
+tr.rowlink { cursor: pointer; }
+tr.rowlink:hover { background: #f0f6ff; }
+.muted { color: var(--muted); font-size: 13px; }
+.field { display: flex; align-items: center; gap: 10px;
+         padding: 8px 0; border-bottom: 1px dashed var(--line); }
+.field:last-child { border-bottom: none; }
+.field .label { width: 240px; flex: none; color: var(--muted); font-size: 13px; }
+.field .value { flex: 1; font-weight: 600; word-break: break-word; }
+.copy { border: 1px solid var(--line); background: #f8fafc; cursor: pointer;
+        border-radius: 6px; padding: 3px 10px; font-size: 12px; flex: none; }
+.copy:hover { border-color: var(--accent); color: var(--accent); }
+.copy.done { background: #d1f0e0; border-color: var(--ok); color: var(--ok); }
+textarea.letter { width: 100%; min-height: 420px; font: 13px/1.5 ui-monospace,
+                  monospace; border: 1px solid var(--line); border-radius: 8px;
+                  padding: 12px; }
+.actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+input[type=text], input[type=number], input[type=datetime-local] {
+  border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px;
+  font-size: 14px; }
+label.inline { display: block; margin: 8px 0; }
+h2 { font-size: 17px; } h3 { font-size: 15px; }
+ul.reasons li { margin-bottom: 6px; }
+.grow { flex: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="{{ url_for('index') }}">✈ Flight Bot</a></h1>
+  <span class="muted grow">your flights, extracted from your inbox</span>
+  <form method="post" action="{{ url_for('scan') }}">
+    <button class="btn primary" onclick="this.textContent='Scanning…'">Scan mailbox</button>
+  </form>
+  <form method="post" action="{{ url_for('demo') }}">
+    <button class="btn">Load demo data</button>
+  </form>
+</header>
+<main>
+  {% with messages = get_flashed_messages() %}
+    {% for message in messages %}<div class="flash">{{ message }}</div>{% endfor %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</main>
+<script>
+function copyText(btn, text) {
+  navigator.clipboard.writeText(text).then(() => {
+    btn.classList.add('done'); btn.textContent = 'Copied';
+    setTimeout(() => { btn.classList.remove('done'); btn.textContent = 'Copy'; }, 1400);
+  });
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Flights – Flight Bot{% endblock %}
+{% block content %}
+<div class="card">
+  <h2 style="margin-top:0">All flights found in your email</h2>
+  {% if not flights %}
+    <p class="muted">Nothing here yet. Click <b>Scan mailbox</b> (after setting
+    your IMAP credentials in <code>config.json</code>) or <b>Load demo data</b>
+    to see how it works.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Date</th><th>Airline</th><th>Flight</th><th>Route</th>
+          <th>Emails linked</th><th>Compensation</th></tr>
+    </thead>
+    <tbody>
+      {% for f in flights %}
+      <tr class="rowlink" onclick="location='{{ url_for('flight_detail', flight_id=f.id) }}'">
+        <td>{{ f.flight_date or '—' }}</td>
+        <td><b>{{ f.airline_name or f.airline_code or '?' }}</b></td>
+        <td>{{ f.flight_numbers|join(', ') or '—' }}</td>
+        <td>{{ f.origin or '???' }} → {{ f.destination or '???' }}</td>
+        <td>
+          {% for label in f.kind_labels %}<span class="badge kind">{{ label }}</span> {% endfor %}
+          <span class="muted">({{ f.email_count }})</span>
+        </td>
+        <td><span class="badge {{ f.assessment.verdict }}">{{ f.assessment.label }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+<p class="muted">Click a flight for ticket number, boarding pass details,
+payment method, the compensation check and one-click complaint letters.</p>
+{% endblock %}

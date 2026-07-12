@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}{{ flight.airline_name or '' }} {{ flight.flight_number or '' }} – Flight Bot{% endblock %}
+{% block content %}
+<p><a class="btn" href="{{ url_for('index') }}">← All flights</a></p>
+
+<div class="card">
+  <h2 style="margin-top:0">
+    {{ flight.airline_name or flight.airline_code or 'Unknown airline' }}
+    {{ flight.flight_number or '' }}
+    <span class="muted">· {{ flight.flight_date or 'date unknown' }}</span>
+    {% if flight.cancelled %}<span class="badge not_eligible">CANCELLED</span>{% endif %}
+  </h2>
+  <p class="muted">Built from {{ flight.email_count }} linked email(s):
+    {% for label in flight.kind_labels %}<span class="badge kind">{{ label }}</span> {% endfor %}
+  </p>
+
+  {% for label, value in fields %}
+  <div class="field">
+    <span class="label">{{ label }}</span>
+    <span class="value" id="fv{{ loop.index }}">{{ value }}</span>
+    <button class="copy" onclick="copyText(this, document.getElementById('fv{{ loop.index }}').textContent)">Copy</button>
+  </div>
+  {% endfor %}
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">Compensation check
+    <span class="badge {{ assessment.verdict }}">{{ assessment.label }}</span>
+  </h3>
+  <p class="muted">Framework: {{ assessment.frameworks|join('; ') }}
+    {% if assessment.delay_hours is not none %} · detected arrival delay ≈ {{ assessment.delay_hours }} h{% endif %}
+  </p>
+  <ul class="reasons">
+    {% for reason in assessment.reasons %}<li>{{ reason }}</li>{% endfor %}
+  </ul>
+  <div class="actions">
+    <a class="btn danger" href="{{ url_for('complaint_gaca', flight_id=flight.id) }}">Complain to GACA</a>
+    <a class="btn primary" href="{{ url_for('complaint_airline', flight_id=flight.id) }}">Complain to the airline</a>
+  </div>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">Corrections (improves the eligibility check)</h3>
+  <p class="muted">Emails rarely contain the <i>actual</i> landing time. If the
+  flight landed late, enter it here and the check re-runs.</p>
+  <form method="post" action="{{ url_for('flight_override', flight_id=flight.id) }}">
+    <label class="inline">Actual arrival (landing) time:
+      <input type="text" name="actual_arrival" placeholder="2026-03-08 21:45"
+             value="{{ flight.overrides.get('actual_arrival', '') }}">
+    </label>
+    <label class="inline">Cancellation notice (days before departure):
+      <input type="number" step="1" min="0" name="cancellation_notice_days"
+             value="{{ flight.overrides.get('cancellation_notice_days', '') }}">
+    </label>
+    <label class="inline">
+      <input type="checkbox" name="denied_boarding" value="1"
+             {% if flight.overrides.get('denied_boarding') %}checked{% endif %}>
+      I was denied boarding (e.g. overbooking)
+    </label>
+    <button class="btn primary">Save &amp; re-check</button>
+  </form>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">Source emails</h3>
+  {% for email in flight.emails %}
+  <details style="margin-bottom:10px">
+    <summary>
+      {% for k in email.kinds %}<span class="badge kind">{{ k }}</span> {% endfor %}
+      <b>{{ email.subject }}</b>
+      <span class="muted">— {{ email.sender }} · {{ email.date }}</span>
+    </summary>
+    <pre style="white-space:pre-wrap;background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:12px;font-size:12px">{{ email.body }}</pre>
+  </details>
+  {% endfor %}
+</div>
+{% endblock %}

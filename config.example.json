@@ -1,0 +1,26 @@
+{
+  "imap": {
+    "host": "imap.gmail.com",
+    "port": 993,
+    "user": "you@gmail.com",
+    "password": "your-gmail-app-password",
+    "folders": ["INBOX"],
+    "since_days": 730
+  },
+  "smtp": {
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "user": "",
+    "password": ""
+  },
+  "user": {
+    "full_name": "Your Full Name",
+    "email": "you@gmail.com",
+    "phone": "+9665XXXXXXXX",
+    "national_id": ""
+  },
+  "web": {
+    "host": "127.0.0.1",
+    "port": 5000
+  }
+}
