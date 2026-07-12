@@ -24,6 +24,13 @@ CREATE TABLE IF NOT EXISTS alerts (
     alerted_at  REAL NOT NULL,
     PRIMARY KEY (asin, price)
 );
+CREATE TABLE IF NOT EXISTS discoveries (
+    asin        TEXT PRIMARY KEY,
+    price       REAL NOT NULL,
+    list_price  REAL NOT NULL,
+    status      TEXT NOT NULL,
+    seen_at     REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS purchases (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     asin        TEXT NOT NULL,
@@ -95,6 +102,21 @@ class Store:
             (asin, price, time.time()),
         )
         self._db.commit()
+
+    # -- discoveries -------------------------------------------------------
+    def record_discovery(self, asin: str, price: float, list_price: float, status: str) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO discoveries (asin, price, list_price, status, seen_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (asin, price, list_price, status, time.time()),
+        )
+        self._db.commit()
+
+    def discovery_stats(self) -> dict[str, int]:
+        rows = self._db.execute(
+            "SELECT status, COUNT(*) FROM discoveries GROUP BY status"
+        ).fetchall()
+        return dict(rows)
 
     # -- purchases ---------------------------------------------------------
     def record_purchase(self, asin: str, price: float, status: str, detail: str) -> None:

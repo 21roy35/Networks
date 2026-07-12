@@ -21,6 +21,39 @@ class MonitorCfg:
     concurrency: int = 4
     request_timeout: int = 15
     cooldown_on_block: int = 600
+    proxy: str = ""  # optional, e.g. "http://user:pass@host:port"
+
+
+# Default catalog slices for full-catalog discovery. These are Amazon search
+# department aliases (the `i=` parameter of /s); edit freely in config.yaml.
+_DEFAULT_CATEGORIES = [
+    "electronics",
+    "computers",
+    "kitchen",
+    "home",
+    "appliances",
+    "toys",
+    "sporting",
+    "beauty",
+    "office-products",
+    "tools",
+    "automotive",
+    "videogames",
+]
+
+
+@dataclasses.dataclass(frozen=True)
+class DiscoveryCfg:
+    enabled: bool = True
+    sweep_interval_seconds: int = 300
+    categories: list[str] = dataclasses.field(default_factory=lambda: list(_DEFAULT_CATEGORIES))
+    min_price_sar: float = 1.0
+    max_price_sar: float = 10.0
+    min_list_price_sar: float = 100.0
+    min_discount_pct: float = 90.0
+    pages_per_category: int = 3
+    use_pct_off_filter: bool = True
+    verify_before_alert: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -37,6 +70,7 @@ class AlertsCfg:
 @dataclasses.dataclass(frozen=True)
 class BuyCfg:
     enabled: bool = True
+    auto_buy: bool = False  # buy instantly on alert, without waiting for the button
     headless: bool = True
     storage_state: str = "amazon_session.json"
     max_auto_price_sar: float = 15.0
@@ -54,6 +88,7 @@ class WatchItem:
 class Config:
     telegram: TelegramCfg
     monitor: MonitorCfg
+    discovery: DiscoveryCfg
     deal: DealCfg
     alerts: AlertsCfg
     buy: BuyCfg
@@ -87,6 +122,7 @@ def load_config(path: str | pathlib.Path = "config.yaml") -> Config:
     return Config(
         telegram=TelegramCfg(bot_token=str(tg["bot_token"]), chat_id=int(tg["chat_id"])),
         monitor=_sub(MonitorCfg, raw.get("monitor")),
+        discovery=_sub(DiscoveryCfg, raw.get("discovery")),
         deal=_sub(DealCfg, raw.get("deal")),
         alerts=_sub(AlertsCfg, raw.get("alerts")),
         buy=_sub(BuyCfg, raw.get("buy")),

@@ -1,19 +1,46 @@
 # Amazon.sa Price-Drop Sniper Bot
 
-Watches a list of Amazon.sa products, and when one crashes to a snipe-worthy
-price (e.g. a 500 SAR item listed at 1–10 SAR), it instantly sends you a
-Telegram alert with a **🛒 BUY NOW** button. Tapping the button auto-purchases
-the item through your own Amazon account using a saved browser session.
+Scans **the entire Amazon.sa catalog** for glitch prices (e.g. a 500 SAR item
+listed at 1–10 SAR) and instantly sends a Telegram alert with a **🛒 BUY NOW**
+button — or buys automatically, if you enable `auto_buy`. Purchases go through
+your own Amazon account using a saved browser session.
 
-## How it works (and why it's fast)
+## How it covers the whole catalog efficiently
 
-- **No browser for monitoring.** Prices are polled over raw HTTP/2 with
-  `httpx`, hitting Amazon's lightweight *All Offers* AJAX endpoint first
-  (~10× smaller than the product page), with the full page as fallback.
-  Parsing uses `selectolax` (C-speed) plus regex fallbacks.
-- **Concurrent sweeps.** The whole watchlist is checked in parallel (bounded
-  concurrency), with randomized stagger/jitter and automatic cool-down when
-  Amazon throttles, so the bot survives instead of getting IP-banned.
+Brute-force polling every ASIN is physically impossible: Amazon.sa lists
+millions of products, and one bot can politely make maybe ~1 request/second —
+that's a full year per pass. Instead the **discovery engine** makes Amazon's
+own search index do the filtering *server-side*. Per sweep, for each catalog
+department it requests:
+
+```
+/s?i=<dept>&low-price=1&high-price=10&s=price-asc-rank&rh=p_n_pct-off-with-tax:90-
+```
+
+Every response is ~24–60 products that *already match* "costs almost nothing
+right now", each result card carrying the current price **and** the
+strike-through list price. Anything with a big list price (≥ 100 SAR by
+default) and a tiny current price is a glitch candidate. So **~36 requests
+(~1 MB) screen the whole store every 5 minutes** — that's the most efficient
+coverage possible without Amazon's internal firehose.
+
+Candidates are then **re-verified against the live buy-box** (search indexes
+lag) before any alert or purchase fires, so a stale index entry can't waste
+your click or your money.
+
+On top of that there's a **priority watchlist** — specific ASINs you care
+about, polled every ~45 s via the lightweight *All Offers* AJAX endpoint
+(~10× smaller than a product page), for items you want caught faster than the
+catalog sweep.
+
+## Why it's fast
+
+- **No browser for monitoring.** Everything is raw HTTP/2 with `httpx`;
+  parsing uses `selectolax` (C-speed) plus regex fallbacks.
+- **Concurrent sweeps.** Watchlist checks and catalog sweeps run in parallel
+  (bounded concurrency), with randomized stagger/jitter and automatic
+  cool-down when Amazon throttles, so the bot survives instead of getting
+  IP-banned. Optional proxy support (`monitor.proxy`).
 - **Browser only at purchase time.** Playwright loads your saved session,
   clicks *Buy Now*, and completes Turbo (one-tap) or classic checkout.
   Your password is never stored — only session cookies from a login you do
@@ -52,16 +79,32 @@ cp config.example.yaml config.yaml   # then edit it
 
 ## Using it
 
-- Watchlist lives in the `watchlist:` section of `config.yaml` and/or via
-  Telegram:
-  - `/add B0ABC12345 499` — watch an ASIN, with its normal price
-  - `/remove B0ABC12345`, `/list`, `/status`
-- Alert rule (both must pass; set one to `0` to disable it):
-  - `deal.max_price_sar` — absolute threshold (e.g. `10`)
-  - `deal.min_discount_pct` — e.g. `85` (% below the item's `ref_price`)
-- When an alert fires you get title, price, discount, link, and buttons.
-  **🛒 BUY NOW** triggers the purchase; you get back a result message plus a
-  screenshot of the confirmation (or of whatever blocked it).
+Telegram commands:
+
+| Command | What it does |
+|---|---|
+| `/add B0ABC12345 499` | watch an ASIN (with its normal price) at high frequency |
+| `/remove B0ABC12345`, `/list` | manage the priority watchlist |
+| `/buy B0ABC12345` | trigger a purchase manually, right now |
+| `/sweep` | run a full catalog discovery sweep immediately |
+| `/pause`, `/resume` | pause/resume all scanning |
+| `/status` | uptime, sweep stats, rules, auto-buy state |
+
+Tuning (in `config.yaml`):
+
+- **Catalog-wide rule** (`discovery:`): current price within
+  `min_price_sar`–`max_price_sar`, list price ≥ `min_list_price_sar`, and
+  discount ≥ `min_discount_pct`. The `min_list_price_sar` floor is what
+  separates a real glitch (500 SAR → 5 SAR) from items that are legitimately
+  cheap (stickers, cables).
+- **Watchlist rule** (`deal:`): `max_price_sar` AND `min_discount_pct`
+  vs the item's `ref_price` (set either to `0` to disable it).
+- **`buy.auto_buy: true`** skips the button and purchases the moment a
+  verified deal is found — for glitches that die in seconds. The alert still
+  arrives, marked "auto-buying". Every purchase path (button, `/buy`,
+  auto-buy) re-checks the live price and the checkout order total against
+  `buy.max_auto_price_sar` before placing the order, and you always get a
+  result message + confirmation screenshot back in Telegram.
 
 Run it 24/7 on any small VPS; a `systemd` unit or `tmux` session is enough.
 Keep `headless: true` on servers. `sniper.db`, `amazon_session.json` and
@@ -75,7 +118,12 @@ Keep `headless: true` on servers. `sniper.db`, `amazon_session.json` and
 - **Scraping and automated purchasing are against Amazon's Terms of Use.**
   Amazon may throttle, captcha, or in principle action the account. The bot
   polls politely (jitter, back-off) to keep a low profile — keep the
-  watchlist reasonable (tens of items, not thousands) and the interval ≥30 s.
+  watchlist reasonable (tens of items, not thousands), the poll interval
+  ≥30 s, and the sweep interval ≥5 min. If you get throttled often, add more
+  categories/pages *slower*, not faster, or set `monitor.proxy`.
+- **The `p_n_pct-off-with-tax` refinement isn't officially documented.** If
+  Amazon ignores or drops it, the price band + list-price floor still do the
+  filtering; set `use_pct_off_filter: false` if it ever causes empty results.
 - **Bank OTP / 3-D Secure can't be automated** (by design). For true one-tap
   buying, use a payment method that doesn't challenge every charge.
 - Amazon changes its HTML regularly; if prices stop parsing, the selectors in
@@ -85,10 +133,12 @@ Keep `headless: true` on servers. `sniper.db`, `amazon_session.json` and
 
 | Path | Purpose |
 |---|---|
-| `bot/main.py` | entrypoint, wires everything |
-| `bot/monitor.py` | polling loop + deal rules |
-| `bot/scraper.py` | fast HTTP price fetch/parse |
+| `bot/main.py` | entrypoint, wires everything, auto-buy dispatch |
+| `bot/discovery.py` | full-catalog sweep via server-side-filtered search |
+| `bot/monitor.py` | high-frequency priority watchlist polling |
+| `bot/scraper.py` | fast HTTP price fetch/parse (shared client) |
 | `bot/telegram_bot.py` | alerts, Buy button, commands |
 | `bot/buyer.py` | Playwright checkout with price safety caps |
 | `bot/login.py` | one-time interactive Amazon login |
-| `bot/storage.py` | SQLite watchlist/alert/purchase state |
+| `bot/storage.py` | SQLite watchlist/alert/discovery/purchase state |
+| `bot/state.py` | shared pause/stats state |

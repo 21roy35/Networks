@@ -6,8 +6,11 @@ import logging
 import random
 from typing import Awaitable, Callable
 
+import httpx
+
 from .config import Config
-from .scraper import Blocked, PriceResult, fetch_price, make_client
+from .scraper import Blocked, PriceResult, fetch_price
+from .state import RunState
 from .storage import Store
 
 log = logging.getLogger("monitor")
@@ -31,49 +34,59 @@ def is_deal(price: float, ref_price: float, cfg: Config) -> bool:
 
 
 class Monitor:
-    def __init__(self, cfg: Config, store: Store, alert: AlertFn):
+    def __init__(
+        self,
+        cfg: Config,
+        store: Store,
+        state: RunState,
+        alert: AlertFn,
+        client: httpx.AsyncClient,
+    ):
         self.cfg = cfg
         self.store = store
+        self.state = state
         self.alert = alert
-        self._blocked_until = 0.0
+        self.client = client
 
     async def run(self) -> None:
-        client = make_client(self.cfg.monitor.request_timeout)
         sem = asyncio.Semaphore(self.cfg.monitor.concurrency)
         log.info("monitor started; %d item(s) on watchlist", len(self.store.products()))
 
-        async with client:
-            while True:
-                products = self.store.products()
-                blocked = False
+        while True:
+            if self.state.paused:
+                await asyncio.sleep(5)
+                continue
 
-                async def check(asin: str, ref_price: float) -> None:
-                    nonlocal blocked
-                    async with sem:
-                        # small stagger so requests don't fire in one burst
-                        await asyncio.sleep(random.uniform(0, 2))
-                        try:
-                            result = await fetch_price(client, asin)
-                        except Blocked:
-                            blocked = True
-                            return
-                        except Exception as exc:  # noqa: BLE001 - keep the loop alive
-                            log.warning("%s: fetch failed: %s", asin, exc)
-                            return
-                        await self._evaluate(result, ref_price)
+            products = self.store.products()
+            blocked = False
 
-                await asyncio.gather(*(check(p.asin, p.ref_price) for p in products))
+            async def check(asin: str, ref_price: float) -> None:
+                nonlocal blocked
+                async with sem:
+                    # small stagger so requests don't fire in one burst
+                    await asyncio.sleep(random.uniform(0, 2))
+                    try:
+                        result = await fetch_price(self.client, asin)
+                    except Blocked:
+                        blocked = True
+                        return
+                    except Exception as exc:  # noqa: BLE001 - keep the loop alive
+                        log.warning("%s: fetch failed: %s", asin, exc)
+                        return
+                    await self._evaluate(result, ref_price)
 
-                if blocked:
-                    cooldown = self.cfg.monitor.cooldown_on_block
-                    log.warning("Amazon is throttling us; cooling down %ds", cooldown)
-                    await asyncio.sleep(cooldown)
-                    continue
+            await asyncio.gather(*(check(p.asin, p.ref_price) for p in products))
 
-                await asyncio.sleep(
-                    self.cfg.monitor.poll_interval_seconds
-                    + random.uniform(0, self.cfg.monitor.jitter_seconds)
-                )
+            if blocked:
+                cooldown = self.cfg.monitor.cooldown_on_block
+                log.warning("Amazon is throttling us; cooling down %ds", cooldown)
+                await asyncio.sleep(cooldown)
+                continue
+
+            await asyncio.sleep(
+                self.cfg.monitor.poll_interval_seconds
+                + random.uniform(0, self.cfg.monitor.jitter_seconds)
+            )
 
     async def _evaluate(self, result: PriceResult, ref_price: float) -> None:
         if result.price is None or not result.in_stock:

@@ -7,9 +7,36 @@ telegram:
 monitor:
   poll_interval_seconds: 45   # base interval between full watchlist sweeps
   jitter_seconds: 20          # random extra delay to look less robotic
-  concurrency: 4              # parallel product checks per sweep
+  concurrency: 4              # parallel requests (shared with discovery)
   request_timeout: 15
   cooldown_on_block: 600      # back off this many seconds after a captcha/503
+  proxy: ""                   # optional, e.g. "http://user:pass@host:port"
+
+# Full-catalog scanning: makes Amazon's search index do the filtering
+# server-side (price band + % off), so ~36 requests screen the whole store.
+discovery:
+  enabled: true
+  sweep_interval_seconds: 300 # one catalog sweep every ~5 min
+  min_price_sar: 1
+  max_price_sar: 10           # only surface items currently at 1-10 SAR
+  min_list_price_sar: 100     # ...whose normal (strike-through) price is >= this
+  min_discount_pct: 90        # ...and that are at least this % off
+  pages_per_category: 3       # search pages to scan per category per sweep
+  use_pct_off_filter: true    # add the ">=X% off" refinement to the search URL
+  verify_before_alert: true   # confirm live buy-box price before alerting/buying
+  categories:                 # Amazon.sa search departments (the i= param of /s)
+    - electronics
+    - computers
+    - kitchen
+    - home
+    - appliances
+    - toys
+    - sporting
+    - beauty
+    - office-products
+    - tools
+    - automotive
+    - videogames
 
 deal:
   # An alert fires when BOTH of these are satisfied (set either to 0 to disable it):
@@ -21,6 +48,8 @@ alerts:
 
 buy:
   enabled: true
+  auto_buy: false             # true = purchase INSTANTLY on alert (no button wait).
+                              # Still hard-capped by max_auto_price_sar below.
   headless: true
   storage_state: "amazon_session.json"  # created by:  python -m bot.login
   max_auto_price_sar: 15      # HARD safety cap: the buyer re-checks the live price at
@@ -29,8 +58,7 @@ buy:
   screenshot_dir: "screenshots"
 
 watchlist:
-  # Seed items; you can also manage the list from Telegram with /add, /remove, /list.
+  # OPTIONAL priority items polled every ~45 s (discovery covers everything
+  # else). Manage from Telegram with /add, /remove, /list. Can be empty: []
   - asin: "B0EXAMPLE01"
     ref_price: 500            # normal price in SAR, used for the discount % rule
-  - asin: "B0EXAMPLE02"
-    ref_price: 899

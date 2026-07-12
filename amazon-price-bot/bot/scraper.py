@@ -49,7 +49,7 @@ class PriceResult:
     in_stock: bool
 
 
-def _headers() -> dict[str, str]:
+def headers() -> dict[str, str]:
     return {
         "User-Agent": random.choice(_USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -59,16 +59,20 @@ def _headers() -> dict[str, str]:
     }
 
 
-def make_client(timeout: int) -> httpx.AsyncClient:
+_headers = headers  # backwards-friendly alias
+
+
+def make_client(timeout: int, proxy: str = "") -> httpx.AsyncClient:
     return httpx.AsyncClient(
         http2=True,
         timeout=timeout,
         follow_redirects=True,
+        proxy=proxy or None,
         limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
     )
 
 
-def _parse_amount(text: str) -> float | None:
+def parse_amount(text: str) -> float | None:
     m = _PRICE_RE.search(text)
     if not m:
         return None
@@ -78,9 +82,13 @@ def _parse_amount(text: str) -> float | None:
         return None
 
 
-def _check_blocked(body: str) -> None:
+def check_blocked(body: str) -> None:
     if any(marker in body for marker in _BLOCK_MARKERS):
         raise Blocked()
+
+
+_parse_amount = parse_amount
+_check_blocked = check_blocked
 
 
 def _price_from_html(body: str) -> tuple[float | None, str | None]:
