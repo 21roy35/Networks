@@ -1,0 +1,36 @@
+# Copy to config.yaml and fill in your values.
+
+telegram:
+  bot_token: "123456:ABC-YOUR-BOT-TOKEN"   # from @BotFather
+  chat_id: 123456789                        # your numeric chat id (message @userinfobot)
+
+monitor:
+  poll_interval_seconds: 45   # base interval between full watchlist sweeps
+  jitter_seconds: 20          # random extra delay to look less robotic
+  concurrency: 4              # parallel product checks per sweep
+  request_timeout: 15
+  cooldown_on_block: 600      # back off this many seconds after a captcha/503
+
+deal:
+  # An alert fires when BOTH of these are satisfied (set either to 0 to disable it):
+  max_price_sar: 10           # absolute snipe threshold, e.g. "anything at or under 10 SAR"
+  min_discount_pct: 85        # AND at least this % below the item's reference price
+
+alerts:
+  realert_cooldown_seconds: 3600   # don't repeat an alert for the same ASIN+price within this window
+
+buy:
+  enabled: true
+  headless: true
+  storage_state: "amazon_session.json"  # created by:  python -m bot.login
+  max_auto_price_sar: 15      # HARD safety cap: the buyer re-checks the live price at
+                              # checkout and aborts if it is above this, no matter what
+  quantity: 1
+  screenshot_dir: "screenshots"
+
+watchlist:
+  # Seed items; you can also manage the list from Telegram with /add, /remove, /list.
+  - asin: "B0EXAMPLE01"
+    ref_price: 500            # normal price in SAR, used for the discount % rule
+  - asin: "B0EXAMPLE02"
+    ref_price: 899

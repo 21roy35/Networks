@@ -1,0 +1,8 @@
+# Secrets & runtime state — never commit these
+config.yaml
+amazon_session.json
+sniper.db
+screenshots/
+.venv/
+__pycache__/
+*.pyc

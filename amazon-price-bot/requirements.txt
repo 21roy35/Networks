@@ -1,0 +1,5 @@
+httpx[http2]>=0.27
+python-telegram-bot>=21.0
+playwright>=1.44
+selectolax>=0.3.21
+PyYAML>=6.0
