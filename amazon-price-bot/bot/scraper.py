@@ -49,6 +49,14 @@ class PriceResult:
     in_stock: bool
 
 
+@dataclass
+class OffersResult:
+    asin: str
+    buybox: float | None     # pinned / buy-box offer price
+    others: list[float]      # competing sellers' prices for the SAME ASIN
+    title: str | None
+
+
 def headers() -> dict[str, str]:
     return {
         "User-Agent": random.choice(_USER_AGENTS),
@@ -119,32 +127,83 @@ def _price_from_html(body: str) -> tuple[float | None, str | None]:
     return None, title
 
 
-async def fetch_price(client: httpx.AsyncClient, asin: str) -> PriceResult:
-    """Fetch the current buy-box price for an ASIN, cheapest request first."""
-    # 1) AOD ajax fragment (~10x smaller than the dp page)
+async def _fetch_aod(client: httpx.AsyncClient, asin: str) -> str | None:
+    """Fetch the All-Offers ajax fragment; None if it wasn't usable."""
     try:
         r = await client.get(
             f"{BASE}/gp/product/ajax/ref=aod_f_new",
             params={"asin": asin, "pc": "dp", "experienceId": "aodAjaxMain"},
-            headers=_headers(),
+            headers=headers(),
         )
-        if r.status_code == 200:
-            _check_blocked(r.text)
-            price, title = _price_from_html(r.text)
-            if price is not None:
-                return PriceResult(asin=asin, price=price, title=title, in_stock=True)
     except (httpx.HTTPError, httpx.InvalidURL):
-        pass  # fall through to the dp page
+        return None
+    if r.status_code != 200:
+        return None
+    check_blocked(r.text)
+    return r.text
 
-    # 2) Full product page
-    r = await client.get(f"{BASE}/dp/{asin}", params={"psc": "1"}, headers=_headers())
+
+async def _fetch_dp(client: httpx.AsyncClient, asin: str) -> PriceResult:
+    """Full product page fallback."""
+    r = await client.get(f"{BASE}/dp/{asin}", params={"psc": "1"}, headers=headers())
     if r.status_code in (503, 429):
         raise Blocked()
     r.raise_for_status()
-    _check_blocked(r.text)
+    check_blocked(r.text)
 
     price, title = _price_from_html(r.text)
     unavailable = "currently unavailable" in r.text.lower()
     return PriceResult(
         asin=asin, price=price, title=title, in_stock=price is not None and not unavailable
+    )
+
+
+def parse_offer_prices(body: str) -> tuple[list[float], str | None]:
+    """All non-strike-through offer prices in an AOD fragment, buy-box first."""
+    tree = HTMLParser(body)
+    title_node = tree.css_first("#aod-asin-title-text") or tree.css_first("#productTitle")
+    title = title_node.text(strip=True) if title_node else None
+
+    prices: list[float] = []
+    for node in tree.css("span.a-price"):
+        if "a-text-price" in (node.attributes.get("class") or ""):
+            continue  # strike-through "was" price, not an offer
+        offscreen = node.css_first(".a-offscreen")
+        if offscreen is None:
+            continue
+        amount = parse_amount(offscreen.text())
+        if amount is not None:
+            prices.append(amount)
+    return prices, title
+
+
+async def fetch_price(client: httpx.AsyncClient, asin: str) -> PriceResult:
+    """Fetch the current buy-box price for an ASIN, cheapest request first."""
+    body = await _fetch_aod(client, asin)
+    if body is not None:
+        price, title = _price_from_html(body)
+        if price is not None:
+            return PriceResult(asin=asin, price=price, title=title, in_stock=True)
+    return await _fetch_dp(client, asin)
+
+
+async def fetch_offers(client: httpx.AsyncClient, asin: str) -> OffersResult:
+    """Buy-box price PLUS competing sellers' prices, in one request.
+
+    The competing prices are the key anti-fake signal: a seller can invent a
+    strike-through list price, but they can't invent other sellers offering
+    the same ASIN at 480 SAR."""
+    body = await _fetch_aod(client, asin)
+    if body is not None:
+        prices, title = parse_offer_prices(body)
+        if prices:
+            buybox = prices[0]
+            # Drop duplicates of the buy-box price (the pinned offer repeats
+            # in the list) so a single-seller item yields others == [].
+            others = [p for p in prices[1:] if abs(p - buybox) > 0.01]
+            return OffersResult(asin=asin, buybox=buybox, others=others, title=title)
+
+    dp = await _fetch_dp(client, asin)
+    return OffersResult(
+        asin=asin, buybox=dp.price if dp.in_stock else None, others=[], title=dp.title
     )

@@ -37,7 +37,9 @@ async def run() -> None:
 
     background: set[asyncio.Task] = set()
 
-    async def on_deal(result: PriceResult, ref_price: float, discount: float) -> None:
+    async def on_deal(
+        result: PriceResult, ref_price: float, discount: float, evidence: str | None = None
+    ) -> None:
         """Shared deal sink for watchlist hits and catalog discoveries."""
         auto = (
             cfg.buy.enabled
@@ -45,7 +47,7 @@ async def run() -> None:
             and result.price is not None
             and result.price <= cfg.buy.max_auto_price_sar
         )
-        await tg.send_deal_alert(result, ref_price, discount, auto_buying=auto)
+        await tg.send_deal_alert(result, ref_price, discount, evidence, auto_buying=auto)
         if auto:
             # Don't stall the sweep while checkout runs; Buyer serialises itself.
             task = asyncio.create_task(tg.do_buy(result.asin))

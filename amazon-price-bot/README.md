@@ -28,6 +28,29 @@ Candidates are then **re-verified against the live buy-box** (search indexes
 lag) before any alert or purchase fires, so a stale index entry can't waste
 your click or your money.
 
+## How it tells real glitches from junk
+
+The strike-through "was" price on a search card is **seller-supplied and
+routinely faked** — a 4 SAR sticker pack claiming "was 299 SAR" would pass any
+list-price rule. So discovered candidates must earn an evidence score
+(`filter.min_score`, default 40) built only from signals sellers can't fake:
+
+| Signal | Score | Why it's trustworthy |
+|---|---|---|
+| Other sellers offer the same ASIN at a real price (≥ `min_list_price_sar`) | +50 | A seller can invent a "was" price, but not competitors selling at 480 SAR. Parsed from the All-Offers response the bot already fetches for verification — zero extra requests. |
+| This bot previously observed the ASIN's buy-box at a real price | +50 | First-party history, builds automatically while the bot runs (watchlist items get it fastest). |
+| ≥ `min_reviews` ratings on the listing | +25 | Junk glitch-bait listings rarely accumulate real review mass. |
+| …and rated 4.0★+ | +15 | |
+| Every other seller is cheap too | −35 | The market says it's genuinely a low-value item, not a glitch. |
+
+Before scoring, titles hitting `filter.blocked_keywords` (stickers, decals,
+screen protectors, gift cards, …) are rejected outright — both the search-card
+title and the live title after verification. Each alert shows its evidence
+line (e.g. *"3 other seller(s) at ~480 SAR; 1,204 ratings; 4.6★"*) so you can
+judge at a glance and tune `min_score`: raise to 50+ to demand market/history
+evidence, set 0 to disable scoring entirely. Filtered items appear in
+`/status` as "filtered" and in the DB with status `junk`/`lowscore`.
+
 On top of that there's a **priority watchlist** — specific ASINs you care
 about, polled every ~45 s via the lightweight *All Offers* AJAX endpoint
 (~10× smaller than a product page), for items you want caught faster than the
@@ -94,9 +117,8 @@ Tuning (in `config.yaml`):
 
 - **Catalog-wide rule** (`discovery:`): current price within
   `min_price_sar`–`max_price_sar`, list price ≥ `min_list_price_sar`, and
-  discount ≥ `min_discount_pct`. The `min_list_price_sar` floor is what
-  separates a real glitch (500 SAR → 5 SAR) from items that are legitimately
-  cheap (stickers, cables).
+  discount ≥ `min_discount_pct` — then the evidence score (`filter:`, see
+  above) decides whether it's a real glitch or junk with a fake "was" price.
 - **Watchlist rule** (`deal:`): `max_price_sar` AND `min_discount_pct`
   vs the item's `ref_price` (set either to `0` to disable it).
 - **`buy.auto_buy: true`** skips the button and purchases the moment a
@@ -135,6 +157,7 @@ Keep `headless: true` on servers. `sniper.db`, `amazon_session.json` and
 |---|---|
 | `bot/main.py` | entrypoint, wires everything, auto-buy dispatch |
 | `bot/discovery.py` | full-catalog sweep via server-side-filtered search |
+| `bot/quality.py` | evidence scoring: real glitch vs fake-discount junk |
 | `bot/monitor.py` | high-frequency priority watchlist polling |
 | `bot/scraper.py` | fast HTTP price fetch/parse (shared client) |
 | `bot/telegram_bot.py` | alerts, Buy button, commands |

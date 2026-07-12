@@ -92,6 +92,8 @@ class Monitor:
         if result.price is None or not result.in_stock:
             return
         self.store.record_price(result.asin, result.price, result.title)
+        # Feeds the glitch scorer's price-history evidence for this ASIN.
+        self.store.update_price_stats(result.asin, result.price)
 
         if not is_deal(result.price, ref_price, self.cfg):
             return

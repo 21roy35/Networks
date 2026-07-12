@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -29,13 +30,17 @@ import httpx
 from selectolax.parser import HTMLParser
 
 from .config import Config
-from .scraper import BASE, Blocked, PriceResult, check_blocked, fetch_price, headers, parse_amount
+from .quality import GlitchScorer
+from .scraper import BASE, Blocked, PriceResult, check_blocked, fetch_offers, headers, parse_amount
 from .state import RunState
 from .storage import Store
 
 log = logging.getLogger("discovery")
 
-OnDeal = Callable[[PriceResult, float, float], Awaitable[None]]
+# (result, ref_price, discount_pct, evidence)
+OnDeal = Callable[..., Awaitable[None]]
+
+_RATING_RE = re.compile(r"([\d.]+)\s")
 
 
 @dataclass
@@ -44,6 +49,8 @@ class Candidate:
     price: float
     list_price: float
     title: str | None
+    reviews: int = 0
+    rating: float = 0.0
 
 
 def parse_search_results(body: str) -> list[Candidate]:
@@ -74,12 +81,34 @@ def parse_search_results(body: str) -> list[Candidate]:
             continue
 
         title_node = card.css_first("h2 span")
+
+        # Social proof, best effort (markup varies): star rating + ratings count.
+        rating = 0.0
+        rating_node = card.css_first("i.a-icon-star-small span.a-icon-alt") or card.css_first(
+            "i.a-icon-star span.a-icon-alt"
+        )
+        if rating_node:
+            m = _RATING_RE.match(rating_node.text(strip=True))
+            if m:
+                try:
+                    rating = float(m.group(1))
+                except ValueError:
+                    pass
+        reviews = 0
+        reviews_node = card.css_first("span.a-size-base.s-underline-text")
+        if reviews_node:
+            digits = re.sub(r"[^\d]", "", reviews_node.text())
+            if digits:
+                reviews = int(digits)
+
         out.append(
             Candidate(
                 asin=asin,
                 price=price,
                 list_price=list_price,
                 title=title_node.text(strip=True) if title_node else None,
+                reviews=reviews,
+                rating=rating,
             )
         )
     return out
@@ -99,6 +128,7 @@ class Discovery:
         self.state = state
         self.on_deal = on_deal
         self.client = client
+        self.scorer = GlitchScorer(cfg, store)
 
     # -- one search page ---------------------------------------------------
     def _search_params(self, category: str, page: int) -> dict[str, str]:
@@ -135,37 +165,60 @@ class Discovery:
         return discount >= d.min_discount_pct
 
     async def _handle_candidate(self, c: Candidate) -> None:
+        # Cheapest gate first: junk product types by title keyword.
+        kw = self.scorer.blocked_keyword(c.title)
+        if kw:
+            self.store.record_discovery(c.asin, c.price, c.list_price, "junk")
+            return
+
         cooldown = self.cfg.alerts.realert_cooldown_seconds
         if not self.store.should_alert(c.asin, c.price, cooldown):
             return  # already alerted at this or a lower price recently
 
         title, price = c.title, c.price
+        other_offers: list[float] = []
         if self.cfg.discovery.verify_before_alert:
-            # Search indexes lag; confirm against the live buy-box before alerting.
+            # One request gets both the live buy-box (search indexes lag) AND
+            # the competing sellers' prices used as value evidence below.
             try:
-                live = await fetch_price(self.client, c.asin)
+                offers = await fetch_offers(self.client, c.asin)
             except Blocked:
                 raise
             except Exception as exc:  # noqa: BLE001
                 log.warning("%s: verify failed (%s); skipping", c.asin, exc)
                 return
-            if live.price is None or not live.in_stock:
+            if offers.buybox is None:
                 self.store.record_discovery(c.asin, c.price, c.list_price, "gone")
                 return
-            if live.price > self.cfg.discovery.max_price_sar:
+            if offers.buybox > self.cfg.discovery.max_price_sar:
                 self.store.record_discovery(c.asin, c.price, c.list_price, "stale")
                 return
-            price, title = live.price, live.title or c.title
+            price, title = offers.buybox, offers.title or c.title
+            other_offers = offers.others
+            kw = self.scorer.blocked_keyword(title)
+            if kw:
+                self.store.record_discovery(c.asin, price, c.list_price, "junk")
+                return
 
+        verdict = self.scorer.score(c.asin, c.reviews, c.rating, other_offers)
+        if not verdict.passed:
+            log.info(
+                "filtered %s @ %.2f SAR (score %d: %s) %s",
+                c.asin, price, verdict.score, verdict.evidence, (title or "")[:60],
+            )
+            self.store.record_discovery(c.asin, price, c.list_price, "lowscore")
+            return
+
+        self.store.update_price_stats(c.asin, price)
         discount = (1 - price / c.list_price) * 100 if c.list_price > 0 else 0.0
         result = PriceResult(asin=c.asin, price=price, title=title, in_stock=True)
         log.info(
-            "DISCOVERED %s @ %.2f SAR (list %.0f, -%.0f%%) %s",
-            c.asin, price, c.list_price, discount, (title or "")[:60],
+            "DISCOVERED %s @ %.2f SAR (list %.0f, -%.0f%%, score %d) %s",
+            c.asin, price, c.list_price, discount, verdict.score, (title or "")[:60],
         )
         self.store.mark_alerted(c.asin, price)
         self.store.record_discovery(c.asin, price, c.list_price, "alerted")
-        await self.on_deal(result, c.list_price, discount)
+        await self.on_deal(result, c.list_price, discount, verdict.evidence)
 
     # -- main loop -----------------------------------------------------------
     async def run(self) -> None:

@@ -39,7 +39,21 @@ discovery:
     - videogames
 
 deal:
-  # An alert fires when BOTH of these are satisfied (set either to 0 to disable it):
+  # Glitch-quality filter for discovered items: separates real high-value
+# glitches from junk (sticker packs etc.) carrying FAKE strike-through prices.
+# Evidence scoring: +50 competing sellers at a real price, +50 seen high by
+# this bot before, +25 has >= min_reviews ratings (+15 more if rated 4.0+),
+# -35 if every other seller is cheap too. Alerts need >= min_score.
+filter:
+  min_score: 40               # 40 = any strong signal passes; 0 = filter off;
+                              # 50+ = require offers/history evidence
+  min_reviews: 20             # ratings needed for the social-proof signal
+  # blocked_keywords:         # uncomment to override the built-in junk list
+  #   - sticker
+  #   - screen protector
+  #   - gift card
+
+# An alert fires when BOTH of these are satisfied (set either to 0 to disable it):
   max_price_sar: 10           # absolute snipe threshold, e.g. "anything at or under 10 SAR"
   min_discount_pct: 85        # AND at least this % below the item's reference price
 

@@ -67,6 +67,41 @@ class AlertsCfg:
     realert_cooldown_seconds: int = 3600
 
 
+# Product types that habitually carry fabricated strike-through prices, plus
+# digital goods that can't be sniped. Matched case-insensitively against the
+# product title; extend in config.yaml (Arabic terms welcome).
+_DEFAULT_BLOCKED_KEYWORDS = [
+    "sticker",
+    "decal",
+    "keychain",
+    "key chain",
+    "lanyard",
+    "screen protector",
+    "tempered glass",
+    "phone case",
+    "case for",
+    "cover for",
+    "skin for",
+    "washi tape",
+    "temporary tattoo",
+    "gift card",
+    "e-gift",
+    "ebook",
+    "sim card",
+    "wallpaper",
+    "poster",
+]
+
+
+@dataclasses.dataclass(frozen=True)
+class FilterCfg:
+    min_score: int = 40           # evidence score a discovery needs to alert
+    min_reviews: int = 20         # ratings needed for the social-proof signal
+    blocked_keywords: list[str] = dataclasses.field(
+        default_factory=lambda: list(_DEFAULT_BLOCKED_KEYWORDS)
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class BuyCfg:
     enabled: bool = True
@@ -90,6 +125,7 @@ class Config:
     monitor: MonitorCfg
     discovery: DiscoveryCfg
     deal: DealCfg
+    filter: FilterCfg
     alerts: AlertsCfg
     buy: BuyCfg
     watchlist: list[WatchItem]
@@ -124,8 +160,15 @@ def load_config(path: str | pathlib.Path = "config.yaml") -> Config:
         monitor=_sub(MonitorCfg, raw.get("monitor")),
         discovery=_sub(DiscoveryCfg, raw.get("discovery")),
         deal=_sub(DealCfg, raw.get("deal")),
+        filter=_normalize_filter(_sub(FilterCfg, raw.get("filter"))),
         alerts=_sub(AlertsCfg, raw.get("alerts")),
         buy=_sub(BuyCfg, raw.get("buy")),
         watchlist=watchlist,
         base_dir=path.resolve().parent,
+    )
+
+
+def _normalize_filter(f: FilterCfg) -> FilterCfg:
+    return dataclasses.replace(
+        f, blocked_keywords=[str(k).lower() for k in f.blocked_keywords]
     )

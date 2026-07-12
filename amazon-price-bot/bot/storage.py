@@ -24,6 +24,12 @@ CREATE TABLE IF NOT EXISTS alerts (
     alerted_at  REAL NOT NULL,
     PRIMARY KEY (asin, price)
 );
+CREATE TABLE IF NOT EXISTS price_stats (
+    asin        TEXT PRIMARY KEY,
+    max_price   REAL NOT NULL,
+    samples     INTEGER NOT NULL DEFAULT 1,
+    updated_at  REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS discoveries (
     asin        TEXT PRIMARY KEY,
     price       REAL NOT NULL,
@@ -102,6 +108,25 @@ class Store:
             (asin, price, time.time()),
         )
         self._db.commit()
+
+    # -- price history (evidence for the glitch scorer) ---------------------
+    def update_price_stats(self, asin: str, price: float) -> None:
+        """Record an observed buy-box price; keeps the max ever seen per ASIN."""
+        self._db.execute(
+            "INSERT INTO price_stats (asin, max_price, samples, updated_at) "
+            "VALUES (?, ?, 1, ?) "
+            "ON CONFLICT(asin) DO UPDATE SET "
+            "max_price = MAX(max_price, excluded.max_price), "
+            "samples = samples + 1, updated_at = excluded.updated_at",
+            (asin, price, time.time()),
+        )
+        self._db.commit()
+
+    def max_seen_price(self, asin: str) -> float | None:
+        row = self._db.execute(
+            "SELECT max_price FROM price_stats WHERE asin = ?", (asin,)
+        ).fetchone()
+        return row[0] if row else None
 
     # -- discoveries -------------------------------------------------------
     def record_discovery(self, asin: str, price: float, list_price: float, status: str) -> None:

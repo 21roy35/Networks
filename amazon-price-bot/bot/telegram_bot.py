@@ -68,7 +68,12 @@ class TelegramBot:
 
     # -- outgoing alert ----------------------------------------------------
     async def send_deal_alert(
-        self, result: PriceResult, ref_price: float, discount: float, auto_buying: bool = False
+        self,
+        result: PriceResult,
+        ref_price: float,
+        discount: float,
+        evidence: str | None = None,
+        auto_buying: bool = False,
     ) -> None:
         title = html.escape((result.title or result.asin)[:120])
         lines = [
@@ -78,6 +83,8 @@ class TelegramBot:
             + (f"  (was ~{ref_price:.0f} SAR, −{discount:.0f}%)" if ref_price > 0 else ""),
             f'🔗 <a href="{BASE}/dp/{result.asin}">{result.asin}</a>',
         ]
+        if evidence:
+            lines.append(f"🧾 <i>{html.escape(evidence)}</i>")
         keyboard = None
         if auto_buying:
             lines.append("⚡ <i>Auto-buy is ON — purchasing now…</i>")
@@ -242,8 +249,9 @@ class TelegramBot:
             + (
                 f"{len(disc.categories)} categories, {self.state.sweeps_done} sweeps, "
                 f"{self.state.candidates_seen} candidates "
-                f"(alerted {stats.get('alerted', 0)}, stale {stats.get('stale', 0)}, "
-                f"gone {stats.get('gone', 0)})\n"
+                f"(alerted {stats.get('alerted', 0)}, "
+                f"filtered {stats.get('junk', 0) + stats.get('lowscore', 0)}, "
+                f"stale {stats.get('stale', 0)}, gone {stats.get('gone', 0)})\n"
                 if disc.enabled
                 else "OFF\n"
             )
