@@ -1,8 +1,8 @@
-"""Visible-browser automation for official airline and GACA complaint forms.
+"""Browser automation for official airline and GACA complaint forms.
 
-The browser is intentionally visible.  Login, OTP, CAPTCHA and any legal
-declaration remain user-controlled; automation waits for those steps and then
-continues filling and submitting the official form.
+On a desktop the browser is visible; on the VPS it runs headlessly. Login,
+OTP, CAPTCHA, missing required fields, and legal declarations remain
+user-controlled through the configured Telegram relay.
 """
 
 from __future__ import annotations
@@ -540,6 +540,207 @@ def _wait_for_human_step(page, update, timeout_seconds: int = 600) -> bool:
     return False
 
 
+def _control_label(control) -> str:
+    try:
+        value = control.evaluate("""el => {
+            if (el.type === 'radio') {
+                const legend = el.closest('fieldset')?.querySelector('legend');
+                const group = el.closest('[role="radiogroup"]');
+                const groupLabel = group?.getAttribute('aria-label');
+                if (legend?.innerText.trim()) return legend.innerText.trim();
+                if (groupLabel) return groupLabel;
+            }
+            const labels = el.labels ? Array.from(el.labels)
+                .map(label => label.innerText.trim()).filter(Boolean) : [];
+            return labels.join(' / ') || el.getAttribute('aria-label') ||
+                el.getAttribute('placeholder') || el.getAttribute('name') ||
+                el.getAttribute('id') || 'required field';
+        }""")
+        return re.sub(r"\s+", " ", str(value or "")).strip()[:160]
+    except Exception:
+        return "required field"
+
+
+def _control_options(control) -> list[str]:
+    try:
+        tag = control.evaluate("el => el.tagName.toLowerCase()")
+        kind = (control.get_attribute("type") or "").lower()
+        if kind == "radio":
+            values = control.evaluate("""el => {
+                const scope = el.form || document;
+                const name = el.name;
+                return Array.from(scope.querySelectorAll('input[type="radio"]'))
+                    .filter(item => !name || item.name === name)
+                    .map(item => {
+                        const label = item.labels && item.labels[0];
+                        return (label?.innerText || item.value || '').trim();
+                    }).filter(Boolean);
+            }""")
+            return list(values or [])[:12]
+        if tag != "select":
+            return []
+        return [re.sub(r"\s+", " ", item).strip()
+                for item in control.locator("option").all_text_contents()
+                if item.strip()][:12]
+    except Exception:
+        return []
+
+
+def _apply_control_answer(control, response) -> bool:
+    answer = str(response or "").strip()
+    if not answer:
+        return False
+    try:
+        tag = control.evaluate("el => el.tagName.toLowerCase()")
+        kind = (control.get_attribute("type") or "").lower()
+        if kind == "radio":
+            return bool(control.evaluate("""(el, answer) => {
+                const scope = el.form || document;
+                const name = el.name;
+                const wanted = answer.trim().toLowerCase();
+                const choices = Array.from(
+                    scope.querySelectorAll('input[type="radio"]'))
+                    .filter(item => !name || item.name === name);
+                const match = choices.find(item => {
+                    const label = item.labels && item.labels[0];
+                    const text = (label?.innerText || '').trim().toLowerCase();
+                    return text === wanted || item.value.toLowerCase() === wanted ||
+                        text.includes(wanted);
+                });
+                if (!match) return false;
+                match.click();
+                return true;
+            }""", answer))
+        if tag == "select":
+            options = control.locator("option").all_text_contents()
+            exact = next((option for option in options
+                          if option.strip().casefold() == answer.casefold()), None)
+            match = exact or next((option for option in options
+                                   if answer.casefold() in option.casefold()), None)
+            if not match:
+                return False
+            control.select_option(label=match.strip())
+        else:
+            control.fill(answer)
+        return True
+    except Exception:
+        return False
+
+
+def _control_screenshot(page, control) -> bytes:
+    try:
+        control.scroll_into_view_if_needed()
+        control.evaluate("el => { el.dataset.flightdeckOutline = el.style.outline; "
+                         "el.style.outline = '4px solid #e11d48'; }")
+        image = _page_screenshot(page)
+        control.evaluate("el => { el.style.outline = "
+                         "el.dataset.flightdeckOutline || ''; "
+                         "delete el.dataset.flightdeckOutline; }")
+        return image
+    except Exception:
+        return _page_screenshot(page)
+
+
+def _invalid_controls(page):
+    selector = (
+        "input:invalid:not([type=hidden]):not([type=checkbox]):"
+        "not([type=file]):not([type=password]):"
+        "not([type=submit]):not([type=button]), textarea:invalid, "
+        "select:invalid")
+    controls = page.locator(selector)
+    found = []
+    for index in range(controls.count()):
+        control = controls.nth(index)
+        try:
+            kind = (control.get_attribute("type") or "").lower()
+            usable = (control.is_enabled() if kind == "radio"
+                      else control.is_editable())
+            if control.is_visible() and usable:
+                found.append(control)
+        except Exception:
+            continue
+    return found
+
+
+def _resolve_invalid_fields(page, update) -> tuple[bool, bool]:
+    """Ask for invalid field values in Telegram. Returns changed, cancelled."""
+    if not _VERIFICATION_HANDLER:
+        return False, False
+    changed = False
+    attempts: dict[str, int] = {}
+    for _round in range(10):
+        controls = _invalid_controls(page)
+        if not controls:
+            return changed, False
+        control = controls[0]
+        label = _control_label(control)
+        key = f"{label}:{control.get_attribute('name')}:{control.get_attribute('id')}"
+        attempts[key] = attempts.get(key, 0) + 1
+        if attempts[key] > 2:
+            return changed, False
+        options = _control_options(control)
+        try:
+            validation = control.evaluate("el => el.validationMessage") or ""
+        except Exception:
+            validation = ""
+        option_text = ("\nAvailable choices: " + "; ".join(options)
+                       if options else "")
+        response = _ask_verification(
+            "field_input",
+            f"The official portal needs: {label}. {validation}".strip()
+            + option_text + "\nReply with the value, or reply CANCEL.",
+            page, image=_control_screenshot(page, control))
+        if str(response or "").strip().lower() == "cancel":
+            return changed, True
+        if not _apply_control_answer(control, response):
+            update("verification", f"The value for {label} was not accepted. Asking again…")
+            continue
+        changed = True
+        update("filling", f"Added {label} from Telegram. Continuing…")
+        page.wait_for_timeout(350)
+    return changed, False
+
+
+def _validation_summary(page) -> str:
+    messages = []
+    for control in _invalid_controls(page)[:4]:
+        try:
+            detail = control.evaluate("el => el.validationMessage") or ""
+        except Exception:
+            detail = ""
+        messages.append(f"{_control_label(control)}: {detail}".strip(": "))
+    alerts = page.locator(
+        "[role='alert'], [aria-live='assertive'], .invalid-feedback, "
+        ".field-validation-error, [class*='error-message']")
+    for index in range(min(alerts.count(), 4)):
+        alert = alerts.nth(index)
+        try:
+            if alert.is_visible():
+                messages.append(re.sub(r"\s+", " ", alert.inner_text()).strip())
+        except Exception:
+            continue
+    unique = list(dict.fromkeys(message for message in messages if message))
+    return "\n".join(unique)[:700]
+
+
+def _submit_fallback(page) -> bool:
+    control = page.locator("button[type='submit'], input[type='submit']")
+    if _visible(control):
+        try:
+            control.first.click()
+            return True
+        except Exception:
+            pass
+    form = page.locator("form")
+    if form.count():
+        try:
+            form.first.evaluate("form => form.requestSubmit()")
+            return True
+        except Exception:
+            pass
+    return False
+
+
 def _fill_common(page, payload: dict):
     _fill(page, ["email address", "e-mail address", "email"], payload["email"])
     _fill(page, ["phone number", "mobile number", "mobile", "phone"],
@@ -657,6 +858,7 @@ def _await_confirmation(page, before_url: str, update,
     started = time.monotonic()
     deadline = started + timeout_seconds
     prompted = False
+    last_assistance = 0.0
     while time.monotonic() < deadline:
         if page.is_closed():
             return PortalResult("needs_attention",
@@ -679,10 +881,40 @@ def _await_confirmation(page, before_url: str, update,
                 update("submitting", "Verification complete. Waiting for confirmation…")
         elif page.url != before_url and prompted:
             update("submitting", "Verification complete. Waiting for confirmation…")
-        elif not prompted and time.monotonic() - started > 12:
-            update("verification",
-                   "The official site needs one correction or confirmation. Complete it in the open browser; tracking will continue.")
-            prompted = True
+        elif (time.monotonic() - started > 12
+              and time.monotonic() - last_assistance > 30):
+            last_assistance = time.monotonic()
+            changed, cancelled = _resolve_invalid_fields(page, update)
+            if cancelled:
+                return PortalResult(
+                    "needs_attention", "Portal input was cancelled in Telegram.")
+            if changed:
+                _click(page, ["Submit", "Send", "Continue", "Confirm",
+                              "إرسال", "تقديم", "متابعة", "تأكيد"])
+                update("submitting", "Telegram inputs applied. Trying the official portal again…")
+                prompted = True
+            elif _VERIFICATION_HANDLER:
+                details = _validation_summary(page)
+                extra = f"\n\nPortal message:\n{details}" if details else ""
+                response = _ask_verification(
+                    "approval",
+                    "The official portal has not confirmed yet. Review this screenshot, then tap Retry to submit again or Cancel to stop safely."
+                    + extra,
+                    page, choices=["Retry", "Cancel"])
+                prompted = True
+                if str(response or "").lower() == "cancel":
+                    return PortalResult(
+                        "needs_attention", "Portal submission was cancelled in Telegram.")
+                if str(response or "").lower() == "retry":
+                    if not _click(page, [
+                            "Submit", "Send", "Continue", "Confirm",
+                            "إرسال", "تقديم", "متابعة", "تأكيد"]):
+                        _submit_fallback(page)
+                    update("submitting", "Retry approved in Telegram. Waiting for confirmation…")
+            else:
+                update("verification",
+                       "The official site needs one correction or confirmation.")
+                prompted = True
         time.sleep(1)
     return PortalResult(
         "needs_attention",
@@ -690,7 +922,7 @@ def _await_confirmation(page, before_url: str, update,
 
 
 def submit_portal_claim(payload: dict, update: Callable[[str, str], None]) -> PortalResult:
-    """Open, fill and submit one official web form in a visible Edge window."""
+    """Open, fill and submit one official web form in the managed browser."""
     url = _official_url(payload)
     if not url or not _is_official_url(url):
         return PortalResult(
@@ -725,12 +957,26 @@ def submit_portal_claim(payload: dict, update: Callable[[str, str], None]) -> Po
                 return PortalResult(
                     "needs_attention",
                     "Login or verification was not completed before the portal timed out.")
+            _changed, cancelled = _resolve_invalid_fields(page, update)
+            if cancelled:
+                return PortalResult(
+                    "needs_attention", "Portal input was cancelled in Telegram.")
             update("submitting", "Submitting to the official website…")
             before_text = _body_text(page)
             before_url = page.url
             if not _click(page, ["Submit", "Send", "File complaint",
                                  "Submit request", "إرسال", "تقديم"]):
-                update("verification", "The official site changed its final control. Review the open form and submit it; confirmation tracking will continue.")
+                if _VERIFICATION_HANDLER:
+                    response = _ask_verification(
+                        "approval",
+                        "The official site changed its final button. Review the screenshot and tap Submit to continue from Telegram.",
+                        page, choices=["Submit", "Cancel"])
+                    if str(response or "").lower() == "cancel":
+                        return PortalResult(
+                            "needs_attention", "Portal submission was cancelled in Telegram.")
+                    if str(response or "").lower() == "submit":
+                        _submit_fallback(page)
+                update("verification", "The official site changed its final control. Telegram assistance is active while confirmation is tracked.")
                 return _await_confirmation(page, before_url, update, before_text)
             return _await_confirmation(page, before_url, update, before_text)
         finally:

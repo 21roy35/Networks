@@ -1,5 +1,6 @@
 import pytest
 
+from flight_bot import portal_automation
 from flight_bot.complaints import complaint_payload, missing_portal_fields
 from flight_bot.portal_automation import (_extract_reference,
                                           _extract_reference_from_url, _is_official_url)
@@ -69,3 +70,53 @@ def test_reference_is_extracted_from_official_confirmation_text():
 def test_reference_is_extracted_from_confirmation_url():
     assert _extract_reference_from_url(
         "https://help.flyadeal.com/hc/en-us/requests/123456") == "123456"
+
+
+def test_invalid_portal_field_is_screenshot_and_filled_from_telegram(monkeypatch):
+    class Control:
+        value = ""
+
+        def evaluate(self, script):
+            if "tagName" in script:
+                return "input"
+            if "validationMessage" in script:
+                return "Please fill out this field."
+            return "Passport number"
+
+        def get_attribute(self, _name):
+            return "text"
+
+        def fill(self, value):
+            self.value = value
+
+    class Page:
+        url = "https://official.example/form"
+
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+    control = Control()
+    challenges = []
+    updates = []
+
+    def verification(challenge):
+        challenges.append(challenge)
+        return "P1234567"
+
+    monkeypatch.setattr(portal_automation, "_VERIFICATION_HANDLER", verification)
+    monkeypatch.setattr(
+        portal_automation, "_invalid_controls",
+        lambda _page: [] if control.value else [control])
+    monkeypatch.setattr(
+        portal_automation, "_control_screenshot",
+        lambda _page, _control: b"portal-screenshot")
+
+    changed, cancelled = portal_automation._resolve_invalid_fields(
+        Page(), lambda phase, message: updates.append((phase, message)))
+    assert changed is True
+    assert cancelled is False
+    assert control.value == "P1234567"
+    assert challenges[0]["kind"] == "field_input"
+    assert challenges[0]["image"] == b"portal-screenshot"
+    assert "Passport number" in challenges[0]["message"]
+    assert updates[-1][0] == "filling"

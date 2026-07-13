@@ -152,3 +152,36 @@ def test_remote_dashboard_requires_telegram_link(tmp_path, monkeypatch):
     assert signed_in.status_code == 302
     assert "access=" not in signed_in.headers["Location"]
     assert client.get("/").status_code == 200
+
+
+def test_mobile_complaint_announces_telegram_screenshot_assistance(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "mobile.db")
+    notices = []
+
+    class Telegram:
+        def notify(self, message, **_kwargs):
+            notices.append(message)
+
+    monkeypatch.setattr(webapp, "start_telegram", lambda _config: Telegram())
+    monkeypatch.setattr(webapp, "missing_portal_fields", lambda _payload: [])
+    monkeypatch.setattr(
+        webapp, "start_portal_job",
+        lambda _payload, on_complete: "mobile-job")
+    config = deepcopy(DEFAULTS)
+    config["user"].update({
+        "full_name": "Mobile Passenger", "email": "p@example.com",
+        "phone": "+966500000000", "national_id": "ID123456",
+        "title": "Mr", "nationality": "Saudi Arabian",
+        "country_code": "+966",
+    })
+    application = webapp.create_app(config)
+    application.config.update(TESTING=True)
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight_id = db.list_flights()[0]["id"]
+    response = application.test_client().post(
+        f"/flight/{flight_id}/complaint/airline/submit",
+        data={"incident": "The seat and entertainment screen were broken."})
+    assert response.status_code == 302
+    assert any("screenshot" in notice and "Telegram" in notice
+               for notice in notices)

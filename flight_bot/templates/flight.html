@@ -167,7 +167,7 @@
         <p class="form-section">Passenger &amp; payment</p>
         <div class="field-grid">
           <label class="form-field">Passenger name<input type="text" name="passenger" placeholder="Name as shown on ticket" value="{{ flight.overrides.get('passenger', flight.passenger or '') }}"></label>
-          <label class="form-field">Payment method / card<input type="text" name="payment_method" placeholder="Visa or Visa •••• 1234" value="{{ flight.overrides.get('payment_method', flight.payment_method or '') }}"></label>
+          <label class="form-field">Payment method / card<input type="text" name="payment_method" placeholder="Visa or Visa •••• 1234" value="{{ flight.payment_card }}"></label>
         </div>
         <p class="muted small">For safety, enter only the card brand and optionally its masked last four digits—never a full card number.</p>
         <p class="form-section">What happened</p>

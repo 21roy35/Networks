@@ -4,7 +4,7 @@ FlightDeck turns airline messages into complete flight records, tracks each jour
 
 ## What it does
 
-- Shows the payment method on every flight and filters by card brand.
+- Shows each payment method as card brand plus last four digits and filters by that exact card.
 - Filters flights by passenger name.
 - Copies or downloads every filtered result as a complete TXT report.
 - Preserves manual corrections across mailbox rescans.
@@ -55,7 +55,7 @@ The workflow uses Telegram's official [Bot API](https://core.telegram.org/bots/a
 
 After a recorded arrival, FlightDeck asks how the flight went. You can tap **Everything was good**, or describe an issue and attach photos. After a short collection window, FlightDeck opens the airline's official complaint form, fills it, attaches the evidence, submits it, saves the official reference, and confirms the outcome in Telegram.
 
-If the portal requests an OTP, text CAPTCHA, image-grid CAPTCHA, legal declaration, Nafath approval, or similar human verification, FlightDeck sends the relevant prompt or screenshot to Telegram. Your reply is applied to the waiting portal session and automation resumes. These controls are assisted, not bypassed. Portal passwords are never requested through Telegram; a one-time sign-in is completed in the persistent Edge window.
+If the portal requests an OTP, text CAPTCHA, image-grid CAPTCHA, missing required field, dropdown/radio choice, legal declaration, Nafath approval, or final confirmation, FlightDeck sends the relevant prompt and screenshot to Telegram. Your reply is applied to the waiting VPS browser session and automation resumes, so the complaint can be started from a phone. These controls are assisted, not bypassed. Portal passwords are never requested through Telegram.
 
 FlightDeck scans the configured inbox for substantive airline replies. When one is matched to a submitted complaint, it sends a concise excerpt to Telegram and offers **Escalate to GACA** or **No, close**. GACA receives the original incident, evidence, flight data, airline complaint date, and airline reference automatically.
 

@@ -83,11 +83,32 @@ def _data_quality(flight: dict) -> dict:
 
 
 def _payment_card(value: str | None) -> str:
-    """Return a stable card/wallet brand while preserving masked details elsewhere."""
+    """Return a safe, filterable card label containing brand and last four."""
     method = (value or "").strip()
     if not method:
         return ""
-    return re.split(r"\s+[•*xX]{2,}", method, maxsplit=1)[0].strip()
+    brands = (
+        (r"american\s+express|\bamex\b", "American Express"),
+        (r"master\s*card", "Mastercard"),
+        (r"\bvisa\b", "Visa"),
+        (r"\bmada\b", "Mada"),
+        (r"apple\s*pay", "Apple Pay"),
+        (r"google\s*pay", "Google Pay"),
+        (r"samsung\s*pay", "Samsung Pay"),
+    )
+    brand = next((label for pattern, label in brands
+                  if re.search(pattern, method, re.I)), "")
+    if not brand:
+        brand = re.split(
+            r"(?:\s+[•*xX]{2,}|\s+ending\s+(?:in\s+)?|\s+\d{4}\s*$)",
+            method, maxsplit=1, flags=re.I)[0].strip(" -–—:·")
+        if re.fullmatch(r"[\s•*xX\d\-–—]+", brand):
+            brand = ""
+    digits = re.findall(r"\d", method)
+    last_four = "".join(digits[-4:]) if len(digits) >= 4 else ""
+    if last_four:
+        return f"{brand or 'Card'} •••• {last_four}"
+    return brand or method
 
 
 def _flight_view(flight: dict) -> dict:
@@ -106,8 +127,9 @@ def _flight_view(flight: dict) -> dict:
         or "Flight unknown")
     item["route"] = f"{item['display_origin']} → {item['display_destination']}"
     item["passenger_name"] = effective(item, "passenger") or ""
-    item["payment_method_display"] = effective(item, "payment_method") or ""
-    item["payment_card"] = _payment_card(item["payment_method_display"])
+    payment_method = effective(item, "payment_method") or ""
+    item["payment_card"] = _payment_card(payment_method)
+    item["payment_method_display"] = item["payment_card"]
 
     when = (_parse_display_dt(effective(item, "departure"))
             or _parse_display_dt(effective(item, "flight_date")))
@@ -198,7 +220,7 @@ def _flights_as_text(flights: list[dict], filters: dict) -> str:
              or flight.get("new_arrival")),
             ("Cabin", flight.get("cabin_class")), ("Seat", flight.get("seat")),
             ("Gate", flight.get("gate")), ("Boarding", flight.get("boarding_time")),
-            ("Ticket price", price), ("Payment method", flight["payment_method_display"]),
+            ("Ticket price", price), ("Payment method", flight["payment_card"]),
             ("Source emails", flight.get("email_count")),
             ("Evidence types", ", ".join(flight.get("kind_labels") or [])),
             ("Rights check", assessment["label"]),
@@ -526,6 +548,10 @@ def create_app(config: dict) -> Flask:
                 telegram.notify(
                     f"{kind.upper()} portal submission needs attention: {result.message}")
 
+        if telegram:
+            telegram.notify(
+                f"Starting the {kind.upper()} complaint from your mobile request. "
+                "I’ll send a Telegram screenshot if the official portal needs a CAPTCHA, OTP, required field, declaration, or final confirmation.")
         job_id = start_portal_job(payload, on_complete=record_result)
         return redirect(url_for("portal_status", job_id=job_id,
                                 flight_id=flight_id))
@@ -674,7 +700,7 @@ def _copyable_field_groups(flight: dict) -> list[dict]:
         ("Payment", [
             ("Ticket price", f"{flight.get('currency') or ''} {flight.get('amount')}".strip()
              if flight.get("amount") else None),
-            ("Payment method", effective(flight, "payment_method")),
+            ("Payment method", _payment_card(effective(flight, "payment_method"))),
         ]),
     ]
     return [{"title": title,
