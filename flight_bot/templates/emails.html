@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Email inspector – Flight Bot{% endblock %}
+{% block content %}
+<div class="card">
+  <h2 style="margin-top:0">Email inspector</h2>
+  <p class="muted">Every stored email, what was extracted from it, and which
+  flight it was linked to. Emails with no flight were treated as
+  promotions/noise (no PNR, ticket number, or usable flight details).</p>
+  <input type="text" id="emailfilter" placeholder="Filter by subject, sender, PNR, flight…"
+         style="width:100%;margin-bottom:12px"
+         oninput="filterRows(this.value, 'emailtable')">
+  <div style="overflow-x:auto">
+  <table id="emailtable">
+    <thead>
+      <tr><th>Date</th><th>Subject / sender</th><th>Extracted</th><th>Linked to flight</th></tr>
+    </thead>
+    <tbody>
+      {% for e in emails %}
+      <tr>
+        <td style="white-space:nowrap">{{ (e.date or '')[:10] or '—' }}</td>
+        <td>
+          <b>{{ e.subject }}</b><br>
+          <span class="muted">{{ e.sender }}</span><br>
+          {% for k in e.kinds %}<span class="badge kind">{{ k }}</span> {% endfor %}
+        </td>
+        <td class="muted" style="font-size:13px">
+          {% if e.pnr %}PNR <b>{{ e.pnr }}</b><br>{% endif %}
+          {% if e.ticket_numbers %}Ticket {{ e.ticket_numbers|join(', ') }}<br>{% endif %}
+          {% if e.flight_numbers %}Flight {{ e.flight_numbers|join(', ') }}<br>{% endif %}
+          {% if e.origin or e.destination %}{{ e.origin or '?' }} → {{ e.destination or '?' }}<br>{% endif %}
+          {% if e.departure %}Dep {{ e.departure }}{% endif %}
+        </td>
+        <td>
+          {% if e.flight %}
+            <a href="{{ url_for('flight_detail', flight_id=e.flight.id) }}">
+              {{ e.flight.airline_name or e.flight.airline_code or '?' }}
+              {{ e.flight.flight_number or '' }} · {{ e.flight.flight_date or '?' }}</a>
+          {% else %}
+            <span class="muted">not linked (noise)</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+{% endblock %}

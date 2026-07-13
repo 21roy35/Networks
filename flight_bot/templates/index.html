@@ -8,7 +8,11 @@
     your IMAP credentials in <code>config.json</code>) or <b>Load demo data</b>
     to see how it works.</p>
   {% else %}
-  <table>
+  <input type="text" id="flightfilter"
+         placeholder="Filter by airline, date, flight number, route…"
+         style="width:100%;margin-bottom:12px"
+         oninput="filterRows(this.value, 'flighttable')">
+  <table id="flighttable">
     <thead>
       <tr><th>Date</th><th>Airline</th><th>Flight</th><th>Route</th>
           <th>Emails linked</th><th>Compensation</th></tr>

@@ -29,7 +29,7 @@ def ingest(raw_emails, log=print, progress: dict | None = None) -> int:
 def rebuild_flights(log=print) -> int:
     """Re-link all stored emails into flight records."""
     db.init_db()
-    flights = link_emails(db.all_emails())
+    flights = link_emails(db.all_emails(), log=log)
     db.replace_flights(flights)
     log(f"Linked into {len(flights)} flight(s).")
     return len(flights)

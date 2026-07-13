@@ -134,15 +134,55 @@ def _merge_group(group: list[dict]) -> dict:
     return flight
 
 
-def link_emails(emails: list[dict]) -> list[dict]:
+def _is_real_flight(flight: dict) -> bool:
+    """Filter out airline marketing/newsletter noise.
+
+    A group only counts as a flight when it carries booking evidence:
+    a PNR, an e-ticket number, or a flight number together with at least
+    one concrete travel fact (route, departure time or flight date).
+    """
+    if flight.get("pnr") or flight.get("ticket_numbers"):
+        return True
+    return bool(flight.get("flight_number")
+                and (flight.get("origin") or flight.get("destination")
+                     or flight.get("departure") or flight.get("flight_date")))
+
+
+def _compatible_pnr(a: dict, b: dict) -> bool:
+    return not a.get("pnr") or not b.get("pnr") or a["pnr"] == b["pnr"]
+
+
+def link_emails(emails: list[dict], log=lambda *a: None) -> list[dict]:
     """Group parsed emails and merge each group into a flight record."""
-    flights = []
-    seen_keys = set()
+    # Pass 1: group by shared PNR / ticket number / flight+date.
+    merged: list[tuple[dict, list[dict]]] = []  # (merged record, its emails)
     for group in _group_emails(emails):
         flight = _merge_group(group)
+        # Pass 2: coalesce groups that resolve to the same physical flight
+        # (same flight number on the same date) once fields are merged,
+        # unless they carry conflicting booking references.
+        for i, (other, other_group) in enumerate(merged):
+            if (flight.get("flight_number") and flight.get("flight_date")
+                    and flight["flight_number"] == other.get("flight_number")
+                    and flight["flight_date"] == other.get("flight_date")
+                    and _compatible_pnr(flight, other)):
+                combined = other_group + group
+                merged[i] = (_merge_group(combined), combined)
+                break
+        else:
+            merged.append((flight, group))
+
+    flights, seen_keys, dropped = [], set(), 0
+    for flight, _group in merged:
+        if not _is_real_flight(flight):
+            dropped += 1
+            continue
         # Guard against duplicate keys from degenerate parses.
         while flight["flight_key"] in seen_keys:
             flight["flight_key"] += "+"
         seen_keys.add(flight["flight_key"])
         flights.append(flight)
+    if dropped:
+        log(f"  (ignored {dropped} email group(s) with no booking evidence "
+            "— likely promotions/newsletters)")
     return flights

@@ -69,6 +69,10 @@ ul.reasons li { margin-bottom: 6px; }
 <header>
   <h1><a href="{{ url_for('index') }}">✈ Flight Bot</a></h1>
   <span class="muted grow">your flights, extracted from your inbox</span>
+  <a class="btn" href="{{ url_for('emails') }}">Email inspector</a>
+  <form method="post" action="{{ url_for('relink') }}">
+    <button class="btn" title="Re-run linking after an update">Re-link</button>
+  </form>
   <form method="post" action="{{ url_for('scan') }}">
     <button class="btn primary" onclick="this.textContent='Scanning…'">Scan mailbox</button>
   </form>
@@ -88,6 +92,12 @@ function copyText(btn, text) {
     btn.classList.add('done'); btn.textContent = 'Copied';
     setTimeout(() => { btn.classList.remove('done'); btn.textContent = 'Copy'; }, 1400);
   });
+}
+function filterRows(query, tableId) {
+  query = query.toLowerCase();
+  for (const row of document.querySelectorAll('#' + tableId + ' tbody tr')) {
+    row.style.display = row.textContent.toLowerCase().includes(query) ? '' : 'none';
+  }
 }
 </script>
 </body>

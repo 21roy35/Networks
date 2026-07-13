@@ -2,6 +2,7 @@
 compensation assessment and one-click complaint generation."""
 
 import threading
+from pathlib import Path
 
 from flask import (Flask, flash, jsonify, redirect, render_template, request,
                    url_for)
@@ -33,8 +34,23 @@ def _run_scan(config: dict):
         _scan_progress.update(phase="error", error=f"Scan failed: {exc}")
 
 
+_TEMPLATES = Path(__file__).resolve().parent / "templates"
+_REQUIRED_TEMPLATES = ("base.html", "index.html", "flight.html",
+                       "complaint.html", "scan.html", "emails.html")
+
+
 def create_app(config: dict) -> Flask:
-    app = Flask(__name__)
+    missing = [t for t in _REQUIRED_TEMPLATES if not (_TEMPLATES / t).exists()]
+    if missing:
+        raise SystemExit(
+            f"Template file(s) missing from {_TEMPLATES}: {', '.join(missing)}.\n"
+            "Your copy of the code is incomplete or out of date. Inside the "
+            "Networks folder run:\n"
+            "    git pull\n"
+            "    git checkout -- flight_bot/templates\n"
+            "then start the app again.")
+
+    app = Flask(__name__, template_folder=str(_TEMPLATES))
     app.secret_key = "flight-bot-local-gui"  # local single-user app
     db.init_db()
 
@@ -157,9 +173,24 @@ def create_app(config: dict) -> Flask:
 
     @app.route("/relink", methods=["POST"])
     def relink():
-        rebuild_flights()
-        flash("Emails re-linked.")
+        count = rebuild_flights()
+        flash(f"Emails re-linked into {count} flight(s).")
         return redirect(url_for("index"))
+
+    @app.route("/emails")
+    def emails():
+        """Inspector: every stored email, what was extracted, and which
+        flight it was linked to — for debugging linking problems."""
+        flight_by_email = {}
+        for flight in db.list_flights():
+            full = db.get_flight(flight["id"])
+            for e in full.get("emails", []):
+                flight_by_email[e["db_id"]] = flight
+        rows = db.all_emails()
+        rows.sort(key=lambda e: e.get("date") or "", reverse=True)
+        for e in rows:
+            e["flight"] = flight_by_email.get(e["db_id"])
+        return render_template("emails.html", emails=rows)
 
     return app
 
