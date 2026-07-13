@@ -1033,12 +1033,20 @@ def _prepare_saudia(page, payload: dict, update):
     page.wait_for_timeout(900)
     _select(page, ["travel complaint or compliment", "request type"], [
         r"^complaint$"])
-    page.wait_for_timeout(1200)
+    try:
+        page.get_by_label(re.compile("booking reference", re.I)).first.wait_for(
+            state="visible", timeout=10000)
+    except Exception:
+        page.wait_for_timeout(1500)
     _fill(page, ["booking reference"], payload["pnr"])
     _fill(page, ["ticket number"], payload["ticket_number"])
     _fill(page, ["last name"], payload["last_name"])
     if _click(page, ["Next"]):
-        page.wait_for_timeout(3500)
+        try:
+            page.get_by_label(re.compile("first name", re.I)).first.wait_for(
+                state="visible", timeout=15000)
+        except Exception:
+            page.wait_for_timeout(3500)
     _fill_common(page, payload)
 
 
