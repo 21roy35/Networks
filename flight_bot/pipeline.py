@@ -1,5 +1,7 @@
 """Glue: ingest raw emails -> parse -> store -> link -> flights table."""
 
+import time
+
 from . import db
 from .config import SAMPLE_EMAILS_DIR
 from .linker import link_emails
@@ -7,7 +9,7 @@ from .mail_client import fetch_airline_emails, load_eml_files
 from .parser import parse_email
 
 
-def ingest(raw_emails, log=print) -> int:
+def ingest(raw_emails, log=print, progress: dict | None = None) -> int:
     """Parse and store raw email dicts; returns number of flight emails kept."""
     db.init_db()
     kept = 0
@@ -18,6 +20,8 @@ def ingest(raw_emails, log=print) -> int:
             continue
         db.save_email(parsed)
         kept += 1
+        if progress is not None:
+            progress["kept"] = kept
         log(f"  + [{','.join(parsed.kinds) or 'other'}] {parsed.subject[:70]}")
     return kept
 
@@ -31,10 +35,17 @@ def rebuild_flights(log=print) -> int:
     return len(flights)
 
 
-def scan_mailbox(config: dict, log=print) -> int:
-    kept = ingest(fetch_airline_emails(config, log=log), log=log)
+def scan_mailbox(config: dict, log=print, progress: dict | None = None) -> int:
+    if progress is None:
+        progress = {}
+    progress.setdefault("started", time.time())
+    kept = ingest(fetch_airline_emails(config, log=log, progress=progress),
+                  log=log, progress=progress)
     log(f"Stored {kept} flight-related email(s).")
-    return rebuild_flights(log=log)
+    progress["phase"] = "linking"
+    flights = rebuild_flights(log=log)
+    progress.update(phase="done", flights=flights, finished=time.time())
+    return flights
 
 
 def load_demo(log=print) -> int:

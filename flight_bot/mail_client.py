@@ -8,6 +8,7 @@ import email
 import email.policy
 import imaplib
 import re
+import time
 from datetime import datetime, timedelta
 from email.utils import parseaddr, parsedate_to_datetime
 
@@ -76,8 +77,12 @@ def _search_queries(since: str) -> list[str]:
     return queries
 
 
-def fetch_airline_emails(config: dict, log=print):
-    """Yield raw email dicts for every candidate airline email found."""
+def fetch_airline_emails(config: dict, log=print, progress: dict | None = None):
+    """Yield raw email dicts for every candidate airline email found.
+
+    `progress` (if given) is updated in place with phase / total /
+    processed / fetch_started so callers can display a live ETA.
+    """
     imap_cfg = config["imap"]
     if not imap_cfg["user"] or not imap_cfg["password"]:
         raise SystemExit(
@@ -90,10 +95,19 @@ def fetch_airline_emails(config: dict, log=print):
     since_dt = datetime.now() - timedelta(days=imap_cfg.get("since_days", 730))
     since = since_dt.strftime("%d-%b-%Y")
 
+    if progress is None:
+        progress = {}
+    progress.update(phase="connecting", total=0, processed=0)
+
     log(f"Connecting to {imap_cfg['host']} as {imap_cfg['user']} ...")
     conn = imaplib.IMAP4_SSL(imap_cfg["host"], imap_cfg.get("port", 993))
     try:
         conn.login(imap_cfg["user"], imap_cfg["password"])
+
+        # Phase 1: search every folder first so the total (and therefore an
+        # ETA) is known before fetching starts.
+        progress["phase"] = "searching"
+        todo: list[tuple[str, bytes]] = []
         for folder in imap_cfg.get("folders", ["INBOX"]):
             status, _ = conn.select(folder, readonly=True)
             if status != "OK":
@@ -108,18 +122,46 @@ def fetch_airline_emails(config: dict, log=print):
                 if status == "OK" and data and data[0]:
                     uids.update(data[0].split())
             log(f"  {folder}: {len(uids)} candidate emails since {since}")
-            for uid in sorted(uids, key=lambda u: int(u)):
-                status, data = conn.uid("FETCH", uid, "(RFC822)")
-                if status != "OK" or not data or data[0] is None:
-                    continue
-                msg = email.message_from_bytes(
-                    data[0][1], policy=email.policy.default)
-                yield message_to_raw(msg)
+            todo.extend((folder, uid) for uid in
+                        sorted(uids, key=lambda u: int(u)))
+
+        # Phase 2: fetch, updating progress as we go.
+        progress.update(phase="fetching", total=len(todo),
+                        fetch_started=time.time())
+        current_folder = None
+        for folder, uid in todo:
+            if folder != current_folder:
+                conn.select(folder, readonly=True)
+                current_folder = folder
+            status, data = conn.uid("FETCH", uid, "(RFC822)")
+            progress["processed"] += 1
+            if progress["processed"] % 25 == 0:
+                log(f"  fetched {progress['processed']}/{progress['total']} "
+                    f"emails (ETA {eta_text(progress) or '...'})")
+            if status != "OK" or not data or data[0] is None:
+                continue
+            msg = email.message_from_bytes(
+                data[0][1], policy=email.policy.default)
+            yield message_to_raw(msg)
     finally:
         try:
             conn.logout()
         except Exception:
             pass
+
+
+def eta_text(progress: dict) -> str | None:
+    """Human-readable time remaining for the fetch phase, e.g. '1m 24s'."""
+    total = progress.get("total") or 0
+    processed = progress.get("processed") or 0
+    started = progress.get("fetch_started")
+    if not started or not total or processed < 3 or processed >= total:
+        return None
+    rate = (time.time() - started) / processed
+    remaining = int(rate * (total - processed))
+    if remaining >= 60:
+        return f"{remaining // 60}m {remaining % 60:02d}s"
+    return f"{remaining}s"
 
 
 def load_eml_files(directory, log=print):

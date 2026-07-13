@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Scanning mailbox – Flight Bot{% endblock %}
+{% block content %}
+<div class="card" style="max-width:640px;margin:40px auto">
+  <h2 style="margin-top:0">Scanning your mailbox</h2>
+  <p class="muted" id="phase">Connecting…</p>
+
+  <div style="background:#e6eaf0;border-radius:999px;height:14px;overflow:hidden">
+    <div id="bar" style="background:var(--accent);height:100%;width:0%;
+         border-radius:999px;transition:width .6s"></div>
+  </div>
+
+  <p style="display:flex;justify-content:space-between">
+    <span id="counts" class="muted"></span>
+    <b id="eta"></b>
+  </p>
+  <p class="muted" id="kept"></p>
+  <p id="errorbox" class="flash" style="display:none"></p>
+  <p><a class="btn" href="{{ url_for('index') }}">← Back to flights</a>
+     <span class="muted">— the scan keeps running in the background.</span></p>
+</div>
+
+<script>
+const PHASE_TEXT = {
+  starting:   "Starting…",
+  connecting: "Connecting to your mail server…",
+  searching:  "Searching folders for airline emails…",
+  fetching:   "Downloading and parsing emails…",
+  linking:    "Linking related emails into flights…",
+};
+
+async function poll() {
+  let p;
+  try {
+    p = await (await fetch("{{ url_for('scan_progress') }}")).json();
+  } catch (e) { setTimeout(poll, 2500); return; }
+
+  if (p.phase === "done") {
+    location = "{{ url_for('index') }}";
+    return;
+  }
+  if (p.phase === "error") {
+    document.getElementById("phase").textContent = "Scan stopped.";
+    const box = document.getElementById("errorbox");
+    box.style.display = "block";
+    box.textContent = p.error || "Unknown error.";
+    return;
+  }
+  document.getElementById("phase").textContent = PHASE_TEXT[p.phase] || p.phase;
+  document.getElementById("bar").style.width = p.percent + "%";
+  document.getElementById("counts").textContent =
+    p.total ? `${p.processed} of ${p.total} emails` : "";
+  document.getElementById("eta").textContent =
+    p.eta ? `~${p.eta} left` : (p.phase === "fetching" ? "estimating…" : "");
+  document.getElementById("kept").textContent =
+    p.kept ? `${p.kept} flight-related email(s) found so far` : "";
+  setTimeout(poll, 1200);
+}
+poll();
+</script>
+{% endblock %}

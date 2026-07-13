@@ -1,12 +1,36 @@
 """Flask web GUI: flight list -> flight detail with copyable fields,
 compensation assessment and one-click complaint generation."""
 
-from flask import (Flask, flash, redirect, render_template, request, url_for)
+import threading
+
+from flask import (Flask, flash, jsonify, redirect, render_template, request,
+                   url_for)
 
 from . import db
 from .compensation import assess, effective
 from .complaints import airline_complaint, gaca_complaint, send_email
+from .mail_client import eta_text
 from .pipeline import load_demo, rebuild_flights, scan_mailbox
+
+_ACTIVE_PHASES = {"starting", "connecting", "searching", "fetching", "linking"}
+
+# Progress of the (single) background mailbox scan, polled by the GUI.
+_scan_progress: dict = {}
+_scan_lock = threading.Lock()
+
+
+def _scan_running() -> bool:
+    return _scan_progress.get("phase") in _ACTIVE_PHASES
+
+
+def _run_scan(config: dict):
+    try:
+        scan_mailbox(config, log=lambda *a, **k: None,
+                     progress=_scan_progress)
+    except SystemExit as exc:  # missing credentials etc.
+        _scan_progress.update(phase="error", error=str(exc))
+    except Exception as exc:
+        _scan_progress.update(phase="error", error=f"Scan failed: {exc}")
 
 
 def create_app(config: dict) -> Flask:
@@ -16,6 +40,15 @@ def create_app(config: dict) -> Flask:
 
     @app.route("/")
     def index():
+        # Report the outcome of a finished background scan exactly once.
+        phase = _scan_progress.get("phase")
+        if phase in ("done", "error") and not _scan_progress.get("reported"):
+            _scan_progress["reported"] = True
+            if phase == "done":
+                flash(f"Mailbox scanned — {_scan_progress.get('flights')} "
+                      "flight(s) linked.")
+            else:
+                flash(_scan_progress.get("error") or "Scan failed.")
         flights = db.list_flights()
         for flight in flights:
             flight["assessment"] = assess(flight)
@@ -85,14 +118,36 @@ def create_app(config: dict) -> Flask:
 
     @app.route("/scan", methods=["POST"])
     def scan():
-        try:
-            count = scan_mailbox(config)
-            flash(f"Mailbox scanned — {count} flight(s) linked.")
-        except SystemExit as exc:
-            flash(str(exc))
-        except Exception as exc:
-            flash(f"Scan failed: {exc}")
-        return redirect(url_for("index"))
+        with _scan_lock:
+            if _scan_running():
+                return redirect(url_for("scan_status"))
+            _scan_progress.clear()
+            _scan_progress.update(phase="starting", total=0, processed=0,
+                                  kept=0)
+            threading.Thread(target=_run_scan, args=(config,),
+                             daemon=True).start()
+        return redirect(url_for("scan_status"))
+
+    @app.route("/scan/status")
+    def scan_status():
+        if not _scan_progress:
+            return redirect(url_for("index"))
+        return render_template("scan.html")
+
+    @app.route("/scan/progress.json")
+    def scan_progress():
+        p = _scan_progress
+        total, processed = p.get("total") or 0, p.get("processed") or 0
+        return jsonify({
+            "phase": p.get("phase", "idle"),
+            "total": total,
+            "processed": processed,
+            "kept": p.get("kept", 0),
+            "flights": p.get("flights"),
+            "percent": round(100 * processed / total) if total else 0,
+            "eta": eta_text(p),
+            "error": p.get("error"),
+        })
 
     @app.route("/demo", methods=["POST"])
     def demo():
