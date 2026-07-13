@@ -261,8 +261,13 @@ class TelegramCoordinator:
             return
         if text == "/status":
             counts = db.counts()
-            ai_status = (f" {self.ai.name} AI is active on {self.ai.model}."
-                         if self.ai.enabled else " AI assistance is off.")
+            if self.ai.enabled and self.ai.last_error:
+                ai_status = (f" {self.ai.name} is configured on {self.ai.model}, "
+                             f"but its last request failed: {self.ai.last_error}.")
+            elif self.ai.enabled:
+                ai_status = f" {self.ai.name} AI is configured on {self.ai.model}."
+            else:
+                ai_status = " AI assistance is off."
             self.notify(
                 f"FlightDeck is running. {counts['flights']} flights, "
                 f"{counts['complaints']} complaints, {counts['emails']} parsed emails."
@@ -420,6 +425,11 @@ class TelegramCoordinator:
             self.notify(f"{self.ai.name} is organizing the issue and checking the safest next stepâ€¦")
             ai_analysis = self.ai.analyze_incident(
                 intake.incident, flight, intake.attachments)
+            if ai_analysis is None:
+                reason = self.ai.last_error or "AI request unavailable"
+                self.notify(
+                    f"{self.ai.name} could not analyze this issue ({reason}). "
+                    "I am continuing with the original statement and deterministic portal automation.")
         try:
             payload = complaint_payload(
                 flight, self.config["user"], "airline", intake.incident,

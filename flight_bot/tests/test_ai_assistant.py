@@ -9,6 +9,7 @@ class FakeResponse:
     def __init__(self, value, status=200):
         self.value = value
         self.status = status
+        self.status_code = status
 
     def raise_for_status(self):
         if self.status >= 400:
@@ -92,3 +93,15 @@ def test_ai_failure_is_non_fatal_and_does_not_expose_response_data():
         enabled_config(), session=FakeSession({"error": "sensitive"}, status=500))
     assert assistant.analyze_response("subject", "body", "CASE-1", "Airline") is None
     assert "sensitive" not in assistant.last_error
+
+
+def test_low_credit_error_is_actionable_without_copying_api_response():
+    response = {"error": {
+        "type": "invalid_request_error",
+        "message": "Your credit balance is too low. purchase credits. secret detail",
+    }}
+    assistant = ClaudeAssistant(
+        enabled_config(), session=FakeSession(response, status=400))
+    assert assistant.analyze_response("subject", "body", "CASE-1", "Airline") is None
+    assert assistant.last_error == "Anthropic credit balance is too low"
+    assert "secret detail" not in assistant.last_error

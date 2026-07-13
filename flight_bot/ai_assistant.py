@@ -29,6 +29,24 @@ class ClaudeAssistant:
     def enabled(self) -> bool:
         return bool(self.settings.get("enabled") and self.api_key)
 
+    @staticmethod
+    def _safe_http_error(response) -> str:
+        """Classify API failures without retaining response data or PII."""
+        try:
+            message = str((response.json().get("error") or {}).get("message") or "")
+        except (ValueError, TypeError, AttributeError):
+            message = ""
+        lowered = message.lower()
+        if "credit balance" in lowered or "purchase credits" in lowered:
+            return "Anthropic credit balance is too low"
+        if response.status_code in {401, 403} or "api key" in lowered:
+            return "Anthropic API key was rejected"
+        if response.status_code == 429 or "rate limit" in lowered:
+            return "Anthropic rate limit reached"
+        if "model" in lowered:
+            return "Configured Anthropic model is unavailable"
+        return f"Anthropic API returned HTTP {response.status_code}"
+
     def _structured(self, prompt: str, schema: dict, *, image: bytes | None = None,
                     images: list[tuple[str, bytes]] | None = None,
                     max_tokens: int = 1200) -> dict[str, Any] | None:
@@ -75,7 +93,9 @@ class ClaudeAssistant:
                 json=body,
                 timeout=max(5, int(self.settings.get("timeout_seconds", 45))),
             )
-            response.raise_for_status()
+            if response.status_code >= 400:
+                self.last_error = self._safe_http_error(response)
+                return None
             result = response.json()
             blocks = result.get("content") or []
             if not blocks or blocks[0].get("type") != "text":
