@@ -241,7 +241,10 @@ def _select(page, labels: list[str], choices: list[str]) -> bool:
             control = field.locator("mat-select")
             if not _visible(control):
                 continue
-            control.first.click()
+            # Saudia may leave a transparent Medallia feedback overlay in a
+            # persistent profile. The field itself is visible and enabled;
+            # force the intended Material control instead of the overlay.
+            control.first.click(force=True)
             page.wait_for_timeout(300)
             options = page.locator("mat-option")
             for index in range(options.count()):
@@ -251,7 +254,7 @@ def _select(page, labels: list[str], choices: list[str]) -> bool:
                 option_text = re.sub(r"\s+", " ", option.inner_text()).strip()
                 if any(re.search(choice, option_text, re.I)
                        for choice in choices):
-                    option.click()
+                    option.click(force=True)
                     page.wait_for_timeout(750)
                     return True
             page.keyboard.press("Escape")

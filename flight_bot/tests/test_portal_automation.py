@@ -128,7 +128,7 @@ def test_material_dropdown_is_selected_from_allowed_choice():
         def is_visible(self):
             return True
 
-        def click(self):
+        def click(self, **_kwargs):
             pass
 
     class Option:
@@ -141,7 +141,7 @@ def test_material_dropdown_is_selected_from_allowed_choice():
         def inner_text(self):
             return self.text
 
-        def click(self):
+        def click(self, **_kwargs):
             selected.append(self.text)
 
     class Options:
