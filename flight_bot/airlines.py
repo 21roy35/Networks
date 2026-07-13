@@ -4,7 +4,7 @@ AIRLINES = {
     "SV": {
         "name": "Saudia",
         "domains": ["saudia.com", "saudiairlines.com", "alfursan.saudia.com"],
-        "complaint_url": "https://prod.dcloud.saudia.com/pages/help/contact-us/guest-relations/contact-form?sc_country=SA&sc_lang=en",
+        "complaint_url": "https://booking-uat.dcloud.saudia.com/forms/contact-form",
     },
     "XY": {
         "name": "flynas",

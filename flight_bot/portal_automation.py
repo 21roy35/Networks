@@ -30,6 +30,11 @@ _BROWSER_LOCK = threading.Lock()
 _VERIFICATION_HANDLER: Callable[[dict], object] | None = None
 _AI_HANDLER: Callable[[dict], dict | None] | None = None
 _AI_MAX_ATTEMPTS = 3
+_CHROME_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/138.0.0.0 Safari/537.36"
+)
 
 
 @dataclass(frozen=True)
@@ -130,14 +135,21 @@ def _launch_context(playwright):
                 if configured else sys.platform != "win32")
     options = dict(user_data_dir=str(_PROFILE_DIR), headless=headless,
                    viewport={"width": 1360, "height": 900},
-                   locale="en-US")
+                   locale="en-US", timezone_id="Asia/Riyadh",
+                   user_agent=_CHROME_USER_AGENT,
+                   args=["--disable-blink-features=AutomationControlled"])
+    context = None
     if sys.platform == "win32":
         try:
-            return playwright.chromium.launch_persistent_context(
+            context = playwright.chromium.launch_persistent_context(
                 channel="msedge", **options)
         except Exception:
             pass
-    return playwright.chromium.launch_persistent_context(**options)
+    if context is None:
+        context = playwright.chromium.launch_persistent_context(**options)
+    context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    return context
 
 
 def _visible(locator):
@@ -213,6 +225,41 @@ def _select(page, labels: list[str], choices: list[str]) -> bool:
                     return True
             except Exception:
                 continue
+    # Saudia's current Angular form uses Material mat-select controls rather
+    # than native <select> elements.
+    try:
+        material_fields = page.locator("mat-form-field").all()
+    except Exception:
+        material_fields = []
+    for field in material_fields:
+        try:
+            if not field.is_visible():
+                continue
+            field_text = re.sub(r"\s+", " ", field.inner_text()).strip()
+            if not any(re.search(label, field_text, re.I) for label in labels):
+                continue
+            control = field.locator("mat-select")
+            if not _visible(control):
+                continue
+            control.first.click()
+            page.wait_for_timeout(300)
+            options = page.locator("mat-option")
+            for index in range(options.count()):
+                option = options.nth(index)
+                if not option.is_visible():
+                    continue
+                option_text = re.sub(r"\s+", " ", option.inner_text()).strip()
+                if any(re.search(choice, option_text, re.I)
+                       for choice in choices):
+                    option.click()
+                    page.wait_for_timeout(750)
+                    return True
+            page.keyboard.press("Escape")
+        except Exception:
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
     return False
 
 
@@ -256,6 +303,19 @@ def _body_text(page) -> str:
         return page.locator("body").inner_text(timeout=3000)
     except Exception:
         return ""
+
+
+def _request_blocked(page) -> bool:
+    """Detect WAF/error pages before they are mistaken for a form."""
+    try:
+        title = page.title()
+    except Exception:
+        title = ""
+    text = _body_text(page)[:2500]
+    return bool(re.search(
+        r"the request is blocked|pardon our interruption|access denied|"
+        r"request (?:was )?rejected|service unavailable",
+        f"{title}\n{text}", re.I))
 
 
 def _needs_human_step(page) -> str:
@@ -944,12 +1004,17 @@ def _fill_common(page, payload: dict):
 
 def _prepare_saudia(page, payload: dict, update):
     update("filling", "Filling Saudia’s official Complaints & Feedback form…")
-    _select(page, ["service type"], ["complaint", "post.travel"])
+    _select(page, ["service type"], [
+        "travel complaint or compliment", "post.travel"])
+    page.wait_for_timeout(900)
+    _select(page, ["travel complaint or compliment", "request type"], [
+        r"^complaint$"])
+    page.wait_for_timeout(1200)
     _fill(page, ["booking reference"], payload["pnr"])
     _fill(page, ["ticket number"], payload["ticket_number"])
     _fill(page, ["last name"], payload["last_name"])
     if _click(page, ["Next"]):
-        page.wait_for_timeout(2500)
+        page.wait_for_timeout(3500)
     _fill_common(page, payload)
 
 
@@ -1029,6 +1094,11 @@ def _await_confirmation(page, before_url: str, update,
         if page.is_closed():
             return PortalResult("needs_attention",
                                 "The official portal was closed before a confirmation was detected.")
+        if _request_blocked(page):
+            return PortalResult(
+                "needs_attention",
+                "The official site blocked the VPS browser request. This is not a "
+                "CAPTCHA or a missing form field, so no verification reply was applied.")
         text = _body_text(page)
         reference = _extract_reference(text) or _extract_reference_from_url(page.url)
         success = re.search(
@@ -1127,7 +1197,14 @@ def submit_portal_claim(payload: dict, update: Callable[[str, str], None]) -> Po
         try:
             update("opening", "Opening the official website in Microsoft Edge…")
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(3500)
+            if _request_blocked(page):
+                return PortalResult(
+                    "needs_attention",
+                    "The official site blocked the VPS browser request. FlightDeck "
+                    "stopped instead of treating the block page as a complaint form.")
             _click(page, ["Accept", "Accept all", "Allow all", "موافق"])
+            page.wait_for_timeout(500)
             kind = payload["kind"]
             code = payload.get("airline_code")
             if kind == "gaca":
@@ -1140,6 +1217,11 @@ def submit_portal_claim(payload: dict, update: Callable[[str, str], None]) -> Po
                 _prepare_flyadeal(page, payload, update)
             else:
                 _prepare_generic(page, payload, update)
+
+            if _request_blocked(page):
+                return PortalResult(
+                    "needs_attention",
+                    "The official site blocked the VPS browser while preparing the form.")
 
             if not _wait_for_human_step(page, update):
                 return PortalResult(

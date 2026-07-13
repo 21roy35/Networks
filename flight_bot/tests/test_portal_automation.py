@@ -1,6 +1,7 @@
 import pytest
 
 from flight_bot import portal_automation
+from flight_bot.airlines import AIRLINES
 from flight_bot.complaints import complaint_payload, missing_portal_fields
 from flight_bot.portal_automation import (_extract_reference,
                                           _extract_reference_from_url, _is_official_url)
@@ -75,6 +76,125 @@ def test_only_official_registry_hosts_are_accepted():
     assert _is_official_url("https://myeservices.gaca.gov.sa/service")
     assert not _is_official_url("https://gaca.gov.sa.evil.example/claim")
     assert not _is_official_url("https://example.com/claim")
+
+
+def test_saudia_uses_current_public_complaint_form():
+    assert AIRLINES["SV"]["complaint_url"] == (
+        "https://booking-uat.dcloud.saudia.com/forms/contact-form")
+    assert _is_official_url(AIRLINES["SV"]["complaint_url"])
+
+
+def test_block_page_is_not_mistaken_for_a_form():
+    class Body:
+        def inner_text(self, timeout=None):
+            return "The request is blocked. Tracking reference 123."
+
+    class Page:
+        def title(self):
+            return "Service unavailable"
+
+        def locator(self, selector):
+            assert selector == "body"
+            return Body()
+
+    assert portal_automation._request_blocked(Page()) is True
+
+
+def test_material_dropdown_is_selected_from_allowed_choice():
+    selected = []
+
+    class Empty:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 0
+
+        def all(self):
+            return []
+
+        def is_visible(self):
+            return False
+
+    class Control:
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def click(self):
+            pass
+
+    class Option:
+        def __init__(self, text):
+            self.text = text
+
+        def is_visible(self):
+            return True
+
+        def inner_text(self):
+            return self.text
+
+        def click(self):
+            selected.append(self.text)
+
+    class Options:
+        def __init__(self):
+            self.values = [Option("Please Select"),
+                           Option("Travel complaint or compliment")]
+
+        def count(self):
+            return len(self.values)
+
+        def nth(self, index):
+            return self.values[index]
+
+    class Field:
+        def is_visible(self):
+            return True
+
+        def inner_text(self):
+            return "Please Select Service type *"
+
+        def locator(self, selector):
+            assert selector == "mat-select"
+            return Control()
+
+    class Fields:
+        def all(self):
+            return [Field()]
+
+    class Keyboard:
+        def press(self, _key):
+            pass
+
+    class Page:
+        keyboard = Keyboard()
+
+        def get_by_label(self, _pattern):
+            return Empty()
+
+        def locator(self, selector):
+            if selector == "select":
+                return Empty()
+            if selector == "mat-form-field":
+                return Fields()
+            if selector == "mat-option":
+                return Options()
+            raise AssertionError(selector)
+
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+    assert portal_automation._select(
+        Page(), ["service type"], ["travel complaint or compliment"])
+    assert selected == ["Travel complaint or compliment"]
 
 
 def test_reference_is_extracted_from_official_confirmation_text():
