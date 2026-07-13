@@ -195,8 +195,12 @@ _PNR_STOPWORDS = {"NUMBER", "BOOKING", "TICKET", "FLIGHT", "TRAVEL",
 
 _PAYMENT_RE = re.compile(
     r"\b(visa|mastercard|master\s*card|mada|american\s+express|amex|apple\s+pay|"
-    r"stc\s+pay|paypal|tabby|tamara)\b(?:\s*(?:card|credit\s+card|debit\s+card))?"
-    r"(?:[^\n]{0,30}?(?:ending(?:\s+in)?|\*{2,}|x{2,})\s*(\d{4}))?",
+    r"stc\s+pay|paypal|tabby|tamara)\b(?:\s*(?:card|credit\s+card|debit\s+card))?",
+    re.IGNORECASE,
+)
+_CARD_LAST4_RE = re.compile(
+    r"(?:ending\s*(?:(?:in|with)\s*)?|last\s*(?:four|4)(?:\s*digits)?\s*|"
+    r"(?:[•*xX][\s-]*){2,})[:#\s-]*(\d{4})\b",
     re.IGNORECASE,
 )
 _AMOUNT_RE = re.compile(
@@ -696,8 +700,12 @@ def parse_email(message_id: str, subject: str, sender: str, date: datetime | Non
 
     if m := _PAYMENT_RE.search(text):
         method = re.sub(r"\s+", " ", m.group(1)).title()
-        method = {"Amex": "American Express", "Mada": "MADA", "Stc Pay": "STC Pay"}.get(method, method)
-        parsed.payment_method = method + (f" •••• {m.group(2)}" if m.group(2) else "")
+        method = {"Amex": "American Express", "Master Card": "Mastercard",
+                  "Mada": "MADA", "Stc Pay": "STC Pay"}.get(method, method)
+        nearby = text[m.start():m.start() + 140]
+        last_four_match = _CARD_LAST4_RE.search(nearby)
+        last_four = last_four_match.group(1) if last_four_match else ""
+        parsed.payment_method = method + (f" •••• {last_four}" if last_four else "")
     if m := _AMOUNT_RE.search(text):
         parsed.currency = (m.group(1) or m.group(3) or "").upper() or None
         parsed.amount = m.group(2)

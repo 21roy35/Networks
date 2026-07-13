@@ -1,4 +1,5 @@
 from copy import deepcopy
+from datetime import datetime
 
 import pytest
 
@@ -6,6 +7,7 @@ from flight_bot import db
 from flight_bot.config import DEFAULTS
 from flight_bot.webapp import (_filter_flights, _flight_view, _flights_as_text,
                                _payment_card, create_app)
+from flight_bot.parser import parse_email
 
 
 def sample_flight(key, number, passenger, payment):
@@ -36,6 +38,20 @@ def test_payment_card_keeps_brand_and_last_four_only():
     assert _payment_card("Visa 4111111111111234") == "Visa •••• 1234"
     assert _payment_card("Mastercard") == "Mastercard"
     assert _payment_card("") == ""
+
+
+@pytest.mark.parametrize("payment_line, expected", [
+    ("Paid with Visa ending in 4242", "Visa •••• 4242"),
+    ("Payment: MADA ****9911", "MADA •••• 9911"),
+    ("Master Card last 4 digits: 7788", "Mastercard •••• 7788"),
+])
+def test_email_parser_extracts_card_last_four(payment_line, expected):
+    parsed = parse_email(
+        "<payment-test>", "Booking confirmed ABC123", "booking@saudia.com",
+        datetime(2026, 7, 14, 10, 0),
+        f"Passenger: Test Passenger\nFlight SV101 RUH to JED\n{payment_line}")
+    assert parsed is not None
+    assert parsed.payment_method == expected
 
 
 def test_passenger_and_card_filters_compose_exactly():
