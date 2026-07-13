@@ -16,13 +16,14 @@ from pathlib import Path
 import requests
 
 from . import db
+from .ai_assistant import ClaudeAssistant
 from .airlines import AIRLINES
 from .complaints import complaint_payload, missing_portal_fields
 from .config import TELEGRAM_EVIDENCE_DIR
 from .flight_status import live_landed, parse_flight_time, schedule_has_finished
 from .pipeline import scan_mailbox
-from .portal_automation import (PortalResult, set_verification_handler,
-                                start_portal_job)
+from .portal_automation import (PortalResult, set_ai_handler,
+                                set_verification_handler, start_portal_job)
 from .web_access import create_web_token
 
 
@@ -128,6 +129,7 @@ class TelegramCoordinator:
         self.settings = config.get("telegram") or {}
         self.chat_id = str(self.settings.get("chat_id") or "")
         self.api = api or TelegramAPI(self.settings.get("bot_token") or "")
+        self.ai = ClaudeAssistant(config)
         self.stop_event = threading.Event()
         self.started_at = datetime.now()
         self.offset = 0
@@ -148,6 +150,9 @@ class TelegramCoordinator:
         db.init_db()
         TELEGRAM_EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
         set_verification_handler(self.request_verification)
+        set_ai_handler(
+            self.ai.portal_decision if self.ai.enabled else None,
+            int(self.ai.settings.get("max_portal_attempts", 3)))
         try:
             self.api.set_commands()
         except Exception:
@@ -163,6 +168,7 @@ class TelegramCoordinator:
     def stop(self):
         self.stop_event.set()
         set_verification_handler(None)
+        set_ai_handler(None)
 
     def notify(self, text: str, buttons=None, force_reply: bool = False) -> dict:
         return self.api.send_message(
@@ -255,9 +261,12 @@ class TelegramCoordinator:
             return
         if text == "/status":
             counts = db.counts()
+            ai_status = (f" {self.ai.name} AI is active on {self.ai.model}."
+                         if self.ai.enabled else " AI assistance is off.")
             self.notify(
                 f"FlightDeck is running. {counts['flights']} flights, "
-                f"{counts['complaints']} complaints, {counts['emails']} parsed emails.")
+                f"{counts['complaints']} complaints, {counts['emails']} parsed emails."
+                + ai_status)
             return
         if text and text.split(maxsplit=1)[0].lower() == "/web":
             self._send_web_link()
@@ -405,10 +414,16 @@ class TelegramCoordinator:
                 self._intakes[flight_key] = intake
             db.update_survey_status(flight_key, "awaiting_details")
             return
+        ai_analysis = None
+        if (self.ai.enabled
+                and self.ai.settings.get("analyze_incidents", True)):
+            self.notify(f"{self.ai.name} is organizing the issue and checking the safest next stepâ€¦")
+            ai_analysis = self.ai.analyze_incident(
+                intake.incident, flight, intake.attachments)
         try:
             payload = complaint_payload(
                 flight, self.config["user"], "airline", intake.incident,
-                attachments=intake.attachments)
+                attachments=intake.attachments, ai_analysis=ai_analysis)
         except ValueError as exc:
             self.notify(str(exc))
             return
@@ -449,11 +464,17 @@ class TelegramCoordinator:
             self.notify("GACA requires the airline complaint reference, which has not been captured yet.")
             return
         incident = prior.get("details") or "The airline response was unsatisfactory."
+        ai_analysis = None
+        if (self.ai.enabled
+                and self.ai.settings.get("analyze_incidents", True)):
+            ai_analysis = self.ai.analyze_incident(
+                incident, flight, prior.get("attachments") or [])
         try:
             payload = complaint_payload(
                 flight, self.config["user"], "gaca", incident,
                 prior["reference"], (prior.get("created_at") or "")[:10],
-                attachments=prior.get("attachments") or [])
+                attachments=prior.get("attachments") or [],
+                ai_analysis=ai_analysis)
         except ValueError as exc:
             self.notify(str(exc))
             return
@@ -561,13 +582,35 @@ class TelegramCoordinator:
                 blob = " ".join((event.get("subject") or "", event.get("body") or ""))
                 if reference and reference not in blob.casefold():
                     continue
-                if not substantive.search(blob):
+                analysis = None
+                if (reference and self.ai.enabled
+                        and self.ai.settings.get("analyze_responses", True)):
+                    analysis = self.ai.analyze_response(
+                        event.get("subject") or "", event.get("body") or "",
+                        complaint.get("reference") or "",
+                        info.get("name") or flight.get("airline_name") or "Airline")
+                if analysis is not None:
+                    if not analysis.get("substantive"):
+                        continue
+                elif not substantive.search(blob):
                     continue
                 db.mark_event_seen(key)
-                excerpt = _clean_excerpt(event.get("body") or event.get("subject") or "")
+                if analysis:
+                    amounts = "; ".join(analysis.get("amounts_or_deadlines") or [])
+                    amount_line = f"\nAmounts/deadlines: {amounts}" if amounts else ""
+                    response_text = (
+                        f"{analysis.get('summary') or 'A substantive response was received.'}"
+                        f"\nOutcome: {str(analysis.get('outcome') or 'unknown').replace('_', ' ')}"
+                        f"{amount_line}\n{self.ai.name} recommends: "
+                        f"{str(analysis.get('recommendation') or 'review').replace('_', ' ')}"
+                        f" â€” {analysis.get('rationale') or 'Review the airline response.'}")
+                else:
+                    response_text = _clean_excerpt(
+                        event.get("body") or event.get("subject") or "")
                 self.notify(
                     f"{info.get('name') or 'The airline'} responded to complaint "
-                    f"{complaint.get('reference') or ''}:\n\n{excerpt}\n\nDo you want me to escalate this to GACA?",
+                    f"{complaint.get('reference') or ''}:\n\n{response_text}\n\n"
+                    "Do you want me to escalate this to GACA?",
                     buttons=_buttons([[
                         ("Escalate to GACA", f"escalate:{complaint['flight_id']}"),
                         ("No, close", f"close_case:{complaint['flight_id']}"),

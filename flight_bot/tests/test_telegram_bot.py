@@ -183,6 +183,42 @@ def test_substantive_airline_response_offers_gaca_escalation(coordinator):
     assert buttons[0]["callback_data"].startswith("escalate:")
 
 
+def test_ghala_interprets_matched_airline_response_before_escalation(coordinator):
+    bot, api = coordinator
+
+    class FakeGhala:
+        enabled = True
+        name = "Ghala-200"
+        model = "claude-sonnet-5"
+        settings = {"analyze_responses": True}
+
+        def analyze_response(self, *_args):
+            return {
+                "summary": "The airline declined compensation.",
+                "outcome": "declined", "amounts_or_deadlines": [],
+                "recommendation": "escalate",
+                "rationale": "The complaint was closed without a remedy.",
+                "substantive": True,
+            }
+
+    bot.ai = FakeGhala()
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Claim", "submitted",
+        reference="CAS-667788", details="Broken seat")
+    db.save_mail_event({
+        "message_id": "<ai-reply@example>", "subject": "Case CAS-667788 update",
+        "sender": "customer.relations@saudia.com", "date": datetime.now(),
+        "body": "We have completed our review of CAS-667788.",
+    })
+    bot.check_complaint_responses()
+    assert len(api.messages) == 1
+    assert "declined compensation" in api.messages[0]["text"]
+    assert "Ghala-200 recommends: escalate" in api.messages[0]["text"]
+
+
 def test_closed_case_ignores_later_airline_messages(coordinator):
     bot, api = coordinator
     load_demo(log=lambda *_args, **_kwargs: None)

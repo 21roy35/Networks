@@ -13,6 +13,7 @@ FlightDeck turns airline messages into complete flight records, tracks each jour
 - Escalates eligible airline complaints through GACA's official E-Services website.
 - Saves incident photos, official complaint references, status, and response history.
 - Uses Telegram for post-flight check-ins, issue/photo intake, OTP and CAPTCHA assistance, airline-response alerts, and one-tap GACA escalation.
+- Uses the optional Ghala-200 Claude assistant to organize plain-language incidents, understand airline decisions, and recover safely when an official portal changes.
 
 After the one-time profile and integration setup, the only per-incident input is a plain-language description such as “the seat was broken and the screen did not work,” plus any photos. FlightDeck supplies the stored passenger, booking, flight, evidence, legal basis, and requested remedies.
 
@@ -59,6 +60,16 @@ If the portal requests an OTP, text CAPTCHA, image-grid CAPTCHA, missing require
 
 FlightDeck scans the configured inbox for substantive airline replies. When one is matched to a submitted complaint, it sends a concise excerpt to Telegram and offers **Escalate to GACA** or **No, close**. GACA receives the original incident, evidence, flight data, airline complaint date, and airline reference automatically.
 
+When Ghala-200 is enabled, it summarizes the airline's actual outcome, extracts stated amounts or deadlines, and recommends whether to accept, reply, wait, review, or escalate. The recommendation never files an escalation by itself; the Telegram buttons remain the authority for that step.
+
+## Ghala-200 AI assistance
+
+Set `FLIGHTBOT_ANTHROPIC_API_KEY` on the server to enable the guarded Anthropic integration. The default model is `claude-sonnet-5`, and the display name is `Ghala-200`; either can be overridden with `FLIGHTBOT_AI_MODEL` and `FLIGHTBOT_AI_NAME`.
+
+Ghala-200 receives only the complaint facts needed for its task. For portal recovery it may receive the current official-page screenshot, visible control metadata, and complaint payload. It may fill exact values already present in that payload or select safe navigation such as **Next**, **Continue**, or **Retry**. Code-level guardrails prevent it from supplying passwords, OTPs, CAPTCHA answers, security information, declarations, payment details, invented values, or final submission actions. Those protected steps are relayed to Telegram with a screenshot.
+
+If Anthropic is unavailable or returns an unusable answer, FlightDeck continues with its deterministic form mappings and Telegram assistance. AI output can be wrong and is not legal advice. Anthropic API usage may incur model charges.
+
 ## Flight completion detection
 
 The default `schedule` provider triggers after the stored arrival time plus `post_flight_delay_minutes`. For live landed-state checks, configure FlightAware AeroAPI:
@@ -97,6 +108,9 @@ FLIGHTBOT_TELEGRAM_CHAT_ID
 FLIGHTBOT_FLIGHTAWARE_API_KEY
 FLIGHTBOT_PUBLIC_BASE_URL
 FLIGHTBOT_WEB_ACCESS_SECRET
+FLIGHTBOT_ANTHROPIC_API_KEY
+FLIGHTBOT_AI_MODEL
+FLIGHTBOT_AI_NAME
 ```
 
 ## How it works
@@ -109,6 +123,7 @@ FLIGHTBOT_WEB_ACCESS_SECRET
 | Store | `db.py` | Stores flights, corrections, evidence, complaint status, responses, and official references in SQLite |
 | Assess | `compensation.py` | Checks GACA, EU/EEA, and UK passenger-rights coverage |
 | Prepare | `complaints.py` | Builds a structured portal payload from the incident and extracted facts |
+| Understand | `ai_assistant.py` | Organizes incidents, interprets replies, and proposes guarded portal recovery actions |
 | Submit | `portal_automation.py` | Drives the official website in visible Edge and relays verification |
 | Track | `flight_status.py` | Detects scheduled completion or optional live landed status |
 | Converse | `telegram_bot.py` | Runs post-flight intake, verification, response alerts, and escalation |

@@ -54,6 +54,19 @@ DEFAULTS = {
         "flightaware_api_key": "",
         "poll_minutes": 10,
     },
+    "ai": {
+        "enabled": False,
+        "provider": "anthropic",
+        "name": "Ghala-200",
+        "model": "claude-sonnet-5",
+        "api_key": "",
+        "timeout_seconds": 45,
+        "analyze_incidents": True,
+        "analyze_attachments": True,
+        "analyze_responses": True,
+        "portal_assistance": True,
+        "max_portal_attempts": 3,
+    },
 }
 
 
@@ -96,6 +109,9 @@ def load_config() -> dict:
         ("flight_status", "flightaware_api_key"): "FLIGHTBOT_FLIGHTAWARE_API_KEY",
         ("web", "public_base_url"): "FLIGHTBOT_PUBLIC_BASE_URL",
         ("web", "access_secret"): "FLIGHTBOT_WEB_ACCESS_SECRET",
+        ("ai", "api_key"): "FLIGHTBOT_ANTHROPIC_API_KEY",
+        ("ai", "model"): "FLIGHTBOT_AI_MODEL",
+        ("ai", "name"): "FLIGHTBOT_AI_NAME",
     }
     for (section, key), env_name in env_map.items():
         value = os.environ.get(env_name)
@@ -114,6 +130,8 @@ def load_config() -> dict:
         raise SystemExit("imap.folders must be a JSON list of mailbox names.")
     if config["telegram"].get("bot_token") and config["telegram"].get("chat_id"):
         config["telegram"]["enabled"] = True
+    if config["ai"].get("api_key"):
+        config["ai"]["enabled"] = True
     return config
 
 

@@ -28,6 +28,8 @@ _JOBS_LOCK = threading.Lock()
 _TERMINAL = {"submitted", "needs_attention", "error"}
 _BROWSER_LOCK = threading.Lock()
 _VERIFICATION_HANDLER: Callable[[dict], object] | None = None
+_AI_HANDLER: Callable[[dict], dict | None] | None = None
+_AI_MAX_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,14 @@ def set_verification_handler(handler: Callable[[dict], object] | None):
     """Install a synchronous human-verification relay, normally Telegram."""
     global _VERIFICATION_HANDLER
     _VERIFICATION_HANDLER = handler
+
+
+def set_ai_handler(handler: Callable[[dict], dict | None] | None,
+                   max_attempts: int = 3):
+    """Install the guarded AI portal-state interpreter."""
+    global _AI_HANDLER, _AI_MAX_ATTEMPTS
+    _AI_HANDLER = handler
+    _AI_MAX_ATTEMPTS = max(1, min(int(max_attempts or 3), 10))
 
 
 def _public_job(job: dict) -> dict:
@@ -288,6 +298,145 @@ def _ask_verification(kind: str, message: str, page, image: bytes = b"",
         "choices": choices or [],
         "url": page.url,
     })
+
+
+def _portal_elements(page) -> list[dict]:
+    """Return visible control metadata without passwords or entered values."""
+    try:
+        controls = page.locator(
+            "input:not([type=hidden]), textarea, select, button, "
+            "a[role='button'], input[type='submit']")
+        count = min(controls.count(), 80)
+    except Exception:
+        return []
+    elements = []
+    for index in range(count):
+        control = controls.nth(index)
+        try:
+            if not control.is_visible():
+                continue
+            record = control.evaluate("""el => {
+                const labels = el.labels ? Array.from(el.labels)
+                    .map(x => x.innerText.trim()).filter(Boolean) : [];
+                const options = el.tagName.toLowerCase() === 'select'
+                    ? Array.from(el.options).map(x => x.text.trim()).filter(Boolean).slice(0, 15)
+                    : [];
+                return {
+                    tag: el.tagName.toLowerCase(),
+                    type: (el.type || '').toLowerCase(),
+                    label: labels.join(' / '),
+                    name: el.getAttribute('name') || '',
+                    id: el.id || '',
+                    placeholder: el.getAttribute('placeholder') || '',
+                    aria_label: el.getAttribute('aria-label') || '',
+                    text: ['button', 'a'].includes(el.tagName.toLowerCase())
+                        ? (el.innerText || '').trim().slice(0, 180) : '',
+                    required: !!el.required,
+                    invalid: !!el.validationMessage,
+                    options,
+                };
+            }""")
+            if str(record.get("type") or "").lower() in {
+                    "password", "file", "hidden"}:
+                record["text"] = ""
+            elements.append(record)
+        except Exception:
+            continue
+    return elements
+
+
+def _ai_payload(payload: dict) -> dict:
+    safe = {}
+    for key, value in (payload or {}).items():
+        if key in {"attachments", "ai_analysis"}:
+            continue
+        if isinstance(value, (str, int, float, bool)) and value not in ("", None):
+            safe[key] = str(value)[:10000]
+    return safe
+
+
+def _ask_ai(page, payload: dict, reason: str) -> dict | None:
+    if not _AI_HANDLER:
+        return None
+    try:
+        return _AI_HANDLER({
+            "reason": reason,
+            "page_url": page.url,
+            "page_text": _body_text(page),
+            "elements": _portal_elements(page),
+            "payload": _ai_payload(payload),
+            "image": _page_screenshot(page),
+        })
+    except Exception:
+        return None
+
+
+def _apply_ai_decision(page, decision: dict | None, payload: dict,
+                       update) -> tuple[bool, bool]:
+    """Apply one code-validated safe action. Returns handled, cancelled."""
+    if not isinstance(decision, dict):
+        return False, False
+    state = str(decision.get("state") or "").lower()
+    action = str(decision.get("action") or "").lower()
+    target = str(decision.get("target") or "").strip()[:180]
+    value = str(decision.get("value") or "").strip()
+    summary = str(decision.get("summary") or "The portal needs attention.").strip()
+    prompt = str(decision.get("user_prompt") or "").strip()
+    try:
+        confidence = float(decision.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0
+
+    security = re.compile(
+        r"captcha|otp|one.?time|password|passcode|login|sign.?in|nafath|"
+        r"declaration|consent|terms|payment|card|security|verification|verify",
+        re.I)
+    final = re.compile(
+        r"submit|send|file\s*(?:the\s*)?complaint|confirm|agree|accept\s*terms|"
+        r"purchase|pay|delete|إرسال|تقديم|تأكيد",
+        re.I)
+    guarded_state = state in {"captcha", "otp", "login", "declaration"}
+
+    if action == "ask_user" or guarded_state:
+        if not _VERIFICATION_HANDLER:
+            return False, False
+        response = _ask_verification(
+            "ai_assistance",
+            f"Ghala-200 portal review: {summary}\n{prompt or 'Review the screenshot and complete the requested step.'}",
+            page, choices=["Done", "Cancel"])
+        if str(response or "").strip().lower() == "cancel":
+            return True, True
+        update("verification", "Ghala-200 handed the protected step back to you. Continuing safelyâ€¦")
+        return True, False
+
+    if confidence < 0.65:
+        return False, False
+    if action in {"fill", "select"}:
+        if not target or security.search(target):
+            return False, False
+        allowed = {str(item).strip() for item in _ai_payload(payload).values()}
+        if value not in allowed:
+            return False, False
+        labels = [re.escape(target)]
+        changed = (_fill(page, labels, value) if action == "fill"
+                   else _select(page, labels, [re.escape(value)]))
+        if changed:
+            update("filling", f"Ghala-200 safely completed {target} from stored trip data.")
+        return changed, False
+
+    if action == "click":
+        allowed_navigation = re.compile(
+            r"^(?:next|continue|retry|back|previous|complaints?(?:\s*&\s*feedback)?|"
+            r"feedback|customer relations|apply now|apply for service)$",
+            re.I)
+        if (not target or final.search(target) or security.search(target)
+                or not allowed_navigation.fullmatch(target)):
+            return False, False
+        changed = _click(page, [re.escape(target)])
+        if changed:
+            update("filling", f"Ghala-200 selected the safe navigation step: {target}.")
+        return changed, False
+    return False, False
 
 
 def _annotate_grid(png: bytes, count: int) -> bytes:
@@ -662,11 +811,13 @@ def _invalid_controls(page):
     return found
 
 
-def _resolve_invalid_fields(page, update) -> tuple[bool, bool]:
+def _resolve_invalid_fields(page, update,
+                            payload: dict | None = None) -> tuple[bool, bool]:
     """Ask for invalid field values in Telegram. Returns changed, cancelled."""
     if not _VERIFICATION_HANDLER:
         return False, False
     changed = False
+    ai_used = False
     attempts: dict[str, int] = {}
     for _round in range(10):
         controls = _invalid_controls(page)
@@ -685,6 +836,19 @@ def _resolve_invalid_fields(page, update) -> tuple[bool, bool]:
             validation = ""
         option_text = ("\nAvailable choices: " + "; ".join(options)
                        if options else "")
+        if _AI_HANDLER and payload and not ai_used:
+            ai_used = True
+            decision = _ask_ai(
+                page, payload,
+                f"A required portal control is invalid: {label}. {validation}")
+            handled, cancelled = _apply_ai_decision(
+                page, decision, payload, update)
+            if cancelled:
+                return changed, True
+            if handled:
+                changed = True
+                page.wait_for_timeout(350)
+                continue
         response = _ask_verification(
             "field_input",
             f"The official portal needs: {label}. {validation}".strip()
@@ -854,11 +1018,13 @@ def _extract_reference_from_url(url: str) -> str:
 
 def _await_confirmation(page, before_url: str, update,
                         before_text: str = "",
+                        payload: dict | None = None,
                         timeout_seconds: int = 600) -> PortalResult:
     started = time.monotonic()
     deadline = started + timeout_seconds
     prompted = False
     last_assistance = 0.0
+    ai_attempts = 0
     while time.monotonic() < deadline:
         if page.is_closed():
             return PortalResult("needs_attention",
@@ -888,12 +1054,34 @@ def _await_confirmation(page, before_url: str, update,
             if cancelled:
                 return PortalResult(
                     "needs_attention", "Portal input was cancelled in Telegram.")
+            handled = False
             if changed:
                 _click(page, ["Submit", "Send", "Continue", "Confirm",
                               "إرسال", "تقديم", "متابعة", "تأكيد"])
                 update("submitting", "Telegram inputs applied. Trying the official portal again…")
                 prompted = True
-            elif _VERIFICATION_HANDLER:
+            elif (_AI_HANDLER and payload
+                  and ai_attempts < _AI_MAX_ATTEMPTS):
+                ai_attempts += 1
+                decision = _ask_ai(
+                    page, payload,
+                    "The form was submitted or advanced, but no deterministic "
+                    "confirmation appeared. Identify a safe correction or navigation step.")
+                handled, cancelled = _apply_ai_decision(
+                    page, decision, payload, update)
+                if cancelled:
+                    return PortalResult(
+                        "needs_attention", "Portal assistance was cancelled in Telegram.")
+                if handled:
+                    prompted = True
+                    continue
+                # If AI cannot take a code-validated action, fall through to
+                # the existing screenshot-based human review on this cycle.
+                if not _VERIFICATION_HANDLER:
+                    update("verification",
+                           "Ghala-200 could not safely resolve the portal state.")
+                    prompted = True
+            if not changed and _VERIFICATION_HANDLER and not handled:
                 details = _validation_summary(page)
                 extra = f"\n\nPortal message:\n{details}" if details else ""
                 response = _ask_verification(
@@ -911,7 +1099,7 @@ def _await_confirmation(page, before_url: str, update,
                             "إرسال", "تقديم", "متابعة", "تأكيد"]):
                         _submit_fallback(page)
                     update("submitting", "Retry approved in Telegram. Waiting for confirmation…")
-            else:
+            elif not changed and not _VERIFICATION_HANDLER:
                 update("verification",
                        "The official site needs one correction or confirmation.")
                 prompted = True
@@ -957,7 +1145,7 @@ def submit_portal_claim(payload: dict, update: Callable[[str, str], None]) -> Po
                 return PortalResult(
                     "needs_attention",
                     "Login or verification was not completed before the portal timed out.")
-            _changed, cancelled = _resolve_invalid_fields(page, update)
+            _changed, cancelled = _resolve_invalid_fields(page, update, payload)
             if cancelled:
                 return PortalResult(
                     "needs_attention", "Portal input was cancelled in Telegram.")
@@ -977,8 +1165,10 @@ def submit_portal_claim(payload: dict, update: Callable[[str, str], None]) -> Po
                     if str(response or "").lower() == "submit":
                         _submit_fallback(page)
                 update("verification", "The official site changed its final control. Telegram assistance is active while confirmation is tracked.")
-                return _await_confirmation(page, before_url, update, before_text)
-            return _await_confirmation(page, before_url, update, before_text)
+                return _await_confirmation(
+                    page, before_url, update, before_text, payload)
+            return _await_confirmation(
+                page, before_url, update, before_text, payload)
         finally:
             context.close()
 

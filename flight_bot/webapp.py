@@ -12,6 +12,7 @@ from flask import (Flask, Response, abort, flash, jsonify, redirect, render_temp
                    request, session, url_for)
 
 from . import db
+from .ai_assistant import ClaudeAssistant
 from .compensation import (ELIGIBLE, POSSIBLY, assess, effective)
 from .complaints import (airline_complaint, complaint_payload, gaca_complaint,
                          missing_portal_fields)
@@ -19,7 +20,7 @@ from .mail_client import eta_text
 from .config import save_user_profile
 from .pipeline import (load_demo, rebuild_flights, reparse_emails,
                        scan_mailbox)
-from .portal_automation import (PortalResult, portal_job_status,
+from .portal_automation import (PortalResult, portal_job_status, set_ai_handler,
                                 start_portal_job)
 from .telegram_bot import start_telegram
 from .web_access import verify_web_token
@@ -292,6 +293,10 @@ def create_app(config: dict) -> Flask:
     app.permanent_session_lifetime = timedelta(
         days=max(1, int(web_settings.get("session_days", 30))))
     db.init_db()
+    assistant = ClaudeAssistant(config)
+    set_ai_handler(
+        assistant.portal_decision if assistant.enabled else None,
+        int(assistant.settings.get("max_portal_attempts", 3)))
     telegram = start_telegram(config)
 
     @app.before_request
@@ -516,10 +521,14 @@ def create_app(config: dict) -> Flask:
         prior = _latest_airline_submission(flight)
         reference = prior.get("reference") if prior else ""
         complaint_date = (prior.get("created_at") or "")[:10] if prior else ""
+        ai_analysis = None
+        if (len(incident) >= 15 and assistant.enabled
+                and assistant.settings.get("analyze_incidents", True)):
+            ai_analysis = assistant.analyze_incident(incident, flight)
         try:
             payload = complaint_payload(
                 flight, config["user"], kind, incident,
-                reference or "", complaint_date)
+                reference or "", complaint_date, ai_analysis=ai_analysis)
         except ValueError as exc:
             flash(str(exc))
             endpoint = "complaint_gaca" if kind == "gaca" else "complaint_airline"

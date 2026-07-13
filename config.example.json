@@ -38,5 +38,18 @@
     "provider": "schedule",
     "flightaware_api_key": "",
     "poll_minutes": 10
+  },
+  "ai": {
+    "enabled": false,
+    "provider": "anthropic",
+    "name": "Ghala-200",
+    "model": "claude-sonnet-5",
+    "api_key": "",
+    "timeout_seconds": 45,
+    "analyze_incidents": true,
+    "analyze_attachments": true,
+    "analyze_responses": true,
+    "portal_assistance": true,
+    "max_portal_attempts": 3
   }
 }

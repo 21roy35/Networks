@@ -47,6 +47,22 @@ def test_payload_maps_incident_and_every_known_portal_field():
     assert missing_portal_fields(payload) == []
 
 
+def test_ai_analysis_augments_letter_but_preserves_original_incident():
+    original = "My seat was broken and the screen did not work."
+    payload = complaint_payload(
+        sample_flight(), profile(), "airline", original,
+        ai_analysis={
+            "category": "seat", "summary": "Seat and screen were unusable.",
+            "facts": ["The seat was broken", "The screen did not work"],
+            "evidence_observations": ["A seat component appears displaced"],
+            "requested_remedy": "Investigate and provide applicable remedies.",
+        })
+    assert payload["incident"] == original
+    assert payload["ai_analysis"]["category"] == "seat"
+    assert "Passenger's original statement" in payload["description"]
+    assert original in payload["description"]
+
+
 def test_gaca_payload_cannot_skip_the_airline_reference():
     with pytest.raises(ValueError, match="airline first"):
         complaint_payload(
@@ -120,3 +136,68 @@ def test_invalid_portal_field_is_screenshot_and_filled_from_telegram(monkeypatch
     assert challenges[0]["image"] == b"portal-screenshot"
     assert "Passport number" in challenges[0]["message"]
     assert updates[-1][0] == "filling"
+
+
+def test_ai_portal_guardrails_block_final_and_security_actions(monkeypatch):
+    clicked = []
+    filled = []
+    monkeypatch.setattr(
+        portal_automation, "_click",
+        lambda _page, names: clicked.extend(names) or True)
+    monkeypatch.setattr(
+        portal_automation, "_fill",
+        lambda _page, labels, value: filled.append((labels, value)) or True)
+    update = lambda *_args: None
+    payload = {"email": "passenger@example.com", "pnr": "ABC123"}
+
+    handled, cancelled = portal_automation._apply_ai_decision(
+        object(), {
+            "state": "ready", "action": "click", "target": "Submit",
+            "value": "", "confidence": .99, "summary": "", "user_prompt": "",
+        }, payload, update)
+    assert (handled, cancelled) == (False, False)
+    assert clicked == []
+
+    handled, _ = portal_automation._apply_ai_decision(
+        object(), {
+            "state": "needs_field", "action": "fill", "target": "OTP code",
+            "value": "ABC123", "confidence": .99, "summary": "", "user_prompt": "",
+        }, payload, update)
+    assert handled is False
+    assert filled == []
+
+
+def test_ai_portal_guardrails_allow_only_known_values_and_safe_navigation(monkeypatch):
+    clicked = []
+    filled = []
+    monkeypatch.setattr(
+        portal_automation, "_click",
+        lambda _page, names: clicked.extend(names) or True)
+    monkeypatch.setattr(
+        portal_automation, "_fill",
+        lambda _page, labels, value: filled.append((labels, value)) or True)
+    update = lambda *_args: None
+    payload = {"email": "passenger@example.com", "pnr": "ABC123"}
+
+    invented, _ = portal_automation._apply_ai_decision(
+        object(), {
+            "state": "needs_field", "action": "fill", "target": "Email",
+            "value": "invented@example.com", "confidence": .99,
+            "summary": "", "user_prompt": "",
+        }, payload, update)
+    known, _ = portal_automation._apply_ai_decision(
+        object(), {
+            "state": "needs_field", "action": "fill", "target": "Email",
+            "value": "passenger@example.com", "confidence": .99,
+            "summary": "", "user_prompt": "",
+        }, payload, update)
+    navigated, _ = portal_automation._apply_ai_decision(
+        object(), {
+            "state": "needs_navigation", "action": "click", "target": "Next",
+            "value": "", "confidence": .99, "summary": "", "user_prompt": "",
+        }, payload, update)
+    assert invented is False
+    assert known is True
+    assert navigated is True
+    assert filled[0][1] == "passenger@example.com"
+    assert clicked

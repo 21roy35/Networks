@@ -131,7 +131,8 @@ Assessment basis:
 def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
                       airline_reference: str = "",
                       airline_complaint_date: str = "",
-                      attachments: list[str] | None = None) -> dict:
+                      attachments: list[str] | None = None,
+                      ai_analysis: dict | None = None) -> dict:
     """Return normalized fields consumed by all official-site adapters."""
     incident = " ".join((incident or "").split()).strip()
     if len(incident) < 15:
@@ -147,9 +148,32 @@ def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
     destination = effective(flight, "destination") or ""
     ticket_numbers = flight.get("ticket_numbers") or []
     assessment = assess(flight)
+    complaint_incident = incident
+    if ai_analysis:
+        facts = [str(item).strip() for item in ai_analysis.get("facts") or []
+                 if str(item).strip()]
+        sections = [f"Passenger's original statement: {incident}"]
+        if ai_analysis.get("summary"):
+            sections.append("Organized issue summary: "
+                            + str(ai_analysis["summary"]).strip())
+        if facts:
+            sections.append("Facts stated by the passenger: " + "; ".join(facts))
+        observations = [
+            str(item).strip()
+            for item in ai_analysis.get("evidence_observations") or []
+            if str(item).strip()
+        ]
+        if observations:
+            sections.append("Visible evidence observations: "
+                            + "; ".join(observations))
+        if ai_analysis.get("requested_remedy"):
+            sections.append("Requested resolution: "
+                            + str(ai_analysis["requested_remedy"]).strip())
+        complaint_incident = "\n  ".join(sections)
     letter = (gaca_complaint(
-        flight, user, incident, airline_reference, airline_complaint_date)
-        if kind == "gaca" else airline_complaint(flight, user, incident))
+        flight, user, complaint_incident, airline_reference, airline_complaint_date)
+        if kind == "gaca" else airline_complaint(
+            flight, user, complaint_incident))
     departure = effective(flight, "departure") or ""
     return {
         "kind": kind,
@@ -176,6 +200,7 @@ def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
         "destination": destination,
         "route": f"{origin} → {destination}" if origin or destination else "",
         "incident": incident,
+        "ai_analysis": dict(ai_analysis or {}),
         "subject": letter["subject"],
         "description": letter["body"],
         "airline_reference": airline_reference,
