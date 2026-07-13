@@ -21,6 +21,10 @@ class FakeAPI:
         self.deleted = []
         self.callbacks = []
         self.counter = 100
+        self.commands_registered = False
+
+    def set_commands(self):
+        self.commands_registered = True
 
     def send_message(self, chat_id, text, reply_markup=None, force_reply=False):
         self.counter += 1
@@ -88,6 +92,13 @@ def test_otp_is_relayed_and_deleted_after_use(coordinator):
     thread.join(2)
     assert result["value"] == "123456"
     assert api.deleted == [("42", 77)]
+
+
+def test_start_registers_telegram_command_menu(coordinator, monkeypatch):
+    bot, api = coordinator
+    monkeypatch.setattr(threading.Thread, "start", lambda _thread: None)
+    bot.start()
+    assert api.commands_registered is True
 
 
 def test_due_flight_gets_one_telegram_survey(coordinator):

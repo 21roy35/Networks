@@ -83,6 +83,14 @@ class TelegramAPI:
         self.call("answerCallbackQuery", {
             "callback_query_id": query_id, "text": text[:200]})
 
+    def set_commands(self):
+        commands = [
+            {"command": "status", "description": "Show FlightDeck status"},
+            {"command": "web", "description": "Open the private dashboard"},
+            {"command": "cancel", "description": "Cancel pending issue intake"},
+        ]
+        self.call("setMyCommands", {"commands": json.dumps(commands)})
+
     def delete_message(self, chat_id, message_id: int):
         try:
             self.call("deleteMessage", {
@@ -140,6 +148,12 @@ class TelegramCoordinator:
         db.init_db()
         TELEGRAM_EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
         set_verification_handler(self.request_verification)
+        try:
+            self.api.set_commands()
+        except Exception:
+            # Command-menu registration is convenient but must never prevent
+            # polling, monitoring, or complaint filing from starting.
+            pass
         threading.Thread(target=self._poll_loop, name="telegram-updates",
                          daemon=True).start()
         threading.Thread(target=self._monitor_loop, name="telegram-monitor",
@@ -237,7 +251,7 @@ class TelegramCoordinator:
         text = (message.get("text") or "").strip()
         if text == "/start":
             self.notify(
-                "FlightDeck Telegram is connected. I’ll check in after flights, collect issue photos, file official complaints, relay verification steps, and report airline responses.")
+                "FlightDeck Telegram is connected. I’ll check in after flights, collect issue photos, file official complaints, relay verification steps, and report airline responses. Use /status for service status or /web for your private dashboard.")
             return
         if text == "/status":
             counts = db.counts()
