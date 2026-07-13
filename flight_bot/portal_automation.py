@@ -321,6 +321,26 @@ def _request_blocked(page) -> bool:
         f"{title}\n{text}", re.I))
 
 
+def _dismiss_feedback_overlay(page) -> bool:
+    """Close Saudia's unrelated Medallia survey when it covers the form."""
+    for frame in getattr(page, "frames", []):
+        if not re.search(r"medallia|md-form", str(getattr(frame, "url", "")), re.I):
+            continue
+        for locator in (
+                frame.get_by_role(
+                    "button", name=re.compile(r"close(?: survey)?", re.I)),
+                frame.locator("[data-aut='button-x-close']")):
+            if not _visible(locator):
+                continue
+            try:
+                locator.first.click(force=True)
+                page.wait_for_timeout(600)
+                return True
+            except Exception:
+                continue
+    return False
+
+
 def _needs_human_step(page) -> str:
     checks = (
         ("input[name*='otp' i], input[id*='otp' i], input[autocomplete='one-time-code']",
@@ -1007,6 +1027,7 @@ def _fill_common(page, payload: dict):
 
 def _prepare_saudia(page, payload: dict, update):
     update("filling", "Filling Saudia’s official Complaints & Feedback form…")
+    _dismiss_feedback_overlay(page)
     _select(page, ["service type"], [
         "travel complaint or compliment", "post.travel"])
     page.wait_for_timeout(900)

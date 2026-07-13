@@ -197,6 +197,42 @@ def test_material_dropdown_is_selected_from_allowed_choice():
     assert selected == ["Travel complaint or compliment"]
 
 
+def test_saudia_feedback_survey_is_dismissed_before_form_fill():
+    clicked = []
+
+    class Locator:
+        def __init__(self, visible=True):
+            self.visible = visible
+            self.first = self
+
+        def count(self):
+            return int(self.visible)
+
+        def is_visible(self):
+            return self.visible
+
+        def click(self, **_kwargs):
+            clicked.append("close")
+
+    class Frame:
+        url = "https://resources.example.medallia.com/md-form/index.html"
+
+        def get_by_role(self, _role, name=None):
+            return Locator()
+
+        def locator(self, _selector):
+            return Locator(False)
+
+    class Page:
+        frames = [Frame()]
+
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+    assert portal_automation._dismiss_feedback_overlay(Page()) is True
+    assert clicked == ["close"]
+
+
 def test_reference_is_extracted_from_official_confirmation_text():
     assert _extract_reference(
         "Thank you. Your complaint reference number is CAS-12345678.") == (
