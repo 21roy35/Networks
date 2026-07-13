@@ -8,6 +8,7 @@
 """
 
 import argparse
+import time
 
 from . import db
 from .config import load_config
@@ -42,6 +43,8 @@ def main():
     web.add_argument("--host", default=None)
     web.add_argument("--port", type=int, default=None)
     sub.add_parser("reset", help="wipe the local database")
+    sub.add_parser("telegram", help="run the Telegram assistant and monitors")
+    sub.add_parser("telegram-id", help="show chat ids that recently messaged the bot")
     args = parser.parse_args()
 
     config = load_config()
@@ -66,6 +69,36 @@ def main():
         port = args.port or config["web"]["port"]
         print(f"GUI running at http://{host}:{port}")
         app.run(host=host, port=port, debug=False)
+    elif args.command == "telegram":
+        from .telegram_bot import start_telegram
+        coordinator = start_telegram(config)
+        if not coordinator:
+            raise SystemExit(
+                "Telegram is not configured. Add telegram.bot_token and "
+                "telegram.chat_id to config.json or the matching environment variables.")
+        print("Telegram assistant running. Press Ctrl+C to stop.")
+        try:
+            while True:
+                time.sleep(60)
+        except KeyboardInterrupt:
+            coordinator.stop()
+    elif args.command == "telegram-id":
+        from .telegram_bot import TelegramAPI
+        token = config.get("telegram", {}).get("bot_token") or ""
+        if not token:
+            raise SystemExit("Set telegram.bot_token first, then message the bot /start.")
+        updates = TelegramAPI(token).updates(0, 1)
+        chats = {}
+        for update in updates:
+            message = update.get("message") or (update.get("callback_query") or {}).get("message") or {}
+            chat = message.get("chat") or {}
+            if chat.get("id") is not None:
+                chats[str(chat["id"])] = chat.get("username") or chat.get("first_name") or "private chat"
+        if not chats:
+            print("No recent chats. Send /start to the bot and run this again.")
+        else:
+            for chat_id, label in chats.items():
+                print(f"{chat_id}  {label}")
 
 
 if __name__ == "__main__":

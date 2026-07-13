@@ -1,0 +1,576 @@
+"""Telegram-first orchestration for post-flight feedback and complaints."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from email.utils import parseaddr
+from pathlib import Path
+
+import requests
+
+from . import db
+from .airlines import AIRLINES
+from .complaints import complaint_payload, missing_portal_fields
+from .config import TELEGRAM_EVIDENCE_DIR
+from .flight_status import live_landed, parse_flight_time, schedule_has_finished
+from .pipeline import scan_mailbox
+from .portal_automation import (PortalResult, set_verification_handler,
+                                start_portal_job)
+from .web_access import create_web_token
+
+
+def _buttons(rows: list[list[tuple[str, str]]]) -> dict:
+    return {"inline_keyboard": [[{"text": text, "callback_data": data}
+                                 for text, data in row] for row in rows]}
+
+
+def _clean_excerpt(value: str, limit: int = 1300) -> str:
+    text = re.sub(r"\s+", " ", value or "").strip()
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+class TelegramAPI:
+    def __init__(self, token: str, session=None):
+        self.token = token
+        self.session = session or requests.Session()
+        self.base = f"https://api.telegram.org/bot{token}/"
+        self.file_base = f"https://api.telegram.org/file/bot{token}/"
+
+    def call(self, method: str, data: dict | None = None, files=None,
+             timeout: int = 35):
+        response = self.session.post(
+            self.base + method, data=data or {}, files=files, timeout=timeout)
+        response.raise_for_status()
+        result = response.json()
+        if not result.get("ok"):
+            raise RuntimeError(result.get("description") or method)
+        return result.get("result")
+
+    def updates(self, offset: int, timeout: int) -> list[dict]:
+        return self.call("getUpdates", {
+            "offset": offset, "timeout": timeout,
+            "allowed_updates": json.dumps(["message", "callback_query"]),
+        }, timeout=timeout + 10) or []
+
+    def send_message(self, chat_id, text: str, reply_markup: dict | None = None,
+                     force_reply: bool = False) -> dict:
+        markup = reply_markup
+        if force_reply:
+            markup = {"force_reply": True, "selective": True,
+                      "input_field_placeholder": "Reply to FlightDeck"}
+        data = {"chat_id": chat_id, "text": text[:4096]}
+        if markup:
+            data["reply_markup"] = json.dumps(markup)
+        return self.call("sendMessage", data)
+
+    def send_photo(self, chat_id, image: bytes, caption: str,
+                   reply_markup: dict | None = None) -> dict:
+        data = {"chat_id": chat_id, "caption": caption[:1024]}
+        if reply_markup:
+            data["reply_markup"] = json.dumps(reply_markup)
+        return self.call(
+            "sendPhoto", data,
+            files={"photo": ("verification.png", image, "image/png")})
+
+    def answer_callback(self, query_id: str, text: str = ""):
+        self.call("answerCallbackQuery", {
+            "callback_query_id": query_id, "text": text[:200]})
+
+    def delete_message(self, chat_id, message_id: int):
+        try:
+            self.call("deleteMessage", {
+                "chat_id": chat_id, "message_id": message_id})
+        except Exception:
+            pass
+
+    def download(self, file_id: str, destination: Path):
+        record = self.call("getFile", {"file_id": file_id})
+        response = self.session.get(
+            self.file_base + record["file_path"], timeout=30)
+        response.raise_for_status()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(response.content)
+
+
+@dataclass
+class VerificationWaiter:
+    kind: str
+    event: threading.Event = field(default_factory=threading.Event)
+    response: object = None
+
+
+@dataclass
+class PendingIntake:
+    flight_key: str
+    incident: str = ""
+    attachments: list[str] = field(default_factory=list)
+    timer: threading.Timer | None = None
+
+
+class TelegramCoordinator:
+    def __init__(self, config: dict, api: TelegramAPI | None = None):
+        self.config = config
+        self.settings = config.get("telegram") or {}
+        self.chat_id = str(self.settings.get("chat_id") or "")
+        self.api = api or TelegramAPI(self.settings.get("bot_token") or "")
+        self.stop_event = threading.Event()
+        self.started_at = datetime.now()
+        self.offset = 0
+        self._lock = threading.RLock()
+        self._verification: VerificationWaiter | None = None
+        self._intakes: dict[str, PendingIntake] = {}
+        self._last_mail_scan = 0.0
+        self._status_cache: dict[str, tuple[float, bool | None]] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.settings.get("enabled")
+                    and self.settings.get("bot_token") and self.chat_id)
+
+    def start(self):
+        if not self.enabled:
+            return self
+        db.init_db()
+        TELEGRAM_EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+        set_verification_handler(self.request_verification)
+        threading.Thread(target=self._poll_loop, name="telegram-updates",
+                         daemon=True).start()
+        threading.Thread(target=self._monitor_loop, name="telegram-monitor",
+                         daemon=True).start()
+        return self
+
+    def stop(self):
+        self.stop_event.set()
+        set_verification_handler(None)
+
+    def notify(self, text: str, buttons=None, force_reply: bool = False) -> dict:
+        return self.api.send_message(
+            self.chat_id, text, reply_markup=buttons, force_reply=force_reply)
+
+    def request_verification(self, challenge: dict):
+        waiter = VerificationWaiter(challenge.get("kind") or "verification")
+        with self._lock:
+            if self._verification:
+                return None
+            self._verification = waiter
+        choices = challenge.get("choices") or []
+        markup = None
+        if choices:
+            markup = _buttons([[(choice, f"verify:{choice.lower()}")
+                                for choice in choices]])
+        prompt = "🔐 FlightDeck verification\n\n" + challenge.get("message", "")
+        image = challenge.get("image") or b""
+        if image:
+            self.api.send_photo(self.chat_id, image, prompt, reply_markup=markup)
+        else:
+            self.notify(prompt, buttons=markup, force_reply=not choices)
+        timeout = int(self.settings.get("verification_timeout_minutes", 10)) * 60
+        waiter.event.wait(timeout)
+        with self._lock:
+            if self._verification is waiter:
+                self._verification = None
+        if not waiter.event.is_set():
+            self.notify("Verification timed out. The portal submission was paused safely.")
+            return None
+        return waiter.response
+
+    def _poll_loop(self):
+        timeout = int(self.settings.get("poll_timeout_seconds", 25))
+        while not self.stop_event.is_set():
+            try:
+                for update in self.api.updates(self.offset, timeout):
+                    self.offset = max(self.offset, int(update["update_id"]) + 1)
+                    self.handle_update(update)
+            except Exception:
+                self.stop_event.wait(3)
+
+    def _monitor_loop(self):
+        interval = max(15, int(self.settings.get("monitor_interval_seconds", 60)))
+        while not self.stop_event.is_set():
+            try:
+                self._maybe_scan_mailbox()
+                self.send_due_surveys()
+                self.check_complaint_responses()
+            except Exception:
+                pass
+            self.stop_event.wait(interval)
+
+    def _authorized(self, chat_id) -> bool:
+        return str(chat_id) == self.chat_id
+
+    def handle_update(self, update: dict):
+        if callback := update.get("callback_query"):
+            message = callback.get("message") or {}
+            chat_id = (message.get("chat") or {}).get("id")
+            if self._authorized(chat_id):
+                self._handle_callback(callback)
+            return
+        message = update.get("message") or {}
+        chat_id = (message.get("chat") or {}).get("id")
+        if self._authorized(chat_id):
+            self._handle_message(message)
+
+    def _handle_verification_message(self, message: dict) -> bool:
+        with self._lock:
+            waiter = self._verification
+        if not waiter:
+            return False
+        response = message.get("text") or message.get("caption") or ""
+        if not response.strip():
+            return True
+        waiter.response = response.strip()
+        waiter.event.set()
+        if waiter.kind == "otp":
+            self.api.delete_message(self.chat_id, message["message_id"])
+        return True
+
+    def _handle_message(self, message: dict):
+        if self._handle_verification_message(message):
+            return
+        text = (message.get("text") or "").strip()
+        if text == "/start":
+            self.notify(
+                "FlightDeck Telegram is connected. I’ll check in after flights, collect issue photos, file official complaints, relay verification steps, and report airline responses.")
+            return
+        if text == "/status":
+            counts = db.counts()
+            self.notify(
+                f"FlightDeck is running. {counts['flights']} flights, "
+                f"{counts['complaints']} complaints, {counts['emails']} parsed emails.")
+            return
+        if text and text.split(maxsplit=1)[0].lower() == "/web":
+            self._send_web_link()
+            return
+        if text == "/cancel":
+            self._cancel_latest_intake()
+            self.notify("Cancelled the pending complaint intake.")
+            return
+
+        reply_id = (message.get("reply_to_message") or {}).get("message_id")
+        survey = db.pending_survey(self.chat_id, reply_id)
+        if not survey:
+            survey = db.pending_survey(self.chat_id)
+        if not survey:
+            self.notify("Reply to a post-flight question, or use /status.")
+            return
+        positive = re.fullmatch(
+            r"(?:good|great|fine|perfect|all good|no issues?|it was good|"
+            r"ممتاز|جيد|تمام|ما فيه مشاكل)[.! ]*", text, re.I)
+        if (survey.get("status") == "asked" and positive
+                and not message.get("photo")):
+            db.update_survey_status(survey["flight_key"], "good")
+            self.notify("Glad the flight went well ✈️")
+            return
+        self._collect_issue(survey, message)
+
+    def _handle_callback(self, callback: dict):
+        data = callback.get("data") or ""
+        self.api.answer_callback(callback["id"])
+        if data.startswith("verify:"):
+            with self._lock:
+                waiter = self._verification
+            if waiter:
+                waiter.response = data.split(":", 1)[1]
+                waiter.event.set()
+            return
+        action, _, value = data.partition(":")
+        if not value.isdigit():
+            return
+        flight = db.get_flight(int(value))
+        if not flight:
+            self.notify("That flight is no longer available.")
+            return
+        if action == "flight_good":
+            db.update_survey_status(flight["flight_key"], "good")
+            self.notify(f"Glad {self._flight_label(flight)} went well ✈️")
+        elif action == "flight_issue":
+            prompt = self.notify(
+                f"What went wrong on {self._flight_label(flight)}? Send a message, photos with a caption, or both. I’ll automatically file after the last message.",
+                force_reply=True)
+            db.record_survey(flight["flight_key"], self.chat_id,
+                             prompt["message_id"], "awaiting_details")
+        elif action == "escalate":
+            self._launch_gaca(flight)
+        elif action == "close_case":
+            db.mark_event_seen(f"closed:{flight['flight_key']}")
+            self.notify("Case kept closed. I won’t escalate it to GACA.")
+        elif action == "submit_issue":
+            self._finalize_intake(flight["flight_key"])
+
+    def _flight_label(self, flight: dict) -> str:
+        number = flight.get("flight_number") or ", ".join(
+            flight.get("flight_numbers") or []) or "your flight"
+        route = " → ".join(filter(None, (
+            flight.get("origin"), flight.get("destination"))))
+        return f"{number} {route}".strip()
+
+    def _post_flight_label(self, flight: dict) -> str:
+        number = flight.get("flight_number") or ", ".join(
+            flight.get("flight_numbers") or []) or ""
+        origin = flight.get("origin") or "your origin"
+        destination = flight.get("destination") or "your destination"
+        prefix = f" {number}" if number else ""
+        return f"your flight{prefix} from {origin} to {destination}"
+
+    def _send_web_link(self):
+        settings = self.config.get("web") or {}
+        base_url = str(settings.get("public_base_url") or "").rstrip("/")
+        secret = str(settings.get("access_secret") or "")
+        if not base_url or not secret:
+            self.notify("The private web link is not configured on this server yet.")
+            return
+        token = create_web_token(secret, self.chat_id)
+        link = f"{base_url}/?access={token}"
+        minutes = int(settings.get("link_expiry_minutes", 15))
+        self.notify(
+            f"Your private FlightDeck link is ready. This sign-in link expires in {minutes} minutes; the phone session stays signed in.",
+            buttons={"inline_keyboard": [[{
+                "text": "Open FlightDeck", "url": link,
+            }]]})
+
+    def _photo_path(self, flight_key: str) -> Path:
+        folder = hashlib.sha256(flight_key.encode()).hexdigest()[:12]
+        return TELEGRAM_EVIDENCE_DIR / folder / f"{uuid.uuid4().hex}.jpg"
+
+    def _collect_issue(self, survey: dict, message: dict):
+        flight_key = survey["flight_key"]
+        with self._lock:
+            intake = self._intakes.setdefault(
+                flight_key, PendingIntake(flight_key=flight_key))
+            value = (message.get("text") or message.get("caption") or "").strip()
+            if value and not value.startswith("/"):
+                intake.incident = (intake.incident + " " + value).strip()
+            photos = message.get("photo") or []
+            if photos:
+                destination = self._photo_path(flight_key)
+                self.api.download(photos[-1]["file_id"], destination)
+                intake.attachments.append(str(destination))
+            if intake.timer:
+                intake.timer.cancel()
+            delay = max(3, int(self.settings.get("complaint_debounce_seconds", 20)))
+            intake.timer = threading.Timer(
+                delay, self._finalize_intake, args=(flight_key,))
+            intake.timer.daemon = True
+            intake.timer.start()
+        db.update_survey_status(flight_key, "collecting")
+        flight = db.get_flight_by_key(flight_key)
+        self.notify(
+            "Got it. Send any more photos now; I’ll file automatically in "
+            f"{delay} seconds after the last message.",
+            buttons=_buttons([[('File now', f"submit_issue:{flight['id']}")]])
+            if flight else None)
+
+    def _cancel_latest_intake(self):
+        with self._lock:
+            for intake in self._intakes.values():
+                if intake.timer:
+                    intake.timer.cancel()
+            self._intakes.clear()
+
+    def _finalize_intake(self, flight_key: str):
+        with self._lock:
+            intake = self._intakes.pop(flight_key, None)
+        if not intake:
+            return
+        if intake.timer:
+            intake.timer.cancel()
+        flight = db.get_flight_by_key(flight_key)
+        if not flight:
+            self.notify("The flight record disappeared before filing.")
+            return
+        if len(intake.incident.strip()) < 15:
+            self.notify("I saved the photos, but need a short description of what went wrong.")
+            with self._lock:
+                self._intakes[flight_key] = intake
+            db.update_survey_status(flight_key, "awaiting_details")
+            return
+        try:
+            payload = complaint_payload(
+                flight, self.config["user"], "airline", intake.incident,
+                attachments=intake.attachments)
+        except ValueError as exc:
+            self.notify(str(exc))
+            return
+        missing = missing_portal_fields(payload)
+        if missing:
+            db.update_survey_status(flight_key, "needs_profile")
+            self.notify("I need these one-time profile/flight details before filing: "
+                        + ", ".join(missing) + ". Complete them in FlightDeck.")
+            return
+        db.update_survey_status(flight_key, "filing")
+        self.notify(f"Filing with {payload['airline_name']} on its official website now…")
+
+        def complete(result: PortalResult):
+            if result.status == "submitted":
+                db.add_complaint(
+                    flight_key, "airline", None, payload["subject"], "submitted",
+                    reference=result.reference or None, details=intake.incident,
+                    attachments=intake.attachments)
+                db.update_survey_status(flight_key, "filed")
+                reference = f" Reference: {result.reference}." if result.reference else ""
+                self.notify("Complaint submitted on the official airline portal."
+                            + reference + " I’ll watch for the airline’s response.")
+            else:
+                db.update_survey_status(flight_key, "needs_attention")
+                self.notify(f"Portal filing needs attention: {result.message}")
+
+        start_portal_job(payload, on_complete=complete)
+
+    def _latest_airline_complaint(self, flight: dict) -> dict | None:
+        for item in reversed(flight.get("complaints") or []):
+            if item.get("kind") == "airline" and item.get("status") == "submitted":
+                return item
+        return None
+
+    def _launch_gaca(self, flight: dict):
+        prior = self._latest_airline_complaint(flight)
+        if not prior or not prior.get("reference"):
+            self.notify("GACA requires the airline complaint reference, which has not been captured yet.")
+            return
+        incident = prior.get("details") or "The airline response was unsatisfactory."
+        try:
+            payload = complaint_payload(
+                flight, self.config["user"], "gaca", incident,
+                prior["reference"], (prior.get("created_at") or "")[:10],
+                attachments=prior.get("attachments") or [])
+        except ValueError as exc:
+            self.notify(str(exc))
+            return
+        missing = missing_portal_fields(payload)
+        if missing:
+            self.notify("GACA filing still needs: " + ", ".join(missing) + ".")
+            return
+        self.notify("Escalating to GACA’s official E-Services portal now…")
+
+        def complete(result: PortalResult):
+            if result.status == "submitted":
+                db.add_complaint(
+                    flight["flight_key"], "gaca", None, payload["subject"],
+                    "submitted", reference=result.reference or None,
+                    details=incident, attachments=prior.get("attachments") or [])
+                suffix = f" Reference: {result.reference}." if result.reference else ""
+                self.notify("GACA escalation submitted." + suffix)
+            else:
+                self.notify(f"GACA escalation needs attention: {result.message}")
+
+        start_portal_job(payload, on_complete=complete)
+
+    def _live_landed_cached(self, flight: dict) -> bool | None:
+        key = flight.get("flight_key") or str(flight.get("id"))
+        now = time.monotonic()
+        poll = max(1, int((self.config.get("flight_status") or {}).get(
+            "poll_minutes", 10))) * 60
+        cached = self._status_cache.get(key)
+        if cached and now - cached[0] < poll:
+            return cached[1]
+        try:
+            value = live_landed(self.config, flight)
+        except Exception:
+            value = None
+        self._status_cache[key] = (now, value)
+        return value
+
+    def send_due_surveys(self, now: datetime | None = None):
+        now = now or datetime.now()
+        delay = int(self.settings.get("post_flight_delay_minutes", 20))
+        lookback = timedelta(hours=int(self.settings.get("survey_lookback_hours", 24)))
+        for summary in db.list_flights():
+            if db.survey_for_flight(summary["flight_key"]):
+                continue
+            flight = db.get_flight(summary["id"])
+            arrival = (parse_flight_time((flight.get("overrides") or {}).get("actual_arrival"))
+                       or parse_flight_time(flight.get("new_arrival"))
+                       or parse_flight_time((flight.get("overrides") or {}).get("arrival"))
+                       or parse_flight_time(flight.get("arrival")))
+            if not arrival or arrival < now - lookback:
+                continue
+            landed = self._live_landed_cached(flight)
+            if landed is not True and not schedule_has_finished(
+                    flight, delay_minutes=delay, now=now):
+                continue
+            message = self.notify(
+                f"How was {self._post_flight_label(flight)}? If anything was broken, delayed, unavailable, or handled badly, tell me and send photos—I can file it automatically.",
+                buttons=_buttons([
+                    [("Everything was good", f"flight_good:{flight['id']}")],
+                    [("Report an issue", f"flight_issue:{flight['id']}")],
+                ]))
+            db.record_survey(flight["flight_key"], self.chat_id,
+                             message["message_id"], "asked")
+
+    def _maybe_scan_mailbox(self):
+        minutes = int(self.settings.get("mailbox_scan_minutes", 10))
+        if minutes <= 0 or not (self.config.get("imap", {}).get("user")
+                                and self.config.get("imap", {}).get("password")):
+            return
+        if time.monotonic() - self._last_mail_scan < minutes * 60:
+            return
+        self._last_mail_scan = time.monotonic()
+        scan_config = json.loads(json.dumps(self.config))
+        scan_config["imap"]["since_days"] = min(
+            int(scan_config["imap"].get("since_days", 730)), 14)
+        scan_mailbox(scan_config, log=lambda *_args, **_kwargs: None)
+
+    def check_complaint_responses(self):
+        events = db.list_mail_events()
+        substantive = re.compile(
+            r"resolved|resolution|decision|outcome|approved|declined|denied|"
+            r"refund|compensation|reimburse|closed|تعويض|استرداد|مرفوض|إغلاق|حل",
+            re.I)
+        for complaint in db.list_complaints():
+            if complaint.get("kind") != "airline" or complaint.get("status") != "submitted":
+                continue
+            if db.event_seen(f"closed:{complaint['flight_key']}"):
+                continue
+            flight = complaint.get("flight_data") or {}
+            info = AIRLINES.get(flight.get("airline_code"), {})
+            domains = info.get("domains") or []
+            reference = str(complaint.get("reference") or "").casefold()
+            created = parse_flight_time(complaint.get("created_at"))
+            for event in events:
+                key = f"complaint-response:{complaint['id']}:{event['id']}"
+                if db.event_seen(key):
+                    continue
+                event_date = parse_flight_time(event.get("date"))
+                if created and event_date and event_date < created:
+                    continue
+                sender = parseaddr(event.get("sender") or "")[1].split("@")[-1].lower()
+                if domains and not any(sender == domain or sender.endswith("." + domain)
+                                       for domain in domains):
+                    continue
+                blob = " ".join((event.get("subject") or "", event.get("body") or ""))
+                if reference and reference not in blob.casefold():
+                    continue
+                if not substantive.search(blob):
+                    continue
+                db.mark_event_seen(key)
+                excerpt = _clean_excerpt(event.get("body") or event.get("subject") or "")
+                self.notify(
+                    f"{info.get('name') or 'The airline'} responded to complaint "
+                    f"{complaint.get('reference') or ''}:\n\n{excerpt}\n\nDo you want me to escalate this to GACA?",
+                    buttons=_buttons([[
+                        ("Escalate to GACA", f"escalate:{complaint['flight_id']}"),
+                        ("No, close", f"close_case:{complaint['flight_id']}"),
+                    ]]))
+
+
+_COORDINATOR: TelegramCoordinator | None = None
+_COORDINATOR_LOCK = threading.Lock()
+
+
+def start_telegram(config: dict) -> TelegramCoordinator | None:
+    global _COORDINATOR
+    settings = config.get("telegram") or {}
+    if not (settings.get("enabled") and settings.get("bot_token")
+            and settings.get("chat_id")):
+        return None
+    with _COORDINATOR_LOCK:
+        if _COORDINATOR is None:
+            _COORDINATOR = TelegramCoordinator(config).start()
+    return _COORDINATOR

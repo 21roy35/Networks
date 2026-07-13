@@ -7,20 +7,36 @@
     "folders": ["INBOX"],
     "since_days": 730
   },
-  "smtp": {
-    "host": "smtp.gmail.com",
-    "port": 587,
-    "user": "",
-    "password": ""
-  },
   "user": {
-    "full_name": "Your Full Name",
+    "full_name": "Your Full Legal Name",
     "email": "you@gmail.com",
     "phone": "+9665XXXXXXXX",
-    "national_id": ""
+    "national_id": "passport-national-id-or-iqama",
+    "title": "Mr",
+    "nationality": "Saudi Arabian",
+    "country_code": "+966"
   },
   "web": {
     "host": "127.0.0.1",
-    "port": 5000
+    "port": 5000,
+    "public_base_url": "",
+    "access_secret": "",
+    "link_expiry_minutes": 15,
+    "session_days": 30
+  },
+  "telegram": {
+    "enabled": true,
+    "bot_token": "paste-token-from-BotFather",
+    "chat_id": "your-private-chat-id",
+    "post_flight_delay_minutes": 20,
+    "survey_lookback_hours": 24,
+    "complaint_debounce_seconds": 20,
+    "verification_timeout_minutes": 10,
+    "mailbox_scan_minutes": 10
+  },
+  "flight_status": {
+    "provider": "schedule",
+    "flightaware_api_key": "",
+    "poll_minutes": 10
   }
 }

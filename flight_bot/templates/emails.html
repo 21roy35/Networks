@@ -1,48 +1,56 @@
 {% extends "base.html" %}
-{% block title %}Email inspector – Flight Bot{% endblock %}
+{% block title %}Email evidence · FlightDeck{% endblock %}
+{% block head %}
+<style>
+.evidence-head { display:flex; align-items:flex-end; justify-content:space-between; gap:24px; margin-bottom:22px; }
+.evidence-head h1 { font-size:clamp(34px,5vw,50px); margin-bottom:9px; }
+.evidence-head p { max-width:700px; margin:0; }
+.evidence-stats { display:grid; grid-template-columns:repeat(3,150px); gap:10px; }
+.evidence-stat { padding:14px 16px; }
+.evidence-stat strong { display:block; font-size:23px; }
+.evidence-stat span { color:var(--navy-500); font-size:11px; font-weight:760; }
+.filterbar { margin-bottom:14px; padding:15px; display:grid; grid-template-columns:minmax(230px,1fr) 170px auto; gap:10px; }
+.search-wrap { position:relative; }
+.search-wrap svg { position:absolute; left:13px; top:13px; width:18px; height:18px; color:var(--navy-500); }
+.search-wrap input { padding-left:40px; }
+.email-table-wrap { overflow:auto; }
+.email-table { width:100%; border-collapse:collapse; min-width:820px; }
+.email-table th { padding:12px 16px; color:var(--navy-500); background:#f7f9fa; border-bottom:1px solid var(--line); text-align:left; text-transform:uppercase; letter-spacing:.08em; font-size:10px; }
+.email-table td { padding:16px; border-bottom:1px solid var(--line); vertical-align:top; }
+.email-table tr:last-child td { border-bottom:0; }
+.email-table tbody tr:hover { background:#f9fbfb; }
+.email-subject { max-width:340px; font-weight:760; }
+.email-subject span { display:block; margin-top:4px; color:var(--navy-500); font-size:12px; font-weight:500; }
+.extract-list { display:grid; gap:3px; color:var(--navy-700); font-size:12px; }
+.linked-flight { color:var(--teal-dark); font-weight:790; text-decoration:none; }
+.linked-flight:hover { text-decoration:underline; }
+@media (max-width:900px) { .evidence-head { align-items:flex-start; flex-direction:column; } .evidence-stats { width:100%; grid-template-columns:repeat(3,1fr); } }
+@media (max-width:650px) { .filterbar { grid-template-columns:1fr; } .evidence-stats { grid-template-columns:1fr; } }
+</style>
+{% endblock %}
 {% block content %}
-<div class="card">
-  <h2 style="margin-top:0">Email inspector</h2>
-  <p class="muted">Every stored email, what was extracted from it, and which
-  flight it was linked to. Emails with no flight were treated as
-  promotions/noise (no PNR, ticket number, or usable flight details).</p>
-  <input type="text" id="emailfilter" placeholder="Filter by subject, sender, PNR, flight…"
-         style="width:100%;margin-bottom:12px"
-         oninput="filterRows(this.value, 'emailtable')">
-  <div style="overflow-x:auto">
-  <table id="emailtable">
-    <thead>
-      <tr><th>Date</th><th>Subject / sender</th><th>Extracted</th><th>Linked to flight</th></tr>
-    </thead>
-    <tbody>
-      {% for e in emails %}
-      <tr>
-        <td style="white-space:nowrap">{{ (e.date or '')[:10] or '—' }}</td>
-        <td>
-          <b>{{ e.subject }}</b><br>
-          <span class="muted">{{ e.sender }}</span><br>
-          {% for k in e.kinds %}<span class="badge kind">{{ k }}</span> {% endfor %}
-        </td>
-        <td class="muted" style="font-size:13px">
-          {% if e.pnr %}PNR <b>{{ e.pnr }}</b><br>{% endif %}
-          {% if e.ticket_numbers %}Ticket {{ e.ticket_numbers|join(', ') }}<br>{% endif %}
-          {% if e.flight_numbers %}Flight {{ e.flight_numbers|join(', ') }}<br>{% endif %}
-          {% if e.origin or e.destination %}{{ e.origin or '?' }} → {{ e.destination or '?' }}<br>{% endif %}
-          {% if e.departure %}Dep {{ e.departure }}{% endif %}
-        </td>
-        <td>
-          {% if e.flight %}
-            <a href="{{ url_for('flight_detail', flight_id=e.flight.id) }}">
-              {{ e.flight.airline_name or e.flight.airline_code or '?' }}
-              {{ e.flight.flight_number or '' }} · {{ e.flight.flight_date or '?' }}</a>
-          {% else %}
-            <span class="muted">not linked (noise)</span>
-          {% endif %}
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-  </div>
+<div class="evidence-head">
+  <div><p class="eyebrow">Extraction audit</p><h1>Email evidence</h1><p class="muted">See exactly what was extracted from each stored message and whether it contributed to a flight. Use this view to spot parser gaps without exposing your whole inbox.</p></div>
+  <div class="evidence-stats"><div class="evidence-stat card"><strong>{{ email_total }}</strong><span>STORED EMAILS</span></div><div class="evidence-stat card"><strong>{{ linked_total }}</strong><span>LINKED</span></div><div class="evidence-stat card"><strong>{{ unlinked_total }}</strong><span>UNLINKED</span></div></div>
 </div>
+<form class="filterbar card" method="get" action="{{ url_for('emails') }}">
+  <label class="search-wrap"><span class="sr-only">Search email evidence</span><svg viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="m16 16 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><input type="text" name="q" value="{{ query }}" placeholder="Search sender, subject, PNR, route…"></label>
+  <label><span class="sr-only">Filter by link state</span><select name="status" onchange="this.form.submit()"><option value="all" {% if status == 'all' %}selected{% endif %}>All evidence</option><option value="linked" {% if status == 'linked' %}selected{% endif %}>Linked to a flight</option><option value="unlinked" {% if status == 'unlinked' %}selected{% endif %}>Not linked</option></select></label>
+  <div class="actions"><button class="btn dark">Search</button>{% if query or status != 'all' %}<a class="btn" href="{{ url_for('emails') }}">Clear</a>{% endif %}</div>
+</form>
+<section class="card" style="overflow:hidden">
+  {% if emails %}
+  <div class="email-table-wrap"><table class="email-table">
+    <thead><tr><th>Date</th><th>Message</th><th>Type</th><th>Extracted facts</th><th>Linked record</th></tr></thead>
+    <tbody>{% for email in emails %}<tr>
+      <td class="small muted" style="white-space:nowrap">{{ (email.date or '')[:10] or 'Unknown' }}</td>
+      <td><div class="email-subject">{{ email.subject or 'No subject' }}<span>{{ email.sender or 'Sender unknown' }}</span></div></td>
+      <td><div class="actions">{% for kind in (email.kinds or [])[:2] %}<span class="badge kind">{{ kind|replace('_',' ')|title }}</span>{% endfor %}</div></td>
+      <td><div class="extract-list">{% if email.pnr %}<span>PNR <strong>{{ email.pnr }}</strong></span>{% endif %}{% if email.flight_numbers %}<span>Flight {{ email.flight_numbers|join(', ') }}</span>{% endif %}{% if email.origin or email.destination %}<span>{{ email.origin or '???' }} → {{ email.destination or '???' }}</span>{% endif %}{% if email.departure %}<span>Departs {{ email.departure }}</span>{% endif %}{% if not email.pnr and not email.flight_numbers and not email.origin %}<span class="muted">No core itinerary facts</span>{% endif %}</div></td>
+      <td>{% if email.flight %}<a class="linked-flight" href="{{ url_for('flight_detail', flight_id=email.flight.id) }}">{{ email.flight.airline_name or email.flight.airline_code or 'Flight' }} {{ email.flight.flight_number or '' }} →</a>{% else %}<span class="badge unknown">Needs review</span>{% endif %}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+  <div class="pagination"><span class="muted small">Showing {{ pagination.from }}–{{ pagination.to }} of {{ pagination.total }}</span><div class="pagination-nav">{% if pagination.has_prev %}<a class="btn small-btn" href="{{ url_for('emails', q=query, status=status, page=pagination.page-1) }}">← Previous</a>{% endif %}<span class="small muted">Page {{ pagination.page }} of {{ pagination.pages }}</span>{% if pagination.has_next %}<a class="btn small-btn" href="{{ url_for('emails', q=query, status=status, page=pagination.page+1) }}">Next →</a>{% endif %}</div></div>
+  {% else %}<div class="empty"><div class="empty-icon">@</div><h2>No email evidence found</h2><p class="muted">Try clearing the filters or scan the mailbox first.</p></div>{% endif %}
+</section>
 {% endblock %}

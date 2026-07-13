@@ -1,77 +1,248 @@
 {% extends "base.html" %}
-{% block title %}{{ flight.airline_name or '' }} {{ flight.flight_number or '' }} – Flight Bot{% endblock %}
+{% block title %}{{ flight.airline_name or flight.airline_code or 'Flight' }} {{ flight.display_flight_number }} · FlightDeck{% endblock %}
+{% block head %}
+<style>
+.breadcrumb { display:inline-flex; align-items:center; gap:7px; margin-bottom:16px; color:var(--navy-500);
+  text-decoration:none; font-size:13px; font-weight:750; }
+.breadcrumb:hover { color:var(--teal-dark); }
+.flight-hero { position:relative; overflow:hidden; padding:30px; margin-bottom:22px; }
+.flight-hero::after { content:""; position:absolute; right:-50px; top:-65px; width:200px; height:200px;
+  border-radius:50%; background:var(--teal-soft); opacity:.75; }
+.flight-hero-top { position:relative; z-index:2; display:flex; align-items:flex-start;
+  justify-content:space-between; gap:20px; }
+.flight-kicker { display:flex; align-items:center; gap:10px; margin-bottom:24px; }
+.airline-logo { width:42px; height:42px; display:grid; place-items:center; border-radius:13px;
+  color:#fff; background:linear-gradient(145deg,#153d5c,#0b968a); font-weight:900; }
+.flight-kicker strong { display:block; }
+.flight-kicker span { display:block; font-size:12px; color:var(--navy-500); }
+.hero-route { display:flex; align-items:center; gap:22px; }
+.airport-code { font-size:clamp(34px,6vw,58px); line-height:1; font-weight:850;
+  letter-spacing:-.045em; }
+.route-line { position:relative; width:150px; height:24px; color:var(--teal); }
+.route-line::before { content:""; position:absolute; left:0; right:25px; top:11px;
+  border-top:2px dashed #8dcbc4; }
+.route-line svg { position:absolute; right:0; top:2px; width:24px; height:24px; }
+.hero-meta { display:flex; gap:10px; flex-wrap:wrap; margin-top:17px; }
+.hero-meta span { color:var(--navy-500); font-size:13px; }
+.quality-card { position:relative; z-index:2; min-width:190px; padding:16px;
+  border:1px solid var(--line); border-radius:14px; background:rgba(255,255,255,.88); }
+.quality-card-top { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.quality-card strong { font-size:25px; }
+.quality-bar { height:6px; margin:10px 0 8px; border-radius:999px; overflow:hidden; background:#e2e9ec; }
+.quality-bar i { display:block; height:100%; background:var(--teal); border-radius:inherit; }
+.detail-layout { display:grid; grid-template-columns:minmax(0,1fr) 370px; gap:22px; align-items:start; }
+.content-stack { display:grid; gap:18px; }
+.panel-head { display:flex; justify-content:space-between; align-items:flex-start; gap:15px;
+  padding:22px 24px 14px; }
+.panel-head p { margin:0; }
+.field-group { padding:0 24px 22px; }
+.field-group + .field-group { padding-top:19px; border-top:1px solid var(--line); }
+.field-group h3 { color:var(--navy-500); text-transform:uppercase; letter-spacing:.1em;
+  font-size:10px; margin-bottom:7px; }
+.data-row { display:grid; grid-template-columns:180px minmax(0,1fr) auto; gap:12px;
+  align-items:center; min-height:46px; border-bottom:1px solid #edf1f3; }
+.data-row:last-child { border-bottom:0; }
+.data-label { color:var(--navy-500); font-size:13px; }
+.data-value { font-weight:730; overflow-wrap:anywhere; }
+.assessment { position:sticky; top:94px; overflow:hidden; }
+.assessment-top { padding:24px; color:#fff; background:linear-gradient(145deg,var(--navy-950),#123a58); }
+.assessment-top .eyebrow { color:#72d9cd; }
+.assessment-top h2 { margin-bottom:14px; }
+.assessment-top p { margin:12px 0 0; color:#b6c7d3; font-size:13px; }
+.assessment-body { padding:22px; }
+.remedy { padding:13px; margin-bottom:15px; border-radius:11px; color:#08645c;
+  background:var(--teal-soft); font-weight:760; }
+.remedy ul { margin:7px 0 0; padding-left:18px; }
+.reason-list { margin:0; padding:0; list-style:none; }
+.reason-list li { position:relative; padding:0 0 13px 22px; color:var(--navy-700); font-size:13px; }
+.reason-list li::before { content:""; position:absolute; left:2px; top:7px; width:7px; height:7px;
+  border-radius:50%; background:var(--teal); box-shadow:0 0 0 4px var(--teal-soft); }
+.source-links { display:grid; gap:7px; padding-top:13px; border-top:1px solid var(--line); }
+.source-links a { color:var(--teal-dark); font-size:12px; font-weight:780; text-decoration:none; }
+.source-links a:hover { text-decoration:underline; }
+.claim-actions { display:grid; gap:9px; margin-top:18px; }
+.claim-actions .btn { width:100%; }
+.corrections { overflow:hidden; }
+.corrections summary { display:flex; align-items:center; justify-content:space-between; gap:15px;
+  padding:20px 24px; cursor:pointer; list-style:none; font-weight:800; }
+.corrections summary::-webkit-details-marker { display:none; }
+.corrections summary::after { content:"+"; width:28px; height:28px; display:grid; place-items:center;
+  border-radius:9px; color:var(--teal-dark); background:var(--teal-soft); }
+.corrections[open] summary::after { content:"−"; }
+.correction-form { padding:0 24px 24px; border-top:1px solid var(--line); }
+.correction-form > p { margin:16px 0; }
+.form-section { margin:22px 0 12px; color:var(--navy-500); text-transform:uppercase;
+  letter-spacing:.1em; font-size:10px; font-weight:850; }
+.email-details { border-top:1px solid var(--line); }
+.email-details summary { display:grid; grid-template-columns:auto 1fr auto; gap:11px;
+  align-items:center; padding:16px 24px; cursor:pointer; list-style:none; }
+.email-details summary::-webkit-details-marker { display:none; }
+.email-details summary:hover { background:#f8fbfb; }
+.email-subject { min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-weight:750; }
+.email-body { max-height:480px; overflow:auto; margin:0 24px 20px; padding:15px;
+  border:1px solid var(--line); border-radius:11px; background:#f6f9fa;
+  white-space:pre-wrap; overflow-wrap:anywhere; font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace; }
+.history-list { display:grid; gap:10px; padding:0 24px 22px; }
+.history-item { display:flex; align-items:center; justify-content:space-between; gap:12px;
+  padding:12px 14px; border:1px solid var(--line); border-radius:11px; }
+.history-item p { margin:0; }
+@media (max-width:980px) {
+  .detail-layout { grid-template-columns:1fr; }
+  .assessment { position:static; grid-row:1; }
+}
+@media (max-width:650px) {
+  .flight-hero { padding:22px; }
+  .flight-hero-top { display:block; }
+  .quality-card { margin-top:22px; }
+  .route-line { width:75px; }
+  .hero-route { gap:12px; }
+  .airport-code { font-size:37px; }
+  .data-row { grid-template-columns:1fr auto; padding:10px 0; gap:3px 10px; }
+  .data-label { grid-column:1/3; }
+  .email-details summary { grid-template-columns:1fr; }
+  .email-details summary .muted { display:none; }
+}
+</style>
+{% endblock %}
 {% block content %}
-<p><a class="btn" href="{{ url_for('index') }}">← All flights</a></p>
+<a class="breadcrumb" href="{{ url_for('index') }}">← Back to all flights</a>
 
-<div class="card">
-  <h2 style="margin-top:0">
-    {{ flight.airline_name or flight.airline_code or 'Unknown airline' }}
-    {{ flight.flight_number or '' }}
-    <span class="muted">· {{ flight.flight_date or 'date unknown' }}</span>
-    {% if flight.cancelled %}<span class="badge not_eligible">CANCELLED</span>{% endif %}
-  </h2>
-  <p class="muted">Built from {{ flight.email_count }} linked email(s):
-    {% for label in flight.kind_labels %}<span class="badge kind">{{ label }}</span> {% endfor %}
-  </p>
-
-  {% for label, value in fields %}
-  <div class="field">
-    <span class="label">{{ label }}</span>
-    <span class="value" id="fv{{ loop.index }}">{{ value }}</span>
-    <button class="copy" onclick="copyText(this, document.getElementById('fv{{ loop.index }}').textContent)">Copy</button>
+<section class="flight-hero card">
+  <div class="flight-hero-top">
+    <div>
+      <div class="flight-kicker">
+        <span class="airline-logo">{{ flight.airline_code or 'FL' }}</span>
+        <div><strong>{{ flight.airline_name or flight.airline_code or 'Airline unknown' }}</strong><span>{{ flight.display_flight_number }} · {{ flight.display_date }}</span></div>
+      </div>
+      <div class="hero-route" aria-label="{{ flight.route }}">
+        <span class="airport-code">{{ flight.display_origin }}</span>
+        <span class="route-line" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M3 13.3 21 5l-5.8 14-3.5-5.2L3 13.3Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg></span>
+        <span class="airport-code">{{ flight.display_destination }}</span>
+      </div>
+      <div class="hero-meta">
+        <span class="badge {{ flight.state }}">{{ flight.state_label }}</span>
+        {% if flight.pnr %}<span>Booking {{ flight.pnr }}</span>{% endif %}
+        <span>{{ flight.email_count or 0 }} source email{% if flight.email_count != 1 %}s{% endif %}</span>
+      </div>
+    </div>
+    <div class="quality-card">
+      <div class="quality-card-top"><span class="small muted">Data confidence</span><strong>{{ flight.quality.score }}%</strong></div>
+      <div class="quality-bar"><i style="width:{{ flight.quality.score }}%"></i></div>
+      <span class="small muted">{{ flight.quality.label }}{% if flight.quality.missing %} · missing {{ flight.quality.missing|join(', ') }}{% endif %}</span>
+    </div>
   </div>
-  {% endfor %}
-</div>
+</section>
 
-<div class="card">
-  <h3 style="margin-top:0">Compensation check
-    <span class="badge {{ assessment.verdict }}">{{ assessment.label }}</span>
-  </h3>
-  <p class="muted">Framework: {{ assessment.frameworks|join('; ') }}
-    {% if assessment.delay_hours is not none %} · detected arrival delay ≈ {{ assessment.delay_hours }} h{% endif %}
-  </p>
-  <ul class="reasons">
-    {% for reason in assessment.reasons %}<li>{{ reason }}</li>{% endfor %}
-  </ul>
-  <div class="actions">
-    <a class="btn danger" href="{{ url_for('complaint_gaca', flight_id=flight.id) }}">Complain to GACA</a>
-    <a class="btn primary" href="{{ url_for('complaint_airline', flight_id=flight.id) }}">Complain to the airline</a>
+<div class="detail-layout">
+  <div class="content-stack">
+    <section class="card">
+      <div class="panel-head"><div><p class="eyebrow">Merged record</p><h2>Flight details</h2></div><span class="badge quality">{{ flight.email_count or 0 }} emails combined</span></div>
+      {% for group in field_groups %}
+      <div class="field-group">
+        <h3>{{ group.title }}</h3>
+        {% for label, value in group.fields %}
+        <div class="data-row">
+          <span class="data-label">{{ label }}</span>
+          <span class="data-value" id="field-{{ loop.index }}-{{ loop.index0 }}-{{ group.title|lower }}">{{ value }}</span>
+          <button type="button" class="copy" onclick="copyFrom(this, 'field-{{ loop.index }}-{{ loop.index0 }}-{{ group.title|lower }}')">Copy</button>
+        </div>
+        {% endfor %}
+      </div>
+      {% endfor %}
+    </section>
+
+    <details id="corrections" class="corrections card" {% if flight.quality.score < 60 %}open{% endif %}>
+      <summary><span><span class="eyebrow" style="display:block;margin-bottom:4px">Your corrections</span>Fix missing or inaccurate details</span></summary>
+      <form class="correction-form" method="post" action="{{ url_for('flight_override', flight_id=flight.id) }}">
+        <p class="muted small">Manual values take priority over email extraction and survive future scans.</p>
+        <p class="form-section">Itinerary</p>
+        <div class="field-grid">
+          <label class="form-field">Flight number<input type="text" name="flight_number" placeholder="SV 123" value="{{ flight.overrides.get('flight_number', flight.flight_number or '') }}"></label>
+          <label class="form-field">Travel date<input type="date" name="flight_date" value="{{ flight.overrides.get('flight_date', flight.flight_date or '') }}"></label>
+          <label class="form-field">Origin airport<input type="text" name="origin" maxlength="3" placeholder="RUH" value="{{ flight.overrides.get('origin', flight.origin or '') }}"></label>
+          <label class="form-field">Destination airport<input type="text" name="destination" maxlength="3" placeholder="JED" value="{{ flight.overrides.get('destination', flight.destination or '') }}"></label>
+          <label class="form-field">Scheduled departure<input type="datetime-local" name="departure" value="{{ flight.overrides.get('departure', flight.departure or '')|replace(' ', 'T') }}"></label>
+          <label class="form-field">Scheduled arrival<input type="datetime-local" name="arrival" value="{{ flight.overrides.get('arrival', flight.arrival or '')|replace(' ', 'T') }}"></label>
+        </div>
+        <p class="form-section">Passenger &amp; payment</p>
+        <div class="field-grid">
+          <label class="form-field">Passenger name<input type="text" name="passenger" placeholder="Name as shown on ticket" value="{{ flight.overrides.get('passenger', flight.passenger or '') }}"></label>
+          <label class="form-field">Payment method / card<input type="text" name="payment_method" placeholder="Visa or Visa •••• 1234" value="{{ flight.overrides.get('payment_method', flight.payment_method or '') }}"></label>
+        </div>
+        <p class="muted small">For safety, enter only the card brand and optionally its masked last four digits—never a full card number.</p>
+        <p class="form-section">What happened</p>
+        <div class="field-grid">
+          <label class="form-field">Actual arrival<input type="datetime-local" name="actual_arrival" value="{{ flight.overrides.get('actual_arrival', '')|replace(' ', 'T') }}"></label>
+          <label class="form-field">Was the flight cancelled?
+            <select name="cancelled">
+              <option value="">Use email evidence{% if flight.cancelled %} (cancelled){% endif %}</option>
+              <option value="yes" {% if flight.overrides.get('cancelled') is sameas true %}selected{% endif %}>Yes</option>
+              <option value="no" {% if flight.overrides.get('cancelled') is sameas false %}selected{% endif %}>No</option>
+            </select>
+          </label>
+          <label class="form-field">Cancellation notice (days)<input type="number" min="0" step="0.5" name="cancellation_notice_days" value="{{ flight.overrides.get('cancellation_notice_days', '') }}"></label>
+          <label class="form-field">Accepted an alternative flight?
+            <select name="accepted_alternative">
+              <option value="" {% if not flight.overrides.get('accepted_alternative') %}selected{% endif %}>Not specified</option>
+              <option value="yes" {% if flight.overrides.get('accepted_alternative') == 'yes' %}selected{% endif %}>Yes</option>
+              <option value="no" {% if flight.overrides.get('accepted_alternative') == 'no' %}selected{% endif %}>No</option>
+            </select>
+          </label>
+        </div>
+        <label class="check-row" style="margin:18px 0"><input type="checkbox" name="denied_boarding" value="1" {% if flight.overrides.get('denied_boarding') %}checked{% endif %}><span>I was involuntarily denied boarding despite checking in on time.</span></label>
+        <button class="btn primary">Save and recalculate</button>
+      </form>
+    </details>
+
+    {% if flight.complaints %}
+    <section class="card">
+      <div class="panel-head"><div><p class="eyebrow">Activity</p><h2>Claim history</h2></div></div>
+      <div class="history-list">
+        {% for item in flight.complaints %}
+        <div class="history-item"><div><strong>{{ item.kind|upper }} · {{ item.status|replace('_', ' ')|title }}</strong><p class="small muted">{{ item.subject or 'Claim record' }}{% if item.reference %}<br>Reference: {{ item.reference }}{% endif %}</p></div><span class="small muted">{{ item.created_at }}</span></div>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+
+    <section class="card">
+      <div class="panel-head"><div><p class="eyebrow">Audit trail</p><h2>Source emails</h2><p class="muted small">Open a message to inspect the evidence behind this record.</p></div></div>
+      {% for email in flight.emails %}
+      <details class="email-details">
+        <summary>
+          <span class="badge kind">{{ (email.kinds or ['email'])[0]|replace('_', ' ')|title }}</span>
+          <span class="email-subject">{{ email.subject }}</span>
+          <span class="muted small">{{ (email.date or '')[:10] }}</span>
+        </summary>
+        <pre class="email-body">{{ email.body }}</pre>
+      </details>
+      {% else %}<p class="muted" style="padding:0 24px 22px">No source emails are currently linked.</p>{% endfor %}
+    </section>
   </div>
-</div>
 
-<div class="card">
-  <h3 style="margin-top:0">Corrections (improves the eligibility check)</h3>
-  <p class="muted">Emails rarely contain the <i>actual</i> landing time. If the
-  flight landed late, enter it here and the check re-runs.</p>
-  <form method="post" action="{{ url_for('flight_override', flight_id=flight.id) }}">
-    <label class="inline">Actual arrival (landing) time:
-      <input type="text" name="actual_arrival" placeholder="2026-03-08 21:45"
-             value="{{ flight.overrides.get('actual_arrival', '') }}">
-    </label>
-    <label class="inline">Cancellation notice (days before departure):
-      <input type="number" step="1" min="0" name="cancellation_notice_days"
-             value="{{ flight.overrides.get('cancellation_notice_days', '') }}">
-    </label>
-    <label class="inline">
-      <input type="checkbox" name="denied_boarding" value="1"
-             {% if flight.overrides.get('denied_boarding') %}checked{% endif %}>
-      I was denied boarding (e.g. overbooking)
-    </label>
-    <button class="btn primary">Save &amp; re-check</button>
-  </form>
-</div>
-
-<div class="card">
-  <h3 style="margin-top:0">Source emails</h3>
-  {% for email in flight.emails %}
-  <details style="margin-bottom:10px">
-    <summary>
-      {% for k in email.kinds %}<span class="badge kind">{{ k }}</span> {% endfor %}
-      <b>{{ email.subject }}</b>
-      <span class="muted">— {{ email.sender }} · {{ email.date }}</span>
-    </summary>
-    <pre style="white-space:pre-wrap;background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:12px;font-size:12px">{{ email.body }}</pre>
-  </details>
-  {% endfor %}
+  <aside class="assessment card">
+    <div class="assessment-top">
+      <p class="eyebrow">Passenger-rights check</p>
+      <h2>{{ assessment.label }}</h2>
+      <span class="badge {{ assessment.verdict }}">{{ assessment.next_step }}</span>
+      <p>{{ assessment.frameworks|join(' · ') }}</p>
+    </div>
+    <div class="assessment-body">
+      {% if assessment.remedies %}
+      <div class="remedy"><span class="small">Potential remedy</span><ul>{% for remedy in assessment.remedies %}<li>{{ remedy }}</li>{% endfor %}</ul></div>
+      {% endif %}
+      <ul class="reason-list">{% for reason in assessment.reasons %}<li>{{ reason }}</li>{% endfor %}</ul>
+      {% if assessment.sources %}
+      <div class="source-links">
+        <span class="small muted">Official sources · checked {{ assessment.verified_on }}</span>
+        {% for source in assessment.sources %}<a href="{{ source.url }}" target="_blank" rel="noopener">{{ source.label }} ↗</a>{% endfor %}
+      </div>
+      {% endif %}
+      <div class="claim-actions">
+        <a class="btn primary" href="{{ url_for('complaint_airline', flight_id=flight.id) }}">File on airline website</a>
+        {% if flight.gaca_applicable %}<a class="btn" href="{{ url_for('complaint_gaca', flight_id=flight.id) }}">Escalate on GACA website</a>{% endif %}
+      </div>
+    </div>
+  </aside>
 </div>
 {% endblock %}

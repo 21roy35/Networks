@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Complaint profile · FlightDeck{% endblock %}
+{% block head %}
+<style>
+.profile-wrap { max-width:820px; margin:25px auto; }
+.profile-head { margin-bottom:22px; }
+.profile-head h1 { font-size:clamp(34px,5vw,52px); margin:7px 0 9px; }
+.profile-card { padding:30px; }
+.profile-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:17px; }
+.profile-grid .wide { grid-column:1/-1; }
+.profile-note { display:flex; gap:12px; margin:0 0 23px; padding:14px 16px;
+  border-radius:13px; background:var(--teal-soft); color:var(--teal-dark); font-size:13px; }
+.profile-actions { display:flex; justify-content:flex-end; gap:10px; margin-top:24px; }
+@media(max-width:650px) { .profile-grid { grid-template-columns:1fr; } .profile-grid .wide { grid-column:auto; } .profile-card { padding:21px; } }
+</style>
+{% endblock %}
+{% block content %}
+<div class="profile-wrap">
+  <a class="breadcrumb" style="display:inline-flex;margin-bottom:12px;color:var(--navy-500);text-decoration:none;font-weight:750;font-size:13px" href="{{ next_url }}">← Back</a>
+  <header class="profile-head"><p class="eyebrow">One-time setup</p><h1>Your complaint profile</h1><p class="muted">Official forms ask for identity and contact details that cannot be guessed from a booking. Save them once; after this, each complaint needs only your description of what went wrong.</p></header>
+  <form class="card profile-card" method="post">
+    <input type="hidden" name="next" value="{{ next_url }}">
+    <div class="profile-note">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></svg>
+      <span>Stored locally in <code>config.json</code> and used only to fill official complaint websites. It is never emailed.</span>
+    </div>
+    <div class="profile-grid">
+      <label class="form-field wide"><span>Full legal name</span><input name="full_name" value="{{ profile.full_name or '' }}" autocomplete="name" required></label>
+      <label class="form-field"><span>Title</span><select name="title" required><option value="">Select title</option>{% for value in ['Mr','Ms','Mrs','Dr'] %}<option value="{{ value }}" {% if profile.title == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></label>
+      <label class="form-field"><span>Nationality</span><input name="nationality" value="{{ profile.nationality or '' }}" placeholder="Saudi Arabian" autocomplete="country-name" required></label>
+      <label class="form-field wide"><span>Passport, National ID, or Iqama number</span><input name="national_id" value="{{ profile.national_id or '' }}" autocomplete="off" required></label>
+      <label class="form-field"><span>Contact email</span><input type="email" name="email" value="{{ profile.email or '' }}" autocomplete="email" required></label>
+      <label class="form-field"><span>Country calling code</span><input name="country_code" value="{{ profile.country_code or '' }}" placeholder="+966" inputmode="tel" required></label>
+      <label class="form-field wide"><span>Mobile number</span><input name="phone" value="{{ profile.phone or '' }}" autocomplete="tel" inputmode="tel" required></label>
+    </div>
+    <div class="profile-actions"><a class="btn" href="{{ next_url }}">Cancel</a><button class="btn primary">Save complaint profile</button></div>
+  </form>
+</div>
+{% endblock %}

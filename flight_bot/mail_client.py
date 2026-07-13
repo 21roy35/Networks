@@ -11,28 +11,94 @@ import re
 import time
 from datetime import datetime, timedelta
 from email.utils import parseaddr, parsedate_to_datetime
+from html import unescape
+from html.parser import HTMLParser
 
 from .airlines import all_domains
 
 _SUBJECT_KEYWORDS = [
     "flight", "boarding pass", "e-ticket", "eticket", "itinerary",
-    "booking confirmation", "check-in", "your trip",
+    "booking confirmation", "check-in", "your trip", "complaint", "claim",
+    "case", "customer relations", "feedback", "reference",
 ]
 
-_HTML_TAG_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
-_TAGS_RE = re.compile(r"<br\s*/?>|</(p|div|tr|li|h[1-6]|table)>", re.IGNORECASE)
-_ANY_TAG_RE = re.compile(r"<[^>]+>")
+_SKIP_TAGS = {"script", "style", "head", "title", "meta", "link"}
+_BREAK_TAGS = {"br", "p", "div", "tr", "li", "table", "ul", "ol",
+               "h1", "h2", "h3", "h4", "h5", "h6"}
+
+
+class _TextExtractor(HTMLParser):
+    """Tolerant HTML -> text: drops script/style/head content entirely."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in _SKIP_TAGS:
+            self._skip += 1
+        elif tag in _BREAK_TAGS:
+            self.parts.append("\n")
+        elif tag == "td":
+            self.parts.append(" ")
+
+    def handle_startendtag(self, tag, attrs):
+        if tag in _BREAK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in _SKIP_TAGS:
+            self._skip = max(0, self._skip - 1)
+        elif tag in _BREAK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._skip:
+            self.parts.append(data)
+
+
+_HTML_MARKER_RE = re.compile(
+    r"<\s*(?:!doctype|html|head|body|table|div|style|span|td)\b", re.IGNORECASE)
+# CSS rules that survive naive tag stripping ("td { padding: 0 }" etc.).
+_CSS_RULE_RE = re.compile(r"[^{}\n]{0,200}\{[^{}]*\}")
+
+
+def looks_like_html(text: str) -> bool:
+    return bool(_HTML_MARKER_RE.search(text or ""))
 
 
 def html_to_text(html: str) -> str:
-    text = _HTML_TAG_RE.sub(" ", html)
-    text = _TAGS_RE.sub("\n", text)
-    text = _ANY_TAG_RE.sub(" ", text)
-    text = (text.replace("&nbsp;", " ").replace("&amp;", "&")
-                .replace("&lt;", "<").replace("&gt;", ">")
-                .replace("&#39;", "'").replace("&quot;", '"'))
-    text = re.sub(r"[ \t]+", " ", text)
+    extractor = _TextExtractor()
+    try:
+        extractor.feed(html)
+        extractor.close()
+    except Exception:
+        pass
+    text = "".join(extractor.parts)
+    text = re.sub(r"[ \t\xa0]+", " ", text)
     return re.sub(r"\n\s*\n+", "\n", text).strip()
+
+
+def clean_email_body(body: str) -> str:
+    """Normalise a stored/extracted body into plain text.
+
+    Handles HTML that was mislabelled as text/plain and CSS residue left
+    behind by earlier, less robust versions of this scraper.
+    """
+    if not body:
+        return ""
+    if looks_like_html(body):
+        body = html_to_text(body)
+    else:
+        body = unescape(body)
+    for _ in range(4):  # peel nested @media { rule { ... } } blocks
+        cleaned = _CSS_RULE_RE.sub(" ", body)
+        if cleaned == body:
+            break
+        body = cleaned
+    body = re.sub(r"[ \t\xa0]+", " ", body)
+    return re.sub(r"\n\s*\n+", "\n", body).strip()
 
 
 def extract_body(msg: email.message.EmailMessage) -> str:
@@ -40,7 +106,9 @@ def extract_body(msg: email.message.EmailMessage) -> str:
     plain = msg.get_body(preferencelist=("plain",))
     if plain is not None:
         try:
-            return plain.get_content()
+            content = plain.get_content()
+            # Some airlines (e.g. flyadeal) put raw HTML in the plain part.
+            return clean_email_body(content)
         except Exception:
             pass
     html = msg.get_body(preferencelist=("html",))

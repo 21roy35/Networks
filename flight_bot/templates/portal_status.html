@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Submitting complaint · FlightDeck{% endblock %}
+{% block head %}
+<style>
+.status-wrap { max-width:760px; margin:55px auto; }
+.status-card { padding:38px; text-align:center; }
+.portal-mark { width:72px; height:72px; display:grid; place-items:center; margin:0 auto 21px;
+  border-radius:22px; background:var(--teal-soft); color:var(--teal-dark); }
+.portal-mark svg { width:34px; height:34px; }
+.status-card h1 { font-size:clamp(30px,5vw,46px); margin:0 0 10px; }
+.status-message { max-width:560px; min-height:48px; margin:0 auto; }
+.progress-track { height:7px; max-width:480px; margin:25px auto; overflow:hidden;
+  border-radius:999px; background:#e7eef0; }
+.progress-bar { width:38%; height:100%; border-radius:inherit; background:var(--teal);
+  animation:travel 1.35s ease-in-out infinite alternate; }
+.status-card.terminal .progress-bar { width:100%; animation:none; }
+.reference { display:none; margin:20px auto 0; padding:15px; max-width:430px;
+  border:1px solid var(--line); border-radius:13px; background:#f7fafb; }
+.reference.visible { display:block; }
+.reference span { display:block; color:var(--navy-500); font-size:11px; }
+.reference strong { display:block; margin-top:4px; font-size:20px; }
+.status-actions { display:flex; justify-content:center; gap:10px; margin-top:25px; }
+@keyframes travel { from { transform:translateX(-70%); } to { transform:translateX(165%); } }
+</style>
+{% endblock %}
+{% block content %}
+<div class="status-wrap">
+  <section class="card status-card" id="status-card">
+    <div class="portal-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3h7v7"/><path d="M10 14 21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg></div>
+    <p class="eyebrow" id="status-label">{{ job.status|replace('_', ' ')|title }}</p>
+    <h1>Official portal in progress</h1>
+    <p class="muted status-message" id="status-message">{{ job.message }}</p>
+    <div class="progress-track"><div class="progress-bar"></div></div>
+    <div class="reference" id="reference"><span>Complaint reference</span><strong id="reference-value"></strong></div>
+    <p class="muted small" id="verification-note">A visible Microsoft Edge window handles the official form. Keep it open until confirmation.</p>
+    <div class="status-actions">
+      {% if flight_id %}<a class="btn" href="{{ url_for('flight_detail', flight_id=flight_id) }}">Back to flight</a>{% endif %}
+    </div>
+  </section>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+const card = document.getElementById('status-card');
+const label = document.getElementById('status-label');
+const message = document.getElementById('status-message');
+const reference = document.getElementById('reference');
+const referenceValue = document.getElementById('reference-value');
+const note = document.getElementById('verification-note');
+const endpoint = {{ url_for('portal_status_json', job_id=job.id)|tojson }};
+
+async function refreshStatus() {
+  try {
+    const response = await fetch(endpoint, {headers: {'Accept': 'application/json'}});
+    if (!response.ok) throw new Error('Status unavailable');
+    const job = await response.json();
+    label.textContent = job.status.replaceAll('_', ' ').replace(/\b\w/g, c => c.toUpperCase());
+    message.textContent = job.message;
+    if (job.status === 'verification') {
+      note.textContent = 'Complete the indicated security or confirmation step in the opened official portal. FlightDeck will continue automatically.';
+    }
+    if (job.reference) {
+      referenceValue.textContent = job.reference;
+      reference.classList.add('visible');
+    }
+    if (job.terminal) {
+      card.classList.add('terminal');
+      if (job.status === 'submitted') note.textContent = 'Submission confirmed and saved to this flight’s claim history.';
+      return;
+    }
+    setTimeout(refreshStatus, 1200);
+  } catch (error) {
+    message.textContent = 'Waiting to reconnect to the local status tracker…';
+    setTimeout(refreshStatus, 2500);
+  }
+}
+setTimeout(refreshStatus, 700);
+</script>
+{% endblock %}

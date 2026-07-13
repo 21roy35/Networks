@@ -1,61 +1,86 @@
 {% extends "base.html" %}
-{% block title %}Scanning mailbox – Flight Bot{% endblock %}
+{% block title %}Scanning mailbox · FlightDeck{% endblock %}
+{% block head %}
+<style>
+.scan-wrap { max-width:760px; margin:28px auto; }
+.scan-hero { position:relative; overflow:hidden; padding:38px; color:#fff;
+  background:linear-gradient(140deg,var(--navy-950),#0d3856); }
+.scan-hero::after { content:""; position:absolute; width:250px; height:250px; right:-100px;
+  top:-120px; border:1px solid rgba(255,255,255,.1); border-radius:50%;
+  box-shadow:0 0 0 45px rgba(255,255,255,.025),0 0 0 90px rgba(255,255,255,.018); }
+.scan-plane { position:relative; z-index:2; width:56px; height:56px; display:grid; place-items:center;
+  margin-bottom:24px; border-radius:17px; color:var(--navy-950); background:#70dece; }
+.scan-hero .eyebrow { color:#70dece; }
+.scan-hero h1 { font-size:38px; margin-bottom:10px; }
+.scan-hero p { color:#aec3d2; margin-bottom:0; }
+.scan-body { padding:28px 32px 32px; }
+.phase-row { display:flex; justify-content:space-between; align-items:center; gap:15px; }
+.phase-row strong { font-size:18px; }
+.progress-track { height:12px; margin:18px 0 12px; overflow:hidden; border-radius:999px;
+  background:#e3ebee; }
+.progress-bar { height:100%; width:0; border-radius:inherit;
+  background:linear-gradient(90deg,var(--teal),#48d4c3); transition:width .55s ease; }
+.scan-stats { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:22px 0; }
+.scan-stat { padding:14px; border:1px solid var(--line); border-radius:12px; background:#f8fafb; }
+.scan-stat strong { display:block; font-size:21px; }
+.scan-stat span { color:var(--navy-500); font-size:11px; font-weight:750; }
+.scan-note { display:flex; gap:10px; padding:13px; border-radius:11px; color:var(--navy-500);
+  background:#f1f5f6; font-size:12px; }
+.error-box { display:none; margin-top:18px; padding:14px; border:1px solid #f0bfc3;
+  border-radius:11px; color:#922f39; background:var(--red-soft); }
+@media (max-width:560px) { .scan-hero,.scan-body { padding:24px; } .scan-stats { grid-template-columns:1fr; } }
+</style>
+{% endblock %}
 {% block content %}
-<div class="card" style="max-width:640px;margin:40px auto">
-  <h2 style="margin-top:0">Scanning your mailbox</h2>
-  <p class="muted" id="phase">Connecting…</p>
-
-  <div style="background:#e6eaf0;border-radius:999px;height:14px;overflow:hidden">
-    <div id="bar" style="background:var(--accent);height:100%;width:0%;
-         border-radius:999px;transition:width .6s"></div>
-  </div>
-
-  <p style="display:flex;justify-content:space-between">
-    <span id="counts" class="muted"></span>
-    <b id="eta"></b>
-  </p>
-  <p class="muted" id="kept"></p>
-  <p id="errorbox" class="flash" style="display:none"></p>
-  <p><a class="btn" href="{{ url_for('index') }}">← Back to flights</a>
-     <span class="muted">— the scan keeps running in the background.</span></p>
+<div class="scan-wrap card">
+  <section class="scan-hero">
+    <div class="scan-plane" aria-hidden="true"><svg class="icon" style="width:28px;height:28px" viewBox="0 0 24 24" fill="none"><path d="M3 13.3 21 5l-5.8 14-3.5-5.2L3 13.3Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg></div>
+    <p class="eyebrow">Inbox intelligence</p>
+    <h1>Building your flight history</h1>
+    <p>We’re reading likely airline messages, extracting evidence, and connecting messages that belong to the same trip.</p>
+  </section>
+  <section class="scan-body">
+    <div class="phase-row"><strong id="phase" role="status">Connecting securely…</strong><span class="badge upcoming" id="percent">0%</span></div>
+    <div class="progress-track" aria-hidden="true"><div class="progress-bar" id="bar"></div></div>
+    <p class="muted small" id="eta">Preparing the scan…</p>
+    <div class="scan-stats">
+      <div class="scan-stat"><strong id="processed">0</strong><span>MESSAGES CHECKED</span></div>
+      <div class="scan-stat"><strong id="total">—</strong><span>POSSIBLE MATCHES</span></div>
+      <div class="scan-stat"><strong id="kept">0</strong><span>USEFUL EMAILS</span></div>
+    </div>
+    <div class="scan-note"><span>●</span><span>You can return to the dashboard. The scan continues in the background, and existing flights stay available.</span></div>
+    <div class="error-box" id="errorbox" role="alert"></div>
+    <div class="actions" style="margin-top:18px"><a class="btn" href="{{ url_for('index') }}">← Back to flights</a></div>
+  </section>
 </div>
-
+{% endblock %}
+{% block scripts %}
 <script>
-const PHASE_TEXT = {
-  starting:   "Starting…",
-  connecting: "Connecting to your mail server…",
-  searching:  "Searching folders for airline emails…",
-  fetching:   "Downloading and parsing emails…",
-  linking:    "Linking related emails into flights…",
+const PHASES = {
+  starting: 'Preparing the mailbox scan…', connecting: 'Connecting to your mail server…',
+  searching: 'Finding likely airline messages…', fetching: 'Reading and extracting flight evidence…',
+  linking: 'Connecting related emails into flights…'
 };
-
-async function poll() {
+async function pollScan() {
   let p;
-  try {
-    p = await (await fetch("{{ url_for('scan_progress') }}")).json();
-  } catch (e) { setTimeout(poll, 2500); return; }
-
-  if (p.phase === "done") {
-    location = "{{ url_for('index') }}";
-    return;
+  try { p = await (await fetch("{{ url_for('scan_progress') }}")).json(); }
+  catch (_) { setTimeout(pollScan, 2200); return; }
+  if (p.phase === 'done') { location = "{{ url_for('index') }}"; return; }
+  if (p.phase === 'error') {
+    document.getElementById('phase').textContent = 'The scan stopped';
+    const box = document.getElementById('errorbox'); box.style.display = 'block';
+    box.textContent = p.error || 'An unknown mailbox error occurred.'; return;
   }
-  if (p.phase === "error") {
-    document.getElementById("phase").textContent = "Scan stopped.";
-    const box = document.getElementById("errorbox");
-    box.style.display = "block";
-    box.textContent = p.error || "Unknown error.";
-    return;
-  }
-  document.getElementById("phase").textContent = PHASE_TEXT[p.phase] || p.phase;
-  document.getElementById("bar").style.width = p.percent + "%";
-  document.getElementById("counts").textContent =
-    p.total ? `${p.processed} of ${p.total} emails` : "";
-  document.getElementById("eta").textContent =
-    p.eta ? `~${p.eta} left` : (p.phase === "fetching" ? "estimating…" : "");
-  document.getElementById("kept").textContent =
-    p.kept ? `${p.kept} flight-related email(s) found so far` : "";
-  setTimeout(poll, 1200);
+  document.getElementById('phase').textContent = PHASES[p.phase] || 'Working…';
+  document.getElementById('bar').style.width = p.percent + '%';
+  document.getElementById('percent').textContent = p.percent + '%';
+  document.getElementById('processed').textContent = p.processed || 0;
+  document.getElementById('total').textContent = p.total || '—';
+  document.getElementById('kept').textContent = p.kept || 0;
+  document.getElementById('eta').textContent = p.eta ? `About ${p.eta} remaining` :
+    (p.phase === 'fetching' ? 'Estimating remaining time…' : 'This usually takes a few moments.');
+  setTimeout(pollScan, 1200);
 }
-poll();
+pollScan();
 </script>
 {% endblock %}

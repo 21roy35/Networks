@@ -1,0 +1,26 @@
+from flight_bot import config as config_module
+
+
+def test_load_config_does_not_mutate_defaults(monkeypatch, tmp_path):
+    monkeypatch.setattr(config_module, "CONFIG_PATH", tmp_path / "missing.json")
+    monkeypatch.setenv("FLIGHTBOT_IMAP_USER", "first@example.com")
+    monkeypatch.setenv("FLIGHTBOT_IMAP_PASSWORD", "secret")
+    first = config_module.load_config()
+    assert first["user"]["email"] == "first@example.com"
+
+    monkeypatch.delenv("FLIGHTBOT_IMAP_USER")
+    monkeypatch.delenv("FLIGHTBOT_IMAP_PASSWORD")
+    second = config_module.load_config()
+    assert second["imap"]["user"] == ""
+    assert second["user"]["email"] == ""
+    assert config_module.DEFAULTS["imap"]["user"] == ""
+
+
+def test_telegram_environment_credentials_enable_integration(monkeypatch, tmp_path):
+    monkeypatch.setattr(config_module, "CONFIG_PATH", tmp_path / "missing.json")
+    monkeypatch.setenv("FLIGHTBOT_TELEGRAM_BOT_TOKEN", "123:test-token")
+    monkeypatch.setenv("FLIGHTBOT_TELEGRAM_CHAT_ID", "987654")
+    config = config_module.load_config()
+    assert config["telegram"]["enabled"] is True
+    assert config["telegram"]["bot_token"] == "123:test-token"
+    assert config["telegram"]["chat_id"] == "987654"

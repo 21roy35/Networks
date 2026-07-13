@@ -1,116 +1,94 @@
-"""Airline registry: IATA codes, sender domains and complaint contacts.
-
-Complaint addresses are best-effort public customer-relations contacts;
-override any of them in config.json under "airline_overrides" if needed.
-"""
+"""Airline registry: IATA codes, sender domains and official complaint sites."""
 
 AIRLINES = {
     "SV": {
         "name": "Saudia",
         "domains": ["saudia.com", "saudiairlines.com", "alfursan.saudia.com"],
-        "complaint_email": "customer.relations@saudia.com",
-        "complaint_url": "https://www.saudia.com/help/contact-us",
+        "complaint_url": "https://prod.dcloud.saudia.com/pages/help/contact-us/guest-relations/contact-form?sc_country=SA&sc_lang=en",
     },
     "XY": {
         "name": "flynas",
         "domains": ["flynas.com"],
-        "complaint_email": "customercare@flynas.com",
-        "complaint_url": "https://www.flynas.com/en/contact-us",
+        "complaint_url": "https://help.flynas.com/en",
     },
     "F3": {
         "name": "flyadeal",
         "domains": ["flyadeal.com"],
-        "complaint_email": "care@flyadeal.com",
-        "complaint_url": "https://www.flyadeal.com/en/contact-us",
+        "complaint_url": "https://help.flyadeal.com/hc/en-us/requests/new",
     },
     "EK": {
         "name": "Emirates",
         "domains": ["emirates.com"],
-        "complaint_email": "customer.affairs@emirates.com",
         "complaint_url": "https://www.emirates.com/english/help/",
     },
     "EY": {
         "name": "Etihad Airways",
         "domains": ["etihad.com", "etihad.ae"],
-        "complaint_email": "guest@etihad.ae",
         "complaint_url": "https://www.etihad.com/en/help",
     },
     "QR": {
         "name": "Qatar Airways",
         "domains": ["qatarairways.com", "qatarairways.com.qa"],
-        "complaint_email": "tell-us@qatarairways.com.qa",
         "complaint_url": "https://www.qatarairways.com/en/contact-us.html",
     },
     "GF": {
         "name": "Gulf Air",
         "domains": ["gulfair.com"],
-        "complaint_email": "customerexperience@gulfair.com",
         "complaint_url": "https://www.gulfair.com/contact-us",
     },
     "KU": {
         "name": "Kuwait Airways",
         "domains": ["kuwaitairways.com"],
-        "complaint_email": "customerservice@kuwaitairways.com",
         "complaint_url": "https://www.kuwaitairways.com/en/contact-us",
     },
     "MS": {
         "name": "EgyptAir",
         "domains": ["egyptair.com"],
-        "complaint_email": "customer.relations@egyptair.com",
         "complaint_url": "https://www.egyptair.com/en/about-egyptair/Pages/contact-us.aspx",
     },
     "RJ": {
         "name": "Royal Jordanian",
         "domains": ["rj.com", "royaljordanian.com"],
-        "complaint_email": "customer.relations@rj.com",
         "complaint_url": "https://www.rj.com/en/contact-us",
     },
     "TK": {
         "name": "Turkish Airlines",
         "domains": ["turkishairlines.com", "thy.com"],
-        "complaint_email": "customer@thy.com",
         "complaint_url": "https://www.turkishairlines.com/en-int/any-questions/customer-relations/",
     },
     "BA": {
         "name": "British Airways",
         "domains": ["britishairways.com", "email.ba.com", "ba.com"],
-        "complaint_email": "customer.relations@ba.com",
         "complaint_url": "https://www.britishairways.com/travel/customer-relations-int/public/en_gb",
     },
     "LH": {
         "name": "Lufthansa",
         "domains": ["lufthansa.com", "milesandmore.com"],
-        "complaint_email": "customer.relations@lufthansa.com",
         "complaint_url": "https://www.lufthansa.com/de/en/help-and-contact",
     },
     "AF": {
         "name": "Air France",
         "domains": ["airfrance.com", "airfrance.fr"],
-        "complaint_email": "mail.customercare@airfrance.fr",
         "complaint_url": "https://wwws.airfrance.fr/en/contact",
     },
     "KL": {
         "name": "KLM",
         "domains": ["klm.com", "klm.nl"],
-        "complaint_email": "klmcares@klm.com",
         "complaint_url": "https://www.klm.com/help",
     },
     "PC": {
         "name": "Pegasus Airlines",
         "domains": ["flypgs.com", "pegasusairlines.com"],
-        "complaint_email": "flypgs@flypgs.com",
         "complaint_url": "https://www.flypgs.com/en/contact-us",
     },
     "WY": {
         "name": "Oman Air",
         "domains": ["omanair.com"],
-        "complaint_email": "customerservice@omanair.com",
         "complaint_url": "https://www.omanair.com/en/contact-us",
     },
     "FZ": {
         "name": "flydubai",
         "domains": ["flydubai.com"],
-        "complaint_email": "letstalk@flydubai.com",
         "complaint_url": "https://www.flydubai.com/en/contact-us",
     },
 }
@@ -118,15 +96,22 @@ AIRLINES = {
 # Carriers whose home regulator is GACA (Saudi Arabia).
 SAUDI_CARRIERS = {"SV", "XY", "F3"}
 
-# EU/UK carriers for EU261/UK261 purposes.
-EU_CARRIERS = {"LH", "AF", "KL", "BA", "PC"}
+# Carriers in the registry that establish inbound EU/EEA or UK territorial
+# coverage. Pegasus is Turkish and must not be treated as an EU carrier; BA is
+# assessed under the separate UK261 regime.
+EU_EEA_CARRIERS = {"LH", "AF", "KL"}
+UK_CARRIERS = {"BA"}
+
+# Backwards-compatible name for integrations that imported the old constant.
+EU_CARRIERS = EU_EEA_CARRIERS
 
 GACA = {
     "name": "General Authority of Civil Aviation (GACA)",
-    "portal_url": "https://cs.gaca.gov.sa/csportal/en/",
-    "phone": "8001168888",
-    "note": "GACA accepts passenger complaints through its Customer "
-            "Support portal and the 8001168888 call centre.",
+    "portal_url": "https://myeservices.gaca.gov.sa/eservices/eservice/details?detailsId=2642710",
+    "phone": "1929",
+    "note": "GACA airline complaints are escalations: file with the carrier "
+            "first, then escalate after seven days without a response or when "
+            "the carrier's proposed resolution is unsatisfactory.",
 }
 
 

@@ -1,0 +1,154 @@
+from copy import deepcopy
+
+import pytest
+
+from flight_bot import db, webapp
+from flight_bot.config import DEFAULTS
+from flight_bot.pipeline import load_demo
+from flight_bot.web_access import create_web_token
+
+
+@pytest.fixture()
+def app(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightbot.db")
+    webapp._scan_progress.clear()
+    config = deepcopy(DEFAULTS)
+    application = webapp.create_app(config)
+    application.config.update(TESTING=True)
+    assert load_demo(log=lambda *args, **kwargs: None) == 3
+    return application
+
+
+@pytest.fixture()
+def client(app):
+    return app.test_client()
+
+
+def test_primary_pages_render(client):
+    response = client.get("/")
+    assert response.status_code == 200
+    assert b"FlightDeck" in response.data
+    assert b"Your inbox, turned into answers" in response.data
+
+    assert client.get("/emails").status_code == 200
+    assert client.get("/healthz").json == {
+        "status": "ok", "emails": 7, "flights": 3, "complaints": 0}
+
+    flight_id = db.list_flights()[0]["id"]
+    assert client.get(f"/flight/{flight_id}").status_code == 200
+    assert client.get(
+        f"/flight/{flight_id}/complaint/airline").status_code == 200
+
+
+def test_manual_corrections_are_validated_and_saved(client):
+    flight_id = db.list_flights()[0]["id"]
+    bad = client.post(f"/flight/{flight_id}/override", data={"origin": "R"})
+    assert bad.status_code == 302
+    assert not db.get_flight(flight_id)["overrides"].get("origin")
+
+    response = client.post(f"/flight/{flight_id}/override", data={
+        "flight_number": "sv 900", "flight_date": "2026-06-01",
+        "origin": "ruh", "destination": "jed",
+        "arrival": "2026-06-01T12:00",
+        "actual_arrival": "2026-06-01T16:15",
+        "accepted_alternative": "no", "cancelled": "no",
+    })
+    assert response.status_code == 302
+    saved = db.get_flight(flight_id)["overrides"]
+    assert saved["origin"] == "RUH"
+    assert saved["destination"] == "JED"
+    assert saved["actual_arrival"] == "2026-06-01 16:15"
+
+
+def test_official_portal_route_uses_only_the_incident(client, monkeypatch):
+    launched = {}
+
+    def fake_start(payload, on_complete):
+        launched.update(payload)
+        on_complete(webapp.PortalResult(
+            "submitted", "Submitted.", "CASE-123456"))
+        return "job-123"
+
+    monkeypatch.setattr(webapp, "missing_portal_fields", lambda payload: [])
+    monkeypatch.setattr(webapp, "start_portal_job", fake_start)
+    flight_id = db.list_flights()[0]["id"]
+    page = client.get(f"/flight/{flight_id}/complaint/airline")
+    assert b"What went wrong?" in page.data
+    assert b"Email and SMTP are not used" in page.data
+    assert b"Recipient" not in page.data
+    assert b"Open email app" not in page.data
+
+    response = client.post(f"/flight/{flight_id}/complaint/airline/submit", data={
+        "incident": "The flight was cancelled and I had to buy a hotel room.",
+    })
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith(
+        "/complaints/jobs/job-123?flight_id=" + str(flight_id))
+    assert launched["kind"] == "airline"
+    assert launched["incident"] == (
+        "The flight was cancelled and I had to buy a hotel room.")
+    assert "to" not in launched
+    assert "smtp" not in launched
+    flight = db.get_flight(flight_id)
+    assert flight["complaints"][0]["status"] == "submitted"
+    assert flight["complaints"][0]["reference"] == "CASE-123456"
+
+
+def test_gaca_requires_and_reuses_airline_reference(client):
+    flight = db.list_flights()[0]
+    blocked = client.post(
+        f"/flight/{flight['id']}/complaint/gaca/submit",
+        data={"incident": "The airline did not resolve my cancelled flight."},
+        follow_redirects=True)
+    assert b"Submit to the airline first" in blocked.data
+
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Airline complaint",
+        "submitted", reference="CAS-998877",
+        details="The airline cancelled my flight without suitable care.")
+    page = client.get(f"/flight/{flight['id']}/complaint/gaca")
+    assert b"CAS-998877" in page.data
+    assert b"cancelled my flight without suitable care" in page.data
+
+
+def test_profile_is_saved_once_and_returns_to_claim(client, monkeypatch):
+    saved = {}
+    monkeypatch.setattr(webapp, "save_user_profile", saved.update)
+    response = client.post("/settings/profile", data={
+        "next": "/", "full_name": "Test Passenger", "email": "p@example.com",
+        "phone": "+966500000000", "national_id": "ID123456",
+        "title": "Mr", "nationality": "Saudi Arabian",
+        "country_code": "+966",
+    })
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/")
+    assert saved["full_name"] == "Test Passenger"
+    assert saved["country_code"] == "+966"
+
+
+def test_scan_without_credentials_gives_actionable_message(client):
+    response = client.post("/scan", follow_redirects=True)
+    assert response.status_code == 200
+    assert b"app password" in response.data
+    assert not webapp._scan_running()
+
+
+def test_remote_dashboard_requires_telegram_link(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "protected.db")
+    config = deepcopy(DEFAULTS)
+    config["web"].update({
+        "public_base_url": "http://flightdeck.example:5000",
+        "access_secret": "private-test-secret",
+        "link_expiry_minutes": 15,
+    })
+    application = webapp.create_app(config)
+    application.config.update(TESTING=True)
+    client = application.test_client()
+    assert client.get("/").status_code == 401
+    assert client.get("/healthz").status_code == 200
+
+    token = create_web_token("private-test-secret", "42")
+    signed_in = client.get(f"/?access={token}")
+    assert signed_in.status_code == 302
+    assert "access=" not in signed_in.headers["Location"]
+    assert client.get("/").status_code == 200

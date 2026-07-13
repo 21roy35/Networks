@@ -1,51 +1,127 @@
 {% extends "base.html" %}
-{% block title %}Complaint – Flight Bot{% endblock %}
+{% block title %}{% if kind == 'gaca' %}Escalate to GACA{% else %}File airline complaint{% endif %} · FlightDeck{% endblock %}
+{% block head %}
+<style>
+.claim-shell { max-width:980px; margin:0 auto; }
+.claim-hero { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:28px;
+  align-items:end; margin:10px 0 24px; }
+.claim-hero h1 { font-size:clamp(36px,6vw,58px); line-height:1.02; margin:8px 0 11px; }
+.route-pill { padding:13px 17px; border:1px solid var(--line); border-radius:14px;
+  background:#fff; box-shadow:var(--shadow-sm); font-weight:850; white-space:nowrap; }
+.automation-card { overflow:hidden; }
+.automation-grid { display:grid; grid-template-columns:minmax(0,1.3fr) minmax(280px,.7fr); }
+.incident-pane { padding:30px; border-right:1px solid var(--line); }
+.incident-pane h2 { font-size:22px; margin:0 0 7px; }
+.incident-box { min-height:210px; margin-top:20px; padding:17px; resize:vertical;
+  font-size:16px; line-height:1.55; border-width:2px; }
+.field-foot { display:flex; justify-content:space-between; gap:12px; margin-top:8px;
+  color:var(--navy-500); font-size:12px; }
+.submit-row { display:flex; align-items:center; justify-content:space-between; gap:16px;
+  margin-top:22px; }
+.submit-row .btn { min-height:48px; padding-inline:22px; }
+.facts-pane { padding:28px; background:#f7fafb; }
+.facts-pane h3 { margin:0 0 5px; font-size:16px; }
+.fact-list { display:grid; gap:0; margin:18px 0 0; }
+.fact { padding:11px 0; border-top:1px solid var(--line); }
+.fact span { display:block; color:var(--navy-500); font-size:10px; font-weight:850;
+  letter-spacing:.08em; text-transform:uppercase; margin-bottom:3px; }
+.fact strong { display:block; font-size:13px; word-break:break-word; }
+.flow { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:18px; }
+.flow-step { padding:16px; border:1px solid var(--line); border-radius:14px; background:#fff; }
+.flow-step b { display:grid; place-items:center; width:28px; height:28px; border-radius:9px;
+  color:var(--teal-dark); background:var(--teal-soft); margin-bottom:10px; font-size:12px; }
+.flow-step strong { display:block; font-size:13px; }
+.flow-step span { display:block; margin-top:3px; color:var(--navy-500); font-size:11px; line-height:1.45; }
+.alert { margin-bottom:16px; padding:15px 17px; border:1px solid #efcf9b;
+  border-radius:13px; background:var(--amber-soft); color:#714306; font-size:13px; }
+.alert.errorish { border-color:#efb9b5; background:#fff0ef; color:#7d2621; }
+.privacy-line { display:flex; gap:9px; align-items:flex-start; margin-top:18px;
+  color:var(--navy-500); font-size:12px; }
+.privacy-line svg { flex:0 0 auto; margin-top:1px; }
+@media(max-width:800px) {
+  .claim-hero { grid-template-columns:1fr; align-items:start; }
+  .automation-grid { grid-template-columns:1fr; }
+  .incident-pane { border-right:0; border-bottom:1px solid var(--line); }
+  .flow { grid-template-columns:1fr; }
+}
+@media(max-width:520px) {
+  .incident-pane,.facts-pane { padding:21px; }
+  .submit-row { align-items:stretch; flex-direction:column; }
+  .submit-row .btn { width:100%; }
+}
+</style>
+{% endblock %}
 {% block content %}
-<p><a class="btn" href="{{ url_for('flight_detail', flight_id=flight.id) }}">← Back to flight</a></p>
+<div class="claim-shell">
+  <a class="breadcrumb" style="display:inline-flex;margin-bottom:10px;color:var(--navy-500);text-decoration:none;font-weight:750;font-size:13px" href="{{ url_for('flight_detail', flight_id=flight.id) }}">← Back to flight</a>
+  <header class="claim-hero">
+    <div>
+      <p class="eyebrow">Official website automation</p>
+      <h1>{% if kind == 'gaca' %}Escalate to GACA{% else %}Tell us what went wrong{% endif %}</h1>
+      <p class="muted">{% if kind == 'gaca' %}Your airline complaint details and reference are carried into GACA automatically.{% else %}One description is all this complaint needs. FlightDeck supplies the booking, passenger, flight, and claim details.{% endif %}</p>
+    </div>
+    <div class="route-pill">{{ flight.display_origin }} → {{ flight.display_destination }} · {{ flight.display_flight_number }}</div>
+  </header>
 
-<div class="card">
-  <h2 style="margin-top:0">
-    {% if kind == 'gaca' %}Complaint to GACA{% else %}Complaint to {{ letter.airline }}{% endif %}
-    <span class="badge {{ letter.assessment.verdict }}">{{ letter.assessment.label }}</span>
-  </h2>
-
-  <div class="field">
-    <span class="label">Subject</span>
-    <span class="value" id="subj">{{ letter.subject }}</span>
-    <button class="copy" onclick="copyText(this, document.getElementById('subj').textContent)">Copy</button>
+  {% if kind == 'gaca' and not gaca_ready %}
+  <div class="alert errorish"><strong>Airline complaint required first.</strong> GACA requires the airline’s complaint reference. Submit through the airline’s official website first; FlightDeck will save the reference for this escalation.
+    <div style="margin-top:11px"><a class="btn small-btn" href="{{ url_for('complaint_airline', flight_id=flight.id) }}">File with {{ letter.airline }} first</a></div>
   </div>
-  {% if letter.to %}
-  <div class="field">
-    <span class="label">Send to</span>
-    <span class="value" id="toaddr">{{ letter.to }}</span>
-    <button class="copy" onclick="copyText(this, document.getElementById('toaddr').textContent)">Copy</button>
-  </div>
+  {% elif kind == 'gaca' %}
+  <div class="alert"><strong>Escalation rule applied.</strong> Reference {{ prior.reference }} from {{ prior.created_at[:10] }} will be supplied to GACA. The official service accepts escalation after seven days without a response or when the proposed solution is unsatisfactory.</div>
   {% endif %}
 
-  <p class="muted" style="margin-top:14px">The letter below is pre-filled with
-  everything scraped from the linked emails — edit anything in brackets before
-  sending.</p>
-  <textarea class="letter" id="letter">{{ letter.body }}</textarea>
+  {% if missing %}
+  <div class="alert errorish"><strong>Missing auto-fill data:</strong> {{ missing|join(', ') }}.<div class="actions" style="margin-top:11px"><a class="btn small-btn" href="{{ url_for('profile_settings', next=request.path) }}">Complete one-time profile</a><a class="btn small-btn" href="{{ url_for('flight_detail', flight_id=flight.id) }}#corrections">Correct trip details</a></div></div>
+  {% endif %}
 
-  <div class="actions">
-    <button class="btn" onclick="copyText(this, document.getElementById('letter').value)">Copy letter</button>
-    {% if kind == 'gaca' %}
-      <a class="btn primary" href="{{ letter.portal_url }}" target="_blank" rel="noopener">Open GACA complaint portal ↗</a>
-    {% else %}
-      {% if letter.mailto %}<a class="btn" href="{{ letter.mailto }}">Open in my email app</a>{% endif %}
-      {% if letter.complaint_url %}<a class="btn" href="{{ letter.complaint_url }}" target="_blank" rel="noopener">Airline complaint page ↗</a>{% endif %}
-      <form method="post" action="{{ url_for('complaint_airline_send', flight_id=flight.id) }}"
-            onsubmit="return confirm('Send this complaint to {{ letter.to or 'the airline' }} now via your configured SMTP account?')">
-        <input type="hidden" name="to" value="{{ letter.to }}">
-        <button class="btn danger">Send now via my email</button>
+  <section class="card automation-card">
+    <div class="automation-grid">
+      <form class="incident-pane" method="post" action="{{ url_for('complaint_submit', flight_id=flight.id, kind=kind) }}">
+        <p class="eyebrow">The only claim field</p>
+        <h2>What went wrong?</h2>
+        <p class="muted small">Write naturally. Include the practical impact, expenses, and the resolution you want. FlightDeck turns it into the structured official complaint.</p>
+        <textarea class="incident-box" id="incident" name="incident" minlength="15" maxlength="4000" required placeholder="Example: My flight was cancelled at the gate with no suitable alternative. I had to buy a replacement ticket and pay for a hotel…">{{ incident }}</textarea>
+        <div class="field-foot"><span>Minimum 15 characters</span><span><b id="count">{{ incident|length }}</b> / 4000</span></div>
+        <div class="submit-row">
+          <span class="badge {{ letter.assessment.verdict }}">{{ letter.assessment.label }}</span>
+          <button class="btn primary" {% if (kind == 'gaca' and not gaca_ready) or missing %}disabled aria-disabled="true"{% endif %}>Open, fill & submit official form</button>
+        </div>
+        <div class="privacy-line">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></svg>
+          <span>Your claim is sent only to the configured official airline or GACA website. Email and SMTP are not used.</span>
+        </div>
       </form>
-    {% endif %}
-  </div>
 
-  {% if kind == 'gaca' %}
-  <p class="muted" style="margin-top:14px">{{ letter.note }} Phone: {{ letter.phone }}.
-  GACA has no public API for filing complaints, so paste the letter into the
-  portal form — every field above has a copy button to make that fast.</p>
-  {% endif %}
+      <aside class="facts-pane">
+        <p class="eyebrow">Auto-filled from your inbox</p>
+        <h3>Submission data</h3>
+        <p class="muted small">These details will be mapped into the official portal.</p>
+        <div class="fact-list">
+          <div class="fact"><span>Passenger</span><strong>{{ flight.passenger_name or 'Missing' }}</strong></div>
+          <div class="fact"><span>Airline</span><strong>{{ flight.airline_name or flight.airline_code or 'Missing' }}</strong></div>
+          <div class="fact"><span>Booking reference</span><strong>{{ flight.pnr or 'Missing' }}</strong></div>
+          <div class="fact"><span>Flight</span><strong>{{ flight.display_flight_number }} · {{ flight.display_date }}</strong></div>
+          <div class="fact"><span>Route</span><strong>{{ flight.route }}</strong></div>
+          {% if flight.ticket_numbers %}<div class="fact"><span>E-ticket</span><strong>{{ flight.ticket_numbers|join(', ') }}</strong></div>{% endif %}
+          {% if kind == 'gaca' and prior %}<div class="fact"><span>Airline reference</span><strong>{{ prior.reference or 'Not captured' }}</strong></div>{% endif %}
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <div class="flow" aria-label="Automated submission steps">
+    <div class="flow-step"><b>1</b><strong>Official site opens</strong><span>Microsoft Edge launches directly on the airline or GACA complaint service.</span></div>
+    <div class="flow-step"><b>2</b><strong>Everything is filled</strong><span>Passenger, booking, flight, incident, and requested remedy are mapped automatically.</span></div>
+    <div class="flow-step"><b>3</b><strong>Submitted & tracked</strong><span>The form is submitted and its complaint reference is saved to this flight.</span></div>
+  </div>
+  <p class="muted small" style="margin:14px 3px 0">If the official site requires login, OTP, CAPTCHA, or a legal declaration, complete that security step in the opened browser. Automation resumes immediately afterward.</p>
 </div>
+{% endblock %}
+{% block scripts %}
+<script>
+const incident = document.getElementById('incident');
+const count = document.getElementById('count');
+incident.addEventListener('input', () => { count.textContent = incident.value.length; });
+</script>
 {% endblock %}

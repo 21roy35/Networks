@@ -3,3 +3,8 @@ __pycache__/
 config.json
 flightbot.db
 .venv/
+flightbot.backup-*.db
+.test-tmp/
+.pytest_cache/
+flight_bot/.portal-profile/
+telegram_evidence/
