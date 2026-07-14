@@ -239,6 +239,19 @@ def test_saudia_feedback_survey_is_dismissed_before_form_fill():
     assert clicked == ["close"]
 
 
+@pytest.mark.parametrize(("incident", "category"), [
+    ("The seat recline was broken.", "Seats"),
+    ("The flight was delayed for five hours.", "Flight Delay"),
+    ("The flight was cancelled.", "Flight Cancellation"),
+    ("The cabin crew handled the issue badly.", "Flight attendants/Pilots"),
+    ("The entertainment screen was broken.", "Quality of services"),
+])
+def test_saudia_complaint_category_mapping(incident, category):
+    assert portal_automation._saudia_complaint_category({
+        "incident": incident, "ai_analysis": {},
+    }) == category
+
+
 def test_reference_is_extracted_from_official_confirmation_text():
     assert _extract_reference(
         "Thank you. Your complaint reference number is CAS-12345678.") == (

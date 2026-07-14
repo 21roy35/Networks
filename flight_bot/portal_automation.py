@@ -1028,6 +1028,30 @@ def _fill_common(page, payload: dict):
                 continue
 
 
+def _saudia_complaint_category(payload: dict) -> str:
+    text = " ".join((
+        str(payload.get("incident") or ""),
+        str((payload.get("ai_analysis") or {}).get("category") or ""),
+    )).casefold()
+    mappings = (
+        (r"cancel", "Flight Cancellation"),
+        (r"delay|late", "Flight Delay"),
+        (r"denied boarding|bumped|overbook", "Denied Boarding"),
+        (r"downgrade", "Downgrade"),
+        (r"seat|recline", "Seats"),
+        (r"meal|food", "Meals"),
+        (r"wi.?fi|internet|voucher", "In-Flight Wi-Fi Services/Vouchers"),
+        (r"flight attendant|cabin crew|pilot", "Flight attendants/Pilots"),
+        (r"check.?in", "Check-in Counters"),
+        (r"boarding gate|\bgate\b", "Boarding Gates"),
+        (r"website|online|app", "Online Services"),
+        (r"call cent", "Call Center"),
+        (r"alfursan|miles", "AlFursan"),
+    )
+    return next((category for pattern, category in mappings
+                 if re.search(pattern, text)), "Quality of services")
+
+
 def _prepare_saudia(page, payload: dict, update):
     update("filling", "Filling Saudia’s official Complaints & Feedback form…")
     _dismiss_feedback_overlay(page)
@@ -1051,6 +1075,17 @@ def _prepare_saudia(page, payload: dict, update):
         except Exception:
             page.wait_for_timeout(3500)
     _fill_common(page, payload)
+    category = _saudia_complaint_category(payload)
+    if _select(page, [r"^complaint\s*\*?$"], [
+            rf"^{re.escape(category)}$"]):
+        try:
+            page.get_by_label(re.compile(
+                "let us know|complaint details|what happened", re.I)
+            ).first.wait_for(state="visible", timeout=10000)
+        except Exception:
+            page.wait_for_timeout(1200)
+        _fill(page, ["let us know", "complaint details", "what happened",
+                     "description", "message"], payload["description"])
 
 
 def _prepare_flynas(page, payload: dict, update):
