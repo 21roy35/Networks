@@ -1078,14 +1078,23 @@ def _prepare_saudia(page, payload: dict, update):
     category = _saudia_complaint_category(payload)
     if _select(page, [r"^complaint\s*\*?$"], [
             rf"^{re.escape(category)}$"]):
+        details = page.locator("textarea[name='descriptionInfo']")
         try:
-            page.get_by_label(re.compile(
-                "let us know|complaint details|what happened", re.I)
-            ).first.wait_for(state="visible", timeout=10000)
+            details.first.wait_for(state="visible", timeout=15000)
         except Exception:
-            page.wait_for_timeout(1200)
-        _fill(page, ["let us know", "complaint details", "what happened",
-                     "description", "message"], payload["description"])
+            page.wait_for_timeout(1500)
+        if _visible(details):
+            details.first.fill(payload["description"])
+        else:
+            _fill(page, ["describe your issue", "let us know",
+                         "complaint details", "what happened", "description",
+                         "message"], payload["description"])
+        try:
+            page.get_by_role("button", name=re.compile(
+                r"^submit$", re.I)).first.wait_for(
+                    state="visible", timeout=10000)
+        except Exception:
+            pass
 
 
 def _prepare_flynas(page, payload: dict, update):
