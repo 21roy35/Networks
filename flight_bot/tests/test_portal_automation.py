@@ -355,6 +355,94 @@ def test_recaptcha_waits_for_stable_unselected_grid_before_next_prompt():
     assert 750 in page.waits
 
 
+def test_recaptcha_can_complete_after_more_than_five_grids(monkeypatch):
+    class Checkbox:
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def get_attribute(self, _name):
+            return "false"
+
+        def click(self):
+            pass
+
+    class AnchorFrame:
+        url = "https://recaptcha.net/recaptcha/api2/anchor"
+
+        def __init__(self):
+            self.checkbox = Checkbox()
+
+        def locator(self, selector):
+            assert selector == "#recaptcha-anchor"
+            return self.checkbox
+
+    class Cell:
+        def click(self):
+            pass
+
+    class Cells:
+        def count(self):
+            return 9
+
+        def nth(self, _index):
+            return Cell()
+
+    class Grid:
+        def screenshot(self, **_kwargs):
+            return b"captcha-grid"
+
+    class Button:
+        def count(self):
+            return 1
+
+        def click(self):
+            pass
+
+    class ChallengeFrame:
+        url = "https://recaptcha.net/recaptcha/api2/bframe"
+
+        def locator(self, selector):
+            if selector == "#rc-imageselect-target td":
+                return Cells()
+            if selector == "#rc-imageselect-target":
+                return Grid()
+            if selector == "#recaptcha-verify-button":
+                return Button()
+            raise AssertionError(selector)
+
+    class Page:
+        def __init__(self):
+            self.frames = [AnchorFrame(), ChallengeFrame()]
+
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+    rounds = []
+
+    def wait_for_refresh(_page, _anchor):
+        rounds.append(len(rounds) + 1)
+        return len(rounds) >= 6, True
+
+    monkeypatch.setattr(portal_automation, "_wait_for_recaptcha_refresh",
+                        wait_for_refresh)
+    monkeypatch.setattr(portal_automation, "_ask_verification",
+                        lambda *_args, **_kwargs: "1")
+    monkeypatch.setattr(portal_automation, "_annotate_grid",
+                        lambda image, _count: image)
+    monkeypatch.setattr(portal_automation, "_body_text", lambda _frame: "cars")
+    updates = []
+    assert portal_automation._solve_recaptcha(
+        Page(), lambda *args: updates.append(args)) is True
+    assert rounds == [1, 2, 3, 4, 5, 6]
+    assert updates[-1][0] == "filling"
+
+
 @pytest.mark.parametrize(("incident", "category"), [
     ("The seat recline was broken.", "Seats"),
     ("The flight was delayed for five hours.", "Flight Delay"),

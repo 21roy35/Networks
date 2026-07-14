@@ -30,6 +30,7 @@ _BROWSER_LOCK = threading.Lock()
 _VERIFICATION_HANDLER: Callable[[dict], object] | None = None
 _AI_HANDLER: Callable[[dict], dict | None] | None = None
 _AI_MAX_ATTEMPTS = 3
+_MAX_CAPTCHA_ROUNDS = 20
 _CHROME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -622,7 +623,7 @@ def _solve_recaptcha(page, update) -> bool:
                 return True
         except Exception:
             pass
-    for _round in range(5):
+    for round_number in range(1, _MAX_CAPTCHA_ROUNDS + 1):
         frame = next((item for item in page.frames
                       if "recaptcha" in item.url and "bframe" in item.url), None)
         if not frame:
@@ -637,7 +638,8 @@ def _solve_recaptcha(page, update) -> bool:
         instruction = _body_text(frame)[:500]
         response = _ask_verification(
             "captcha_grid",
-            f"CAPTCHA: {instruction}\nReply with the matching tile numbers, for example: 1 4 7.",
+            f"CAPTCHA round {round_number}: {instruction}\n"
+            "Reply with the matching tile numbers, for example: 1 4 7.",
             page, image=image)
         selected = _parse_cells(response, count)
         if not selected:
@@ -656,6 +658,9 @@ def _solve_recaptcha(page, update) -> bool:
                 "verification",
                 "The next CAPTCHA image did not finish loading, so no stale screenshot was sent.")
             return False
+    update(
+        "verification",
+        f"reCAPTCHA remained active after {_MAX_CAPTCHA_ROUNDS} completed grids.")
     return False
 
 
