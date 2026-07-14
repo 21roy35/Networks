@@ -556,8 +556,14 @@ def _parse_cells(response, count: int) -> list[int]:
 
 
 def _solve_recaptcha(page, update) -> bool:
+    # Saudia currently renders a placeholder anchor iframe before the real
+    # interactive one. Choose the frame that actually contains a visible
+    # checkbox so the verification is not abandoned before Telegram receives
+    # the image challenge.
     anchor = next((frame for frame in page.frames
-                   if "recaptcha" in frame.url and "anchor" in frame.url), None)
+                   if "recaptcha" in frame.url
+                   and "anchor" in frame.url
+                   and _visible(frame.locator("#recaptcha-anchor"))), None)
     if anchor:
         checkbox = anchor.locator("#recaptcha-anchor")
         try:

@@ -239,6 +239,53 @@ def test_saudia_feedback_survey_is_dismissed_before_form_fill():
     assert clicked == ["close"]
 
 
+def test_recaptcha_uses_interactive_anchor_when_placeholder_comes_first():
+    class Empty:
+        first = None
+
+        def count(self):
+            return 0
+
+    class Checkbox:
+        def __init__(self):
+            self.first = self
+            self.checked = False
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def get_attribute(self, name):
+            assert name == "aria-checked"
+            return "true" if self.checked else "false"
+
+        def click(self):
+            self.checked = True
+
+    class Frame:
+        def __init__(self, checkbox=None):
+            self.url = "https://recaptcha.net/recaptcha/api2/anchor"
+            self.checkbox = checkbox
+
+        def locator(self, selector):
+            assert selector == "#recaptcha-anchor"
+            return self.checkbox or Empty()
+
+    class Page:
+        def __init__(self, frames):
+            self.frames = frames
+
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+    checkbox = Checkbox()
+    page = Page([Frame(), Frame(checkbox)])
+    assert portal_automation._solve_recaptcha(page, lambda *_: None) is True
+    assert checkbox.checked is True
+
+
 @pytest.mark.parametrize(("incident", "category"), [
     ("The seat recline was broken.", "Seats"),
     ("The flight was delayed for five hours.", "Flight Delay"),
