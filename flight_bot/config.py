@@ -22,12 +22,16 @@ DEFAULTS = {
     },
     "user": {
         "full_name": "",
+        "first_name": "",
+        "middle_name": "",
+        "last_name": "",
         "title": "",
         "nationality": "",
         "country_code": "",
         "email": "",
         "phone": "",
         "national_id": "",
+        "alfursan_id": "",
     },
     "web": {
         "host": "127.0.0.1",
@@ -153,8 +157,9 @@ def save_user_profile(profile: dict) -> None:
     if not isinstance(existing, dict):
         existing = {}
     allowed = {
-        "full_name", "email", "phone", "national_id", "title",
-        "nationality", "country_code",
+        "full_name", "first_name", "middle_name", "last_name", "email",
+        "phone", "national_id", "title", "nationality", "country_code",
+        "alfursan_id",
     }
     current["user"] = {
         **existing,

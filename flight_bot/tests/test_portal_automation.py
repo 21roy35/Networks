@@ -48,6 +48,25 @@ def test_payload_maps_incident_and_every_known_portal_field():
     assert missing_portal_fields(payload) == []
 
 
+def test_payload_prefers_exact_saved_profile_names_and_alfursan_id():
+    saved = profile()
+    saved.update({
+        "first_name": "ProfileFirst",
+        "middle_name": "ProfileMiddle",
+        "last_name": "ProfileLast",
+        "alfursan_id": "30680000",
+    })
+    payload = complaint_payload(
+        sample_flight(), saved, "airline",
+        "The seat and entertainment screen were both broken.")
+    assert payload["passenger_name"] == (
+        "ProfileFirst ProfileMiddle ProfileLast")
+    assert payload["first_name"] == "ProfileFirst"
+    assert payload["middle_name"] == "ProfileMiddle"
+    assert payload["last_name"] == "ProfileLast"
+    assert payload["alfursan_id"] == "30680000"
+
+
 def test_ai_analysis_augments_letter_but_preserves_original_incident():
     original = "My seat was broken and the screen did not work."
     payload = complaint_payload(
@@ -98,6 +117,50 @@ def test_block_page_is_not_mistaken_for_a_form():
             return Body()
 
     assert portal_automation._request_blocked(Page()) is True
+
+
+def test_fill_prefers_latest_visible_duplicate_control():
+    filled = []
+
+    class Control:
+        def __init__(self, name, visible):
+            self.name = name
+            self.visible = visible
+
+        def is_visible(self):
+            return self.visible
+
+        def is_editable(self):
+            return True
+
+        def fill(self, value):
+            filled.append((self.name, value))
+
+    class Matches:
+        def __init__(self, controls):
+            self.controls = controls
+
+        def count(self):
+            return len(self.controls)
+
+        def nth(self, index):
+            return self.controls[index]
+
+    class Page:
+        def get_by_label(self, _pattern):
+            return Matches([
+                Control("earlier-step", True),
+                Control("current-step", True),
+            ])
+
+        def get_by_placeholder(self, _pattern):
+            return Matches([])
+
+        def locator(self, _selector):
+            raise AssertionError("fallback should not be needed")
+
+    assert portal_automation._fill(Page(), ["last name"], "ProfileLast")
+    assert filled == [("current-step", "ProfileLast")]
 
 
 def test_material_dropdown_is_selected_from_allowed_choice():
@@ -165,6 +228,8 @@ def test_material_dropdown_is_selected_from_allowed_choice():
         def locator(self, selector):
             if selector == "mat-select":
                 return Control()
+            if selector == "input:not([type=hidden])":
+                return Empty()
             if selector == "mat-label":
                 class Label(Control):
                     def inner_text(self):
@@ -191,7 +256,7 @@ def test_material_dropdown_is_selected_from_allowed_choice():
                 return Empty()
             if selector == "mat-form-field":
                 return Fields()
-            if selector == "mat-option":
+            if selector == "mat-option, [role='option']":
                 return Options()
             raise AssertionError(selector)
 
@@ -201,6 +266,107 @@ def test_material_dropdown_is_selected_from_allowed_choice():
     assert portal_automation._select(
         Page(), ["service type"], ["travel complaint or compliment"])
     assert selected == ["Travel complaint or compliment"]
+
+
+def test_material_autocomplete_is_searched_and_selected():
+    selected = []
+    searches = []
+
+    class Empty:
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 0
+
+        def all(self):
+            return []
+
+        def is_visible(self):
+            return False
+
+    class Input:
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def is_editable(self):
+            return True
+
+        def click(self, **_kwargs):
+            pass
+
+        def fill(self, value):
+            searches.append(value)
+
+    class Option:
+        def is_visible(self):
+            return True
+
+        def inner_text(self):
+            return "Saudi Arabia (+966)"
+
+        def click(self, **_kwargs):
+            selected.append("Saudi Arabia (+966)")
+
+    class Options:
+        def count(self):
+            return 1
+
+        def nth(self, _index):
+            return Option()
+
+    class Label(Input):
+        def inner_text(self):
+            return "Country or territory code*"
+
+    class Field:
+        def is_visible(self):
+            return True
+
+        def inner_text(self):
+            return "Country or territory code*"
+
+        def locator(self, selector):
+            return {
+                "mat-label": Label(),
+                "mat-select": Empty(),
+                "input:not([type=hidden])": Input(),
+            }[selector]
+
+    class Fields:
+        def all(self):
+            return [Field()]
+
+    class Keyboard:
+        def press(self, _key):
+            pass
+
+    class Page:
+        keyboard = Keyboard()
+
+        def get_by_label(self, _pattern):
+            return Empty()
+
+        def locator(self, selector):
+            return {
+                "select": Empty(),
+                "mat-form-field": Fields(),
+                "mat-option, [role='option']": Options(),
+            }[selector]
+
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+    assert portal_automation._select(
+        Page(), ["country or territory code"],
+        [r"\+966", "Saudi Arabia"], queries=["966"])
+    assert selected == ["Saudi Arabia (+966)"]
 
 
 def test_saudia_feedback_survey_is_dismissed_before_form_fill():

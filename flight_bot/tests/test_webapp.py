@@ -63,7 +63,7 @@ def test_manual_corrections_are_validated_and_saved(client):
 def test_official_portal_route_uses_only_the_incident(client, monkeypatch):
     launched = {}
 
-    def fake_start(payload, on_complete):
+    def fake_start(payload, on_complete, on_update=None):
         launched.update(payload)
         on_complete(webapp.PortalResult(
             "submitted", "Submitted.", "CASE-123456"))
@@ -115,14 +115,17 @@ def test_profile_is_saved_once_and_returns_to_claim(client, monkeypatch):
     saved = {}
     monkeypatch.setattr(webapp, "save_user_profile", saved.update)
     response = client.post("/settings/profile", data={
-        "next": "/", "full_name": "Test Passenger", "email": "p@example.com",
+        "next": "/", "first_name": "Test", "middle_name": "Middle",
+        "last_name": "Passenger", "email": "p@example.com",
         "phone": "+966500000000", "national_id": "ID123456",
         "title": "Mr", "nationality": "Saudi Arabian",
-        "country_code": "+966",
+        "country_code": "+966", "alfursan_id": "30680000",
     })
     assert response.status_code == 302
     assert response.headers["Location"].endswith("/")
-    assert saved["full_name"] == "Test Passenger"
+    assert saved["full_name"] == "Test Middle Passenger"
+    assert saved["last_name"] == "Passenger"
+    assert saved["alfursan_id"] == "30680000"
     assert saved["country_code"] == "+966"
 
 
@@ -163,11 +166,14 @@ def test_mobile_complaint_announces_telegram_screenshot_assistance(
         def notify(self, message, **_kwargs):
             notices.append(message)
 
+        def portal_progress_handler(self):
+            return None
+
     monkeypatch.setattr(webapp, "start_telegram", lambda _config: Telegram())
     monkeypatch.setattr(webapp, "missing_portal_fields", lambda _payload: [])
     monkeypatch.setattr(
         webapp, "start_portal_job",
-        lambda _payload, on_complete: "mobile-job")
+        lambda _payload, on_complete, on_update=None: "mobile-job")
     config = deepcopy(DEFAULTS)
     config["user"].update({
         "full_name": "Mobile Passenger", "email": "p@example.com",

@@ -25,9 +25,12 @@
       <span>Stored locally in <code>config.json</code> and used only to fill official complaint websites. It is never emailed.</span>
     </div>
     <div class="profile-grid">
-      <label class="form-field wide"><span>Full legal name</span><input name="full_name" value="{{ profile.full_name or '' }}" autocomplete="name" required></label>
+      <label class="form-field"><span>First name</span><input name="first_name" value="{{ profile.first_name or '' }}" autocomplete="given-name" required></label>
+      <label class="form-field"><span>Second / middle name</span><input name="middle_name" value="{{ profile.middle_name or '' }}" autocomplete="additional-name"></label>
+      <label class="form-field"><span>Last name</span><input name="last_name" value="{{ profile.last_name or '' }}" autocomplete="family-name" required></label>
       <label class="form-field"><span>Title</span><select name="title" required><option value="">Select title</option>{% for value in ['Mr','Ms','Mrs','Dr'] %}<option value="{{ value }}" {% if profile.title == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></label>
-      <label class="form-field"><span>Nationality</span><input name="nationality" value="{{ profile.nationality or '' }}" placeholder="Saudi Arabian" autocomplete="country-name" required></label>
+      <label class="form-field"><span>Nationality</span><input name="nationality" value="{{ profile.nationality or '' }}" placeholder="Saudi" autocomplete="country-name" required></label>
+      <label class="form-field"><span>AlFursan ID <small>(optional)</small></span><input name="alfursan_id" value="{{ profile.alfursan_id or '' }}" inputmode="numeric" autocomplete="off"></label>
       <label class="form-field wide"><span>Passport, National ID, or Iqama number</span><input name="national_id" value="{{ profile.national_id or '' }}" autocomplete="off" required></label>
       <label class="form-field"><span>Contact email</span><input type="email" name="email" value="{{ profile.email or '' }}" autocomplete="email" required></label>
       <label class="form-field"><span>Country calling code</span><input name="country_code" value="{{ profile.country_code or '' }}" placeholder="+966" inputmode="tel" required></label>

@@ -77,7 +77,9 @@ def portal_job_status(job_id: str) -> dict | None:
 
 
 def start_portal_job(payload: dict,
-                     on_complete: Callable[[PortalResult], None] | None = None) -> str:
+                     on_complete: Callable[[PortalResult], None] | None = None,
+                     on_update: Callable[[str, str, bytes | None], None]
+                     | None = None) -> str:
     """Start one portal submission and return an id suitable for polling."""
     job_id = uuid.uuid4().hex
     job = {
@@ -91,12 +93,19 @@ def start_portal_job(payload: dict,
     with _JOBS_LOCK:
         _JOBS[job_id] = job
 
-    def update(status: str, message: str):
+    def update(status: str, message: str, image: bytes | None = None):
         with _JOBS_LOCK:
             current = _JOBS.get(job_id)
             if current:
                 current.update(status=status, message=message,
                                terminal=status in _TERMINAL)
+        if on_update:
+            try:
+                on_update(status, message, image)
+            except Exception:
+                # Telegram progress reporting must never interrupt a portal
+                # submission that is otherwise proceeding normally.
+                pass
 
     def worker():
         try:
@@ -105,12 +114,11 @@ def start_portal_job(payload: dict,
         except Exception as exc:  # pragma: no cover - final safety boundary
             result = PortalResult(
                 "error", f"Portal automation stopped: {exc}")
+        update(result.status, result.message)
         with _JOBS_LOCK:
             current = _JOBS.get(job_id)
             if current:
-                current.update(status=result.status, message=result.message,
-                               reference=result.reference,
-                               terminal=result.status in _TERMINAL)
+                current.update(reference=result.reference)
                 current.pop("payload", None)
         if on_complete:
             on_complete(result)
@@ -173,12 +181,18 @@ def _fill(page, labels: list[str], value, *, required: bool = False) -> bool:
         return not required
     for label in labels:
         pattern = re.compile(label, re.I)
-        for locator in (page.get_by_label(pattern),
+        for matches in (page.get_by_label(pattern),
                         page.get_by_placeholder(pattern)):
-            if _visible(locator):
+            try:
+                candidates = [matches.nth(index)
+                              for index in reversed(range(matches.count()))]
+            except Exception:
+                candidates = []
+            for control in candidates:
                 try:
-                    locator.first.fill(value)
-                    return True
+                    if control.is_visible() and control.is_editable():
+                        control.fill(value)
+                        return True
                 except Exception:
                     pass
     keywords = [re.sub(r"[^a-z0-9]", "", label.lower()) for label in labels]
@@ -202,7 +216,8 @@ def _fill(page, labels: list[str], value, *, required: bool = False) -> bool:
     return False
 
 
-def _select(page, labels: list[str], choices: list[str]) -> bool:
+def _select(page, labels: list[str], choices: list[str],
+            queries: list[str] | None = None) -> bool:
     choices = [choice for choice in choices if choice]
     if not choices:
         return False
@@ -250,25 +265,38 @@ def _select(page, labels: list[str], choices: list[str]) -> bool:
             if not any(re.search(label, label_text, re.I) for label in labels):
                 continue
             control = field.locator("mat-select")
-            if not _visible(control):
+            autocomplete = field.locator("input:not([type=hidden])")
+            if _visible(control):
+                attempts = [(control.first, "")]
+            elif _visible(autocomplete):
+                attempts = [(autocomplete.first, query)
+                            for query in ([""] + list(queries or []))]
+            else:
                 continue
-            # Saudia may leave a transparent Medallia feedback overlay in a
-            # persistent profile. The field itself is visible and enabled;
-            # force the intended Material control instead of the overlay.
-            control.first.click(force=True)
-            page.wait_for_timeout(300)
-            options = page.locator("mat-option")
-            for index in range(options.count()):
-                option = options.nth(index)
-                if not option.is_visible():
-                    continue
-                option_text = re.sub(r"\s+", " ", option.inner_text()).strip()
-                if any(re.search(choice, option_text, re.I)
-                       for choice in choices):
-                    option.click(force=True)
-                    page.wait_for_timeout(750)
-                    return True
-            page.keyboard.press("Escape")
+            for target, query in attempts:
+                # Saudia may leave a transparent Medallia feedback overlay in
+                # a persistent profile. Force the intended Material control.
+                target.click(force=True)
+                if query:
+                    try:
+                        if target.is_editable():
+                            target.fill(query)
+                    except Exception:
+                        pass
+                page.wait_for_timeout(450)
+                options = page.locator("mat-option, [role='option']")
+                for index in range(options.count()):
+                    option = options.nth(index)
+                    if not option.is_visible():
+                        continue
+                    option_text = re.sub(
+                        r"\s+", " ", option.inner_text()).strip()
+                    if any(re.search(choice, option_text, re.I)
+                           for choice in choices):
+                        option.click(force=True)
+                        page.wait_for_timeout(750)
+                        return True
+                page.keyboard.press("Escape")
         except Exception:
             try:
                 page.keyboard.press("Escape")
@@ -1258,14 +1286,29 @@ def _fill_common(page, payload: dict):
     _fill(page, ["full name", "passenger name", "name"], payload["passenger_name"])
     _fill(page, ["national id", "passport", "iqama", "identity"],
           payload["national_id"])
+    _fill(page, ["alfursan id", "alfursan", "frequent flyer number"],
+          payload.get("alfursan_id") or "")
     _fill(page, ["subject", "request subject"], payload["subject"])
     _fill(page, ["description", "complaint details", "text of the complaint",
                  "let us know", "message", "what happened"],
           payload["description"])
     _select(page, ["title"], [re.escape(payload.get("title") or "")])
-    _select(page, ["nationality"], [re.escape(payload.get("nationality") or "")])
+    nationality = str(payload.get("nationality") or "").strip()
+    nationality_choices = [re.escape(nationality)]
+    nationality_queries = [nationality]
+    if re.fullmatch(r"saudi(?: arabia| arabian)?", nationality, re.I):
+        nationality_choices = [r"^saudi(?: arabia| arabian)?$"]
+        nationality_queries = ["Saudi"]
+    _select(page, ["nationality"], nationality_choices,
+            queries=nationality_queries)
+    country_code = str(payload.get("country_code") or "").strip()
+    country_choices = [re.escape(country_code)]
+    country_queries = [country_code.lstrip("+")]
+    if country_code.replace(" ", "") in {"966", "+966"}:
+        country_choices.append(r"saudi arabia")
+        country_queries.append("Saudi")
     _select(page, ["country code", "country or territory code"],
-            [re.escape(payload.get("country_code") or "")])
+            country_choices, queries=country_queries)
     _choose_yes(page, ["are you one of the passengers", "passenger"])
     attachments = [str(path) for path in payload.get("attachments") or []
                    if Path(path).is_file()]
@@ -1439,6 +1482,10 @@ def _await_confirmation(page, before_url: str, update,
             text, re.I)
         new_reference = reference and reference not in before_text
         if new_reference or success or re.search(r"success|thank", page.url, re.I):
+            update(
+                "submitted",
+                "The official website confirmed the complaint submission.",
+                _page_screenshot(page))
             return PortalResult(
                 "submitted", "Submitted through the official website.", reference)
         human = _needs_human_step(page)
@@ -1511,7 +1558,7 @@ def _await_confirmation(page, before_url: str, update,
         "The official portal did not expose a confirmation before the tracking window ended.")
 
 
-def submit_portal_claim(payload: dict, update: Callable[[str, str], None]) -> PortalResult:
+def submit_portal_claim(payload: dict, update: Callable[..., None]) -> PortalResult:
     """Open, fill and submit one official web form in the managed browser."""
     url = _official_url(payload)
     if not url or not _is_official_url(url):
@@ -1537,6 +1584,10 @@ def submit_portal_claim(payload: dict, update: Callable[[str, str], None]) -> Po
                     "stopped instead of treating the block page as a complaint form.")
             _click(page, ["Accept", "Accept all", "Allow all", "موافق"])
             page.wait_for_timeout(500)
+            update(
+                "filling",
+                "The official website loaded. Starting the saved form details.",
+                _page_screenshot(page))
             kind = payload["kind"]
             code = payload.get("airline_code")
             if kind == "gaca":
@@ -1555,6 +1606,10 @@ def submit_portal_claim(payload: dict, update: Callable[[str, str], None]) -> Po
                     "needs_attention",
                     "The official site blocked the VPS browser while preparing the form.")
 
+            update(
+                "reviewing",
+                "Finished filling the known details. Checking verification and required fields.",
+                _page_screenshot(page))
             if not _wait_for_human_step(page, update):
                 return PortalResult(
                     "needs_attention",
@@ -1563,7 +1618,10 @@ def submit_portal_claim(payload: dict, update: Callable[[str, str], None]) -> Po
             if cancelled:
                 return PortalResult(
                     "needs_attention", "Portal input was cancelled in Telegram.")
-            update("submitting", "Submitting to the official website…")
+            update(
+                "submitting",
+                "Finished the form checks. Submitting to the official website now…",
+                _page_screenshot(page))
             before_text = _body_text(page)
             before_url = page.url
             if not _click(page, ["Submit", "Send", "File complaint",

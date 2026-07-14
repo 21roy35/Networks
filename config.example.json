@@ -9,12 +9,16 @@
   },
   "user": {
     "full_name": "Your Full Legal Name",
+    "first_name": "Your first name",
+    "middle_name": "Your second or middle name",
+    "last_name": "Your last name",
     "email": "you@gmail.com",
     "phone": "+9665XXXXXXXX",
     "national_id": "passport-national-id-or-iqama",
     "title": "Mr",
     "nationality": "Saudi Arabian",
-    "country_code": "+966"
+    "country_code": "+966",
+    "alfursan_id": ""
   },
   "web": {
     "host": "127.0.0.1",

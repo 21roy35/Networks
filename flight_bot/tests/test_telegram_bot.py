@@ -101,6 +101,21 @@ def test_start_registers_telegram_command_menu(coordinator, monkeypatch):
     assert api.commands_registered is True
 
 
+def test_portal_progress_reports_stage_transitions_with_screenshots(coordinator):
+    bot, api = coordinator
+    relay = bot.portal_progress_handler()
+    relay("opening", "Opening the official site.")
+    relay("filling", "The site loaded.", b"loaded-screen")
+    relay("filling", "The site loaded.", b"duplicate-screen")
+    relay("submitting", "Form checks finished.", b"review-screen")
+
+    assert "Doing now: opening the official website" in api.messages[0]["text"]
+    assert api.photos[0]["image"] == b"loaded-screen"
+    assert "Finished: opening the official website" in api.photos[0]["caption"]
+    assert "Doing now: filling the complaint form" in api.photos[0]["caption"]
+    assert len(api.photos) == 2
+
+
 def test_due_flight_gets_one_telegram_survey(coordinator):
     bot, api = coordinator
     assert load_demo(log=lambda *_args, **_kwargs: None) == 3
@@ -143,7 +158,7 @@ def test_issue_text_and_photo_auto_file_to_official_portal(
 
     captured = {}
 
-    def fake_start(payload, on_complete):
+    def fake_start(payload, on_complete, on_update=None):
         captured.update(payload)
         on_complete(PortalResult("submitted", "ok", "CAS-555000"))
         return "job"
@@ -254,7 +269,7 @@ def test_gaca_callback_files_with_airline_reference(coordinator, monkeypatch):
     monkeypatch.setattr(telegram_bot, "missing_portal_fields", lambda _payload: [])
     captured = {}
 
-    def fake_start(payload, on_complete):
+    def fake_start(payload, on_complete, on_update=None):
         captured.update(payload)
         on_complete(PortalResult("submitted", "ok", "GACA-98765"))
         return "job"

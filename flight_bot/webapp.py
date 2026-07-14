@@ -399,13 +399,21 @@ def create_app(config: dict) -> Flask:
             next_url = url_for("index")
         if request.method == "POST":
             fields = (
-                "full_name", "email", "phone", "national_id", "title",
-                "nationality", "country_code",
+                "first_name", "middle_name", "last_name", "email", "phone",
+                "national_id", "title", "nationality", "country_code",
+                "alfursan_id",
             )
             values = {field: request.form.get(field, "").strip()
                       for field in fields}
-            missing = [field.replace("_", " ") for field, value in values.items()
-                       if not value]
+            values["full_name"] = " ".join(filter(None, (
+                values["first_name"], values["middle_name"],
+                values["last_name"])))
+            required = (
+                "first_name", "last_name", "email", "phone", "national_id",
+                "title", "nationality", "country_code",
+            )
+            missing = [field.replace("_", " ") for field in required
+                       if not values[field]]
             if missing:
                 flash("Complete every profile field: " + ", ".join(missing) + ".")
             elif not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", values["email"]):
@@ -565,7 +573,9 @@ def create_app(config: dict) -> Flask:
             telegram.notify(
                 f"Starting the {kind.upper()} complaint from your mobile request. "
                 "I’ll send a Telegram screenshot if the official portal needs a CAPTCHA, OTP, required field, declaration, or final confirmation.")
-        job_id = start_portal_job(payload, on_complete=record_result)
+        job_id = start_portal_job(
+            payload, on_complete=record_result,
+            on_update=telegram.portal_progress_handler() if telegram else None)
         return redirect(url_for("portal_status", job_id=job_id,
                                 flight_id=flight_id))
 

@@ -142,8 +142,21 @@ def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
     if kind == "gaca" and not airline_reference:
         raise ValueError("Submit to the airline first so GACA receives its reference number.")
 
-    passenger = effective(flight, "passenger") or user.get("full_name") or ""
-    first, middle, last = _names(passenger)
+    trip_passenger = effective(flight, "passenger") or ""
+    profile_name = user.get("full_name") or ""
+    explicit_names = [
+        str(user.get("first_name") or "").strip(),
+        str(user.get("middle_name") or "").strip(),
+        str(user.get("last_name") or "").strip(),
+    ]
+    passenger = (" ".join(filter(None, explicit_names))
+                 if explicit_names[0] or explicit_names[2]
+                 else profile_name or trip_passenger)
+    parsed_first, parsed_middle, parsed_last = _names(
+        profile_name or trip_passenger)
+    first = explicit_names[0] or parsed_first
+    middle = explicit_names[1] or parsed_middle
+    last = explicit_names[2] or parsed_last
     origin = effective(flight, "origin") or ""
     destination = effective(flight, "destination") or ""
     ticket_numbers = flight.get("ticket_numbers") or []
@@ -190,6 +203,7 @@ def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
         "title": user.get("title") or "",
         "nationality": user.get("nationality") or "",
         "country_code": user.get("country_code") or "",
+        "alfursan_id": user.get("alfursan_id") or "",
         "pnr": flight.get("pnr") or "",
         "ticket_number": ticket_numbers[0] if ticket_numbers else "",
         "flight_number": effective(flight, "flight_number")

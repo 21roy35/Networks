@@ -180,6 +180,49 @@ class TelegramCoordinator:
         return self.api.send_message(
             self.chat_id, text, reply_markup=buttons, force_reply=force_reply)
 
+    def portal_progress_handler(self):
+        """Return a per-job Telegram relay with readable stage transitions."""
+        state = {"stage": "", "key": None}
+        labels = {
+            "queued": "preparing the portal",
+            "opening": "opening the official website",
+            "filling": "filling the complaint form",
+            "reviewing": "checking the completed form",
+            "verification": "completing verification",
+            "submitting": "submitting the complaint",
+            "submitted": "complaint submitted",
+            "needs_attention": "waiting for your attention",
+            "error": "stopped with an error",
+        }
+        terminal = {"submitted", "needs_attention", "error"}
+
+        def relay(status: str, message: str,
+                  image: bytes | None = None) -> None:
+            key = (status, message)
+            previous = state["stage"]
+            if key == state["key"] or (status in terminal and previous == status):
+                return
+            current_label = labels.get(status, status.replace("_", " "))
+            if status == "submitted":
+                heading = "✅ Finished: submitting the complaint\n✅ Result: complaint submitted"
+            elif status in {"needs_attention", "error"}:
+                heading = f"⚠️ Stage: {current_label}"
+            elif previous and previous != status:
+                previous_label = labels.get(
+                    previous, previous.replace("_", " "))
+                heading = (f"✅ Finished: {previous_label}\n"
+                           f"⏳ Doing now: {current_label}")
+            else:
+                heading = f"⏳ Doing now: {current_label}"
+            text = f"{heading}\n{message}"[:1000]
+            if image:
+                self.api.send_photo(self.chat_id, image, text)
+            else:
+                self.notify(text)
+            state.update(stage=status, key=key)
+
+        return relay
+
     def request_verification(self, challenge: dict):
         waiter = VerificationWaiter(challenge.get("kind") or "verification")
         with self._lock:
@@ -469,7 +512,9 @@ class TelegramCoordinator:
                 db.update_survey_status(flight_key, "needs_attention")
                 self.notify(f"Portal filing needs attention: {result.message}")
 
-        start_portal_job(payload, on_complete=complete)
+        start_portal_job(
+            payload, on_complete=complete,
+            on_update=self.portal_progress_handler())
 
     def _latest_airline_complaint(self, flight: dict) -> dict | None:
         for item in reversed(flight.get("complaints") or []):
@@ -514,7 +559,9 @@ class TelegramCoordinator:
             else:
                 self.notify(f"GACA escalation needs attention: {result.message}")
 
-        start_portal_job(payload, on_complete=complete)
+        start_portal_job(
+            payload, on_complete=complete,
+            on_update=self.portal_progress_handler())
 
     def _live_landed_cached(self, flight: dict) -> bool | None:
         key = flight.get("flight_key") or str(flight.get("id"))
