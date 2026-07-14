@@ -18,12 +18,14 @@ import requests
 from . import db
 from .ai_assistant import ClaudeAssistant
 from .airlines import AIRLINES
+from .captcha_solver import TwoCaptchaSolver
 from .complaints import complaint_payload, missing_portal_fields
 from .config import TELEGRAM_EVIDENCE_DIR
 from .flight_status import live_landed, parse_flight_time, schedule_has_finished
 from .pipeline import scan_mailbox
 from .portal_automation import (PortalResult, set_ai_handler,
-                                set_verification_handler, start_portal_job)
+                                set_captcha_solver, set_verification_handler,
+                                start_portal_job)
 from .web_access import create_web_token
 
 
@@ -130,6 +132,7 @@ class TelegramCoordinator:
         self.chat_id = str(self.settings.get("chat_id") or "")
         self.api = api or TelegramAPI(self.settings.get("bot_token") or "")
         self.ai = ClaudeAssistant(config)
+        self.captcha = TwoCaptchaSolver(config)
         self.stop_event = threading.Event()
         self.started_at = datetime.now()
         self.offset = 0
@@ -153,6 +156,8 @@ class TelegramCoordinator:
         set_ai_handler(
             self.ai.portal_decision if self.ai.enabled else None,
             int(self.ai.settings.get("max_portal_attempts", 3)))
+        set_captcha_solver(
+            self.captcha.solve_recaptcha if self.captcha.enabled else None)
         try:
             self.api.set_commands()
         except Exception:
@@ -169,6 +174,7 @@ class TelegramCoordinator:
         self.stop_event.set()
         set_verification_handler(None)
         set_ai_handler(None)
+        set_captcha_solver(None)
 
     def notify(self, text: str, buttons=None, force_reply: bool = False) -> dict:
         return self.api.send_message(
@@ -268,10 +274,13 @@ class TelegramCoordinator:
                 ai_status = f" {self.ai.name} AI is configured on {self.ai.model}."
             else:
                 ai_status = " AI assistance is off."
+            captcha_status = (" 2Captcha is configured with Telegram fallback."
+                              if self.captcha.enabled
+                              else " Automatic CAPTCHA solving is off.")
             self.notify(
                 f"FlightDeck is running. {counts['flights']} flights, "
                 f"{counts['complaints']} complaints, {counts['emails']} parsed emails."
-                + ai_status)
+                + ai_status + captcha_status)
             return
         if text and text.split(maxsplit=1)[0].lower() == "/web":
             self._send_web_link()

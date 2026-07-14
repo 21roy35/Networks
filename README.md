@@ -56,7 +56,7 @@ The workflow uses Telegram's official [Bot API](https://core.telegram.org/bots/a
 
 After a recorded arrival, FlightDeck asks how the flight went. You can tap **Everything was good**, or describe an issue and attach photos. After a short collection window, FlightDeck opens the airline's official complaint form, fills it, attaches the evidence, submits it, saves the official reference, and confirms the outcome in Telegram.
 
-If the portal requests an OTP, text CAPTCHA, image-grid CAPTCHA, missing required field, dropdown/radio choice, legal declaration, Nafath approval, or final confirmation, FlightDeck sends the relevant prompt and screenshot to Telegram. Your reply is applied to the waiting VPS browser session and automation resumes, so the complaint can be started from a phone. These controls are assisted, not bypassed. Portal passwords are never requested through Telegram.
+If the portal requests a reCAPTCHA and 2Captcha is configured, FlightDeck obtains and applies the token automatically. If that service is unavailable or the token cannot be applied, it falls back to the numbered Telegram image-grid flow. OTPs, missing required fields, dropdown/radio choices, legal declarations, Nafath approval, and final confirmation continue to use the relevant Telegram prompt and screenshot. Your reply is applied to the waiting VPS browser session and automation resumes, so the complaint can be started from a phone. Portal passwords are never requested through Telegram.
 
 FlightDeck scans the configured inbox for substantive airline replies. When one is matched to a submitted complaint, it sends a concise excerpt to Telegram and offers **Escalate to GACA** or **No, close**. GACA receives the original incident, evidence, flight data, airline complaint date, and airline reference automatically.
 
@@ -69,6 +69,10 @@ Set `FLIGHTBOT_ANTHROPIC_API_KEY` on the server to enable the guarded Anthropic 
 Ghala-200 receives only the complaint facts needed for its task. For portal recovery it may receive the current official-page screenshot, visible control metadata, and complaint payload. It may fill exact values already present in that payload or select safe navigation such as **Next**, **Continue**, or **Retry**. Code-level guardrails prevent it from supplying passwords, OTPs, CAPTCHA answers, security information, declarations, payment details, invented values, or final submission actions. Those protected steps are relayed to Telegram with a screenshot.
 
 If Anthropic is unavailable or returns an unusable answer, FlightDeck continues with its deterministic form mappings and Telegram assistance. AI output can be wrong and is not legal advice. Anthropic API usage may incur model charges.
+
+## Automatic CAPTCHA solving
+
+Set `FLIGHTBOT_2CAPTCHA_API_KEY` to enable the 2Captcha API v2 integration. FlightDeck creates a proxyless reCAPTCHA v2 task, polls at the documented five-second minimum, applies the returned token and invokes the page callback when present. The configured Telegram chat remains the fallback. Solver usage consumes the balance on the configured 2Captcha account.
 
 ## Flight completion detection
 
@@ -106,6 +110,7 @@ FLIGHTBOT_IMAP_PASSWORD
 FLIGHTBOT_TELEGRAM_BOT_TOKEN
 FLIGHTBOT_TELEGRAM_CHAT_ID
 FLIGHTBOT_FLIGHTAWARE_API_KEY
+FLIGHTBOT_2CAPTCHA_API_KEY
 FLIGHTBOT_PUBLIC_BASE_URL
 FLIGHTBOT_WEB_ACCESS_SECRET
 FLIGHTBOT_ANTHROPIC_API_KEY

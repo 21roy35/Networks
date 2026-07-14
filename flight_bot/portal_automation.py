@@ -17,7 +17,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .airlines import AIRLINES, GACA
 
@@ -29,6 +29,7 @@ _TERMINAL = {"submitted", "needs_attention", "error"}
 _BROWSER_LOCK = threading.Lock()
 _VERIFICATION_HANDLER: Callable[[dict], object] | None = None
 _AI_HANDLER: Callable[[dict], dict | None] | None = None
+_CAPTCHA_SOLVER: Callable[[dict], dict | None] | None = None
 _AI_MAX_ATTEMPTS = 3
 _MAX_CAPTCHA_ROUNDS = 20
 _CHROME_USER_AGENT = (
@@ -57,6 +58,12 @@ def set_ai_handler(handler: Callable[[dict], dict | None] | None,
     global _AI_HANDLER, _AI_MAX_ATTEMPTS
     _AI_HANDLER = handler
     _AI_MAX_ATTEMPTS = max(1, min(int(max_attempts or 3), 10))
+
+
+def set_captcha_solver(handler: Callable[[dict], dict | None] | None):
+    """Install the automatic CAPTCHA solver, with Telegram kept as fallback."""
+    global _CAPTCHA_SOLVER
+    _CAPTCHA_SOLVER = handler
 
 
 def _public_job(job: dict) -> dict:
@@ -375,6 +382,100 @@ def _captcha_completed(page) -> bool:
     except Exception:
         pass
     return False
+
+
+def _recaptcha_challenge(page) -> dict | None:
+    for frame in getattr(page, "frames", []):
+        raw_url = str(getattr(frame, "url", ""))
+        parsed = urlparse(raw_url)
+        if "recaptcha" not in raw_url or "anchor" not in parsed.path:
+            continue
+        params = parse_qs(parsed.query)
+        site_key = (params.get("k") or [""])[0].strip()
+        if not site_key:
+            continue
+        try:
+            user_agent = str(page.evaluate("navigator.userAgent") or "")
+        except Exception:
+            user_agent = _CHROME_USER_AGENT
+        return {
+            "website_url": page.url,
+            "site_key": site_key,
+            "is_invisible": (params.get("size") or [""])[0] == "invisible",
+            "user_agent": user_agent,
+            "api_domain": ("recaptcha.net"
+                           if (parsed.hostname or "").endswith("recaptcha.net")
+                           else "google.com"),
+        }
+    return None
+
+
+def _inject_recaptcha_token(page, token: str) -> bool:
+    try:
+        applied = page.evaluate("""token => {
+            const fields = Array.from(document.querySelectorAll(
+                "textarea[name='g-recaptcha-response'], " +
+                "input[name='g-recaptcha-response']"));
+            for (const field of fields) {
+                const proto = field instanceof HTMLTextAreaElement
+                    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+                if (setter) setter.call(field, token); else field.value = token;
+                field.dispatchEvent(new Event("input", {bubbles: true}));
+                field.dispatchEvent(new Event("change", {bubbles: true}));
+            }
+
+            const callbacks = new Set();
+            for (const element of document.querySelectorAll("[data-callback]")) {
+                const path = (element.getAttribute("data-callback") || "").split(".");
+                let value = window;
+                for (const part of path) value = value?.[part];
+                if (typeof value === "function") callbacks.add(value);
+            }
+            const seen = new WeakSet();
+            const visit = (value, depth = 0) => {
+                if (!value || depth > 6 || !["object", "function"].includes(typeof value)) return;
+                if (seen.has(value)) return;
+                seen.add(value);
+                for (const key of Object.keys(value)) {
+                    let child;
+                    try { child = value[key]; } catch (_) { continue; }
+                    if (key.toLowerCase() === "callback" && typeof child === "function") {
+                        callbacks.add(child);
+                    } else {
+                        visit(child, depth + 1);
+                    }
+                }
+            };
+            visit(window.___grecaptcha_cfg?.clients || {});
+            let called = 0;
+            for (const callback of callbacks) {
+                try { callback(token); called += 1; } catch (_) {}
+            }
+            return {fields: fields.length, callbacks: called};
+        }""", token)
+    except Exception:
+        return False
+    return bool((applied or {}).get("fields") or (applied or {}).get("callbacks"))
+
+
+def _solve_recaptcha_automatically(page, update) -> bool:
+    if not _CAPTCHA_SOLVER:
+        return False
+    challenge = _recaptcha_challenge(page)
+    if not challenge:
+        return False
+    update("verification", "2Captcha is solving the reCAPTCHA automatically…")
+    try:
+        result = _CAPTCHA_SOLVER(challenge) or {}
+    except Exception:
+        return False
+    token = str(result.get("token") or "").strip()
+    if not token or not _inject_recaptcha_token(page, token):
+        return False
+    page.wait_for_timeout(1500)
+    update("filling", "2Captcha verification applied. Continuing automatically…")
+    return True
 
 
 def _needs_human_step(page) -> str:
@@ -877,15 +978,25 @@ def _wait_for_human_step(page, update, timeout_seconds: int = 600) -> bool:
     if not message:
         return True
     update("verification", message)
-    if _VERIFICATION_HANDLER:
-        if _solve_otp(page, update):
+    recaptcha = _visible(page.locator("iframe[src*='recaptcha']"))
+    if _VERIFICATION_HANDLER and _solve_otp(page, update):
+        pass
+    elif _VERIFICATION_HANDLER and _solve_text_captcha(page, update):
+        pass
+    elif recaptcha:
+        if _CAPTCHA_SOLVER and _solve_recaptcha_automatically(page, update):
             pass
-        elif _solve_text_captcha(page, update):
-            pass
-        elif _visible(page.locator("iframe[src*='recaptcha']")):
+        elif _VERIFICATION_HANDLER:
+            if _CAPTCHA_SOLVER:
+                update(
+                    "verification",
+                    "2Captcha could not complete this challenge. Falling back to Telegram…")
             if not _solve_recaptcha(page, update):
                 return False
-        elif _visible(page.locator("iframe[src*='hcaptcha']")):
+        else:
+            return False
+    elif _VERIFICATION_HANDLER:
+        if _visible(page.locator("iframe[src*='hcaptcha']")):
             if not _solve_hcaptcha(page, update):
                 return False
         elif _visible(page.locator("iframe[src*='challenges.cloudflare.com']")):

@@ -13,6 +13,7 @@ from flask import (Flask, Response, abort, flash, jsonify, redirect, render_temp
 
 from . import db
 from .ai_assistant import ClaudeAssistant
+from .captcha_solver import TwoCaptchaSolver
 from .compensation import (ELIGIBLE, POSSIBLY, assess, effective)
 from .complaints import (airline_complaint, complaint_payload, gaca_complaint,
                          missing_portal_fields)
@@ -21,7 +22,7 @@ from .config import save_user_profile
 from .pipeline import (load_demo, rebuild_flights, reparse_emails,
                        scan_mailbox)
 from .portal_automation import (PortalResult, portal_job_status, set_ai_handler,
-                                start_portal_job)
+                                set_captcha_solver, start_portal_job)
 from .telegram_bot import start_telegram
 from .web_access import verify_web_token
 
@@ -297,6 +298,9 @@ def create_app(config: dict) -> Flask:
     set_ai_handler(
         assistant.portal_decision if assistant.enabled else None,
         int(assistant.settings.get("max_portal_attempts", 3)))
+    captcha = TwoCaptchaSolver(config)
+    set_captcha_solver(
+        captcha.solve_recaptcha if captcha.enabled else None)
     telegram = start_telegram(config)
 
     @app.before_request

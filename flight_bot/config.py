@@ -54,6 +54,14 @@ DEFAULTS = {
         "flightaware_api_key": "",
         "poll_minutes": 10,
     },
+    "captcha": {
+        "enabled": False,
+        "provider": "2captcha",
+        "api_key": "",
+        "poll_interval_seconds": 5,
+        "timeout_seconds": 180,
+        "telegram_fallback": True,
+    },
     "ai": {
         "enabled": False,
         "provider": "anthropic",
@@ -107,6 +115,7 @@ def load_config() -> dict:
         ("telegram", "bot_token"): "FLIGHTBOT_TELEGRAM_BOT_TOKEN",
         ("telegram", "chat_id"): "FLIGHTBOT_TELEGRAM_CHAT_ID",
         ("flight_status", "flightaware_api_key"): "FLIGHTBOT_FLIGHTAWARE_API_KEY",
+        ("captcha", "api_key"): "FLIGHTBOT_2CAPTCHA_API_KEY",
         ("web", "public_base_url"): "FLIGHTBOT_PUBLIC_BASE_URL",
         ("web", "access_secret"): "FLIGHTBOT_WEB_ACCESS_SECRET",
         ("ai", "api_key"): "FLIGHTBOT_ANTHROPIC_API_KEY",
@@ -130,6 +139,8 @@ def load_config() -> dict:
         raise SystemExit("imap.folders must be a JSON list of mailbox names.")
     if config["telegram"].get("bot_token") and config["telegram"].get("chat_id"):
         config["telegram"]["enabled"] = True
+    if config["captcha"].get("api_key"):
+        config["captcha"]["enabled"] = True
     if config["ai"].get("api_key"):
         config["ai"]["enabled"] = True
     return config

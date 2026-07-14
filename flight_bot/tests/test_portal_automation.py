@@ -286,6 +286,94 @@ def test_recaptcha_uses_interactive_anchor_when_placeholder_comes_first():
     assert checkbox.checked is True
 
 
+def test_2captcha_extracts_site_key_and_applies_token(monkeypatch):
+    class Frame:
+        url = ("https://recaptcha.net/recaptcha/api2/anchor?"
+               "k=saudia-site-key&size=normal")
+
+    class Page:
+        url = "https://booking.saudia.com/forms/contact-form"
+        frames = [Frame()]
+
+        def __init__(self):
+            self.waits = []
+            self.injected = ""
+
+        def evaluate(self, script, *args):
+            if script == "navigator.userAgent":
+                return "Modern Browser"
+            self.injected = args[0]
+            return {"fields": 1, "callbacks": 1}
+
+        def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    captured = {}
+
+    def solve(challenge):
+        captured.update(challenge)
+        return {"token": "automatic-token", "task_id": "123"}
+
+    monkeypatch.setattr(portal_automation, "_CAPTCHA_SOLVER", solve)
+    page = Page()
+    updates = []
+    assert portal_automation._solve_recaptcha_automatically(
+        page, lambda *args: updates.append(args)) is True
+    assert captured == {
+        "website_url": page.url,
+        "site_key": "saudia-site-key",
+        "is_invisible": False,
+        "user_agent": "Modern Browser",
+        "api_domain": "recaptcha.net",
+    }
+    assert page.injected == "automatic-token"
+    assert page.waits == [1500]
+    assert updates[0][0] == "verification"
+    assert updates[-1][0] == "filling"
+
+
+def test_2captcha_failure_falls_back_to_telegram_grid(monkeypatch):
+    class Visible:
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+    class Page:
+        def locator(self, _selector):
+            return Visible()
+
+        def is_closed(self):
+            return False
+
+    messages = iter(["Solve the CAPTCHA challenge.", ""])
+    manual = []
+    monkeypatch.setattr(portal_automation, "_needs_human_step",
+                        lambda _page: next(messages))
+    monkeypatch.setattr(portal_automation, "_CAPTCHA_SOLVER",
+                        lambda _challenge: None)
+    monkeypatch.setattr(portal_automation, "_VERIFICATION_HANDLER",
+                        lambda _challenge: "1")
+    monkeypatch.setattr(portal_automation, "_solve_otp",
+                        lambda *_args: False)
+    monkeypatch.setattr(portal_automation, "_solve_text_captcha",
+                        lambda *_args: False)
+    monkeypatch.setattr(portal_automation, "_solve_recaptcha_automatically",
+                        lambda *_args: False)
+    monkeypatch.setattr(portal_automation, "_solve_recaptcha",
+                        lambda *_args: manual.append(True) or True)
+    updates = []
+    assert portal_automation._wait_for_human_step(
+        Page(), lambda *args: updates.append(args)) is True
+    assert manual == [True]
+    assert any("Falling back to Telegram" in message
+               for _stage, message in updates)
+
+
 def test_solved_recaptcha_widget_is_not_reported_as_pending_step():
     class Widget:
         def __init__(self):

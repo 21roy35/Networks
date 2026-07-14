@@ -39,6 +39,14 @@
     "flightaware_api_key": "",
     "poll_minutes": 10
   },
+  "captcha": {
+    "enabled": false,
+    "provider": "2captcha",
+    "api_key": "",
+    "poll_interval_seconds": 5,
+    "timeout_seconds": 180,
+    "telegram_fallback": true
+  },
   "ai": {
     "enabled": false,
     "provider": "anthropic",

@@ -36,3 +36,12 @@ def test_anthropic_environment_key_enables_ghala(monkeypatch, tmp_path):
     assert config["ai"]["api_key"] == "test-key"
     assert config["ai"]["name"] == "Ghala-200"
     assert config["ai"]["model"] == "claude-sonnet-5"
+
+
+def test_2captcha_environment_key_enables_solver(monkeypatch, tmp_path):
+    monkeypatch.setattr(config_module, "CONFIG_PATH", tmp_path / "missing.json")
+    monkeypatch.setenv("FLIGHTBOT_2CAPTCHA_API_KEY", "test-captcha-key")
+    config = config_module.load_config()
+    assert config["captcha"]["enabled"] is True
+    assert config["captcha"]["provider"] == "2captcha"
+    assert config["captcha"]["api_key"] == "test-captcha-key"
