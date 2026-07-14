@@ -1090,9 +1090,9 @@ def _prepare_saudia(page, payload: dict, update):
                          "complaint details", "what happened", "description",
                          "message"], payload["description"])
         try:
-            page.get_by_role("button", name=re.compile(
-                r"^submit$", re.I)).first.wait_for(
-                    state="visible", timeout=10000)
+            page.locator("button:visible").filter(has_text=re.compile(
+                r"^\s*submit\s*$", re.I)).first.wait_for(
+                    state="visible", timeout=15000)
         except Exception:
             pass
 
