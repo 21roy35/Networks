@@ -235,8 +235,11 @@ def _select(page, labels: list[str], choices: list[str]) -> bool:
         try:
             if not field.is_visible():
                 continue
-            field_text = re.sub(r"\s+", " ", field.inner_text()).strip()
-            if not any(re.search(label, field_text, re.I) for label in labels):
+            label_control = field.locator("mat-label")
+            label_text = (label_control.first.inner_text()
+                          if label_control.count() else field.inner_text())
+            label_text = re.sub(r"\s+", " ", label_text).strip()
+            if not any(re.search(label, label_text, re.I) for label in labels):
                 continue
             control = field.locator("mat-select")
             if not _visible(control):

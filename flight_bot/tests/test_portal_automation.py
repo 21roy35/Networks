@@ -163,8 +163,14 @@ def test_material_dropdown_is_selected_from_allowed_choice():
             return "Please Select Service type *"
 
         def locator(self, selector):
-            assert selector == "mat-select"
-            return Control()
+            if selector == "mat-select":
+                return Control()
+            if selector == "mat-label":
+                class Label(Control):
+                    def inner_text(self):
+                        return "Service type *"
+                return Label()
+            raise AssertionError(selector)
 
     class Fields:
         def all(self):
