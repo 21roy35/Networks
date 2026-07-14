@@ -437,7 +437,7 @@ def test_recaptcha_can_complete_after_more_than_five_grids(monkeypatch):
             return self.checkbox
 
     class Cell:
-        def click(self):
+        def click(self, **_kwargs):
             pass
 
     class Cells:
@@ -455,7 +455,7 @@ def test_recaptcha_can_complete_after_more_than_five_grids(monkeypatch):
         def count(self):
             return 1
 
-        def click(self):
+        def click(self, **_kwargs):
             pass
 
     class ChallengeFrame:
@@ -495,6 +495,79 @@ def test_recaptcha_can_complete_after_more_than_five_grids(monkeypatch):
         Page(), lambda *args: updates.append(args)) is True
     assert rounds == [1, 2, 3, 4, 5, 6]
     assert updates[-1][0] == "filling"
+
+
+def test_unstable_captcha_tile_reprompts_instead_of_crashing(monkeypatch):
+    class Checkbox:
+        first = property(lambda self: self)
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def get_attribute(self, _name):
+            return "false"
+
+        def click(self, **_kwargs):
+            pass
+
+    class AnchorFrame:
+        url = "https://recaptcha.net/recaptcha/api2/anchor"
+
+        def locator(self, _selector):
+            return Checkbox()
+
+    class StuckCell:
+        def click(self, **_kwargs):
+            raise TimeoutError("Locator.click: Timeout 30000ms exceeded.")
+
+    class Cells:
+        def count(self):
+            return 16
+
+        def nth(self, _index):
+            return StuckCell()
+
+    class Grid:
+        def screenshot(self, **_kwargs):
+            return b"captcha-grid"
+
+    class ChallengeFrame:
+        url = "https://recaptcha.net/recaptcha/api2/bframe"
+
+        def locator(self, selector):
+            if selector == "#rc-imageselect-target td":
+                return Cells()
+            if selector == "#rc-imageselect-target":
+                return Grid()
+            raise AssertionError(selector)
+
+    class Page:
+        def __init__(self):
+            self.frames = [AnchorFrame(), ChallengeFrame()]
+
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+    responses = iter(["13", ""])
+    prompts = []
+
+    def ask(_kind, message, _page, **_kwargs):
+        prompts.append(message)
+        return next(responses)
+
+    monkeypatch.setattr(portal_automation, "_ask_verification", ask)
+    monkeypatch.setattr(portal_automation, "_annotate_grid",
+                        lambda image, _count: image)
+    monkeypatch.setattr(portal_automation, "_body_text",
+                        lambda _frame: "crosswalks")
+    updates = []
+    assert portal_automation._solve_recaptcha(
+        Page(), lambda *args: updates.append(args)) is False
+    assert len(prompts) == 2
+    assert any("stopped responding" in text for _stage, text in updates)
 
 
 @pytest.mark.parametrize(("incident", "category"), [

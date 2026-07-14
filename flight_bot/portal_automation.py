@@ -639,6 +639,26 @@ def _wait_for_recaptcha_refresh(page, anchor, *, minimum_ms: int = 4500,
     return _recaptcha_checked(anchor), False
 
 
+def _click_grid_cells(cells, selected: list[int]) -> bool:
+    """Click the chosen tiles without letting one flaky tile kill the job.
+
+    Challenge tiles animate while images fade in, so a strict actionability
+    wait can time out even though the tile is clickable. Retry each tile with
+    a forced click before reporting failure so the caller can re-prompt with
+    a fresh screenshot instead of aborting the submission."""
+    for cell in selected:
+        tile = cells.nth(cell - 1)
+        for kwargs in ({"timeout": 8000}, {"timeout": 4000, "force": True}):
+            try:
+                tile.click(**kwargs)
+                break
+            except Exception:
+                continue
+        else:
+            return False
+    return True
+
+
 def _solve_recaptcha(page, update) -> bool:
     # Saudia currently renders a placeholder anchor iframe before the real
     # interactive one. Choose the frame that actually contains a visible
@@ -670,7 +690,11 @@ def _solve_recaptcha(page, update) -> bool:
         if count not in (9, 16):
             return False
         grid = frame.locator("#rc-imageselect-target")
-        image = _annotate_grid(grid.screenshot(type="png"), count)
+        try:
+            image = _annotate_grid(grid.screenshot(type="png"), count)
+        except Exception:
+            page.wait_for_timeout(1500)
+            continue
         instruction = _body_text(frame)[:500]
         response = _ask_verification(
             "captcha_grid",
@@ -680,11 +704,19 @@ def _solve_recaptcha(page, update) -> bool:
         selected = _parse_cells(response, count)
         if not selected:
             return False
-        for cell in selected:
-            cells.nth(cell - 1).click()
+        if not _click_grid_cells(cells, selected):
+            update(
+                "verification",
+                "A CAPTCHA tile stopped responding, so a fresh challenge "
+                "screenshot is on its way…")
+            page.wait_for_timeout(1500)
+            continue
         button = frame.locator("#recaptcha-verify-button")
-        if button.count():
-            button.click()
+        try:
+            if button.count():
+                button.click(timeout=8000)
+        except Exception:
+            pass
         verified, ready = _wait_for_recaptcha_refresh(page, anchor)
         if verified:
             update("filling", "CAPTCHA verified through Telegram. Continuing…")
@@ -724,7 +756,11 @@ def _solve_hcaptcha(page, update) -> bool:
         if count not in (9, 16):
             return False
         grid = frame.locator(".task-grid")
-        image = _annotate_grid(grid.screenshot(type="png"), count)
+        try:
+            image = _annotate_grid(grid.screenshot(type="png"), count)
+        except Exception:
+            page.wait_for_timeout(1500)
+            continue
         prompt = _clean_frame_text(frame)[:500]
         response = _ask_verification(
             "captcha_grid",
@@ -733,11 +769,19 @@ def _solve_hcaptcha(page, update) -> bool:
         selected = _parse_cells(response, count)
         if not selected:
             return False
-        for cell in selected:
-            cells.nth(cell - 1).click()
+        if not _click_grid_cells(cells, selected):
+            update(
+                "verification",
+                "A CAPTCHA tile stopped responding, so a fresh challenge "
+                "screenshot is on its way…")
+            page.wait_for_timeout(1500)
+            continue
         button = frame.locator(".button-submit")
-        if button.count():
-            button.click()
+        try:
+            if button.count():
+                button.click(timeout=8000)
+        except Exception:
+            pass
         page.wait_for_timeout(2000)
         if checkbox_frame and checkbox_frame.locator(
                 "#checkbox").get_attribute("aria-checked") == "true":
