@@ -286,6 +286,75 @@ def test_recaptcha_uses_interactive_anchor_when_placeholder_comes_first():
     assert checkbox.checked is True
 
 
+def test_recaptcha_waits_for_stable_unselected_grid_before_next_prompt():
+    class Count:
+        def __init__(self, value):
+            self.value = value
+
+        def count(self):
+            return self.value
+
+    class Images(Count):
+        def evaluate_all(self, _script):
+            return True
+
+    class Grid(Count):
+        def __init__(self):
+            super().__init__(1)
+            self.first = self
+
+        def is_visible(self):
+            return True
+
+        def locator(self, selector):
+            assert selector == "img"
+            return Images(1)
+
+        def screenshot(self, **_kwargs):
+            return b"stable-grid"
+
+    class ChallengeFrame:
+        url = "https://recaptcha.net/recaptcha/api2/bframe"
+
+        def __init__(self):
+            self.grid = Grid()
+
+        def locator(self, selector):
+            if selector == "#rc-imageselect-target":
+                return self.grid
+            if selector == "#rc-imageselect-target td":
+                return Count(9)
+            if selector.endswith(".rc-imageselect-tileselected"):
+                return Count(0)
+            raise AssertionError(selector)
+
+    class Checkbox:
+        def get_attribute(self, name):
+            assert name == "aria-checked"
+            return "false"
+
+    class Anchor:
+        def locator(self, selector):
+            assert selector == "#recaptcha-anchor"
+            return Checkbox()
+
+    class Page:
+        frames = [ChallengeFrame()]
+
+        def __init__(self):
+            self.waits = []
+
+        def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    page = Page()
+    verified, ready = portal_automation._wait_for_recaptcha_refresh(
+        page, Anchor())
+    assert (verified, ready) == (False, True)
+    assert page.waits[0] == 4500
+    assert 750 in page.waits
+
+
 @pytest.mark.parametrize(("incident", "category"), [
     ("The seat recline was broken.", "Seats"),
     ("The flight was delayed for five hours.", "Flight Delay"),

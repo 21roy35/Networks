@@ -555,6 +555,53 @@ def _parse_cells(response, count: int) -> list[int]:
                    if 1 <= int(value) <= count})
 
 
+def _recaptcha_checked(anchor) -> bool:
+    try:
+        return anchor.locator(
+            "#recaptcha-anchor").get_attribute("aria-checked") == "true"
+    except Exception:
+        return False
+
+
+def _wait_for_recaptcha_refresh(page, anchor, *, minimum_ms: int = 4500,
+                                  timeout_seconds: int = 15
+                                  ) -> tuple[bool, bool]:
+    """Return (verified, grid_ready) after a submitted CAPTCHA round."""
+    page.wait_for_timeout(minimum_ms)
+    deadline = time.monotonic() + timeout_seconds
+    last_image = None
+    while time.monotonic() < deadline:
+        if _recaptcha_checked(anchor):
+            return True, True
+        frame = next((item for item in page.frames
+                      if "recaptcha" in item.url
+                      and "bframe" in item.url
+                      and _visible(item.locator("#rc-imageselect-target"))),
+                     None)
+        if frame:
+            grid = frame.locator("#rc-imageselect-target")
+            cells = frame.locator("#rc-imageselect-target td")
+            selected = frame.locator(
+                "#rc-imageselect-target .rc-imageselect-tileselected")
+            images = grid.locator("img")
+            try:
+                loaded = (not images.count() or images.evaluate_all(
+                    "items => items.every(img => img.complete && "
+                    "img.naturalWidth > 0)"))
+                ready = (cells.count() in (9, 16)
+                         and selected.count() == 0 and loaded)
+                current_image = grid.screenshot(type="png") if ready else None
+            except Exception:
+                current_image = None
+            if current_image and current_image == last_image:
+                return False, True
+            last_image = current_image
+        else:
+            last_image = None
+        page.wait_for_timeout(750)
+    return _recaptcha_checked(anchor), False
+
+
 def _solve_recaptcha(page, update) -> bool:
     # Saudia currently renders a placeholder anchor iframe before the real
     # interactive one. Choose the frame that actually contains a visible
@@ -600,11 +647,15 @@ def _solve_recaptcha(page, update) -> bool:
         button = frame.locator("#recaptcha-verify-button")
         if button.count():
             button.click()
-        page.wait_for_timeout(2200)
-        if anchor and anchor.locator(
-                "#recaptcha-anchor").get_attribute("aria-checked") == "true":
+        verified, ready = _wait_for_recaptcha_refresh(page, anchor)
+        if verified:
             update("filling", "CAPTCHA verified through Telegram. Continuing…")
             return True
+        if not ready:
+            update(
+                "verification",
+                "The next CAPTCHA image did not finish loading, so no stale screenshot was sent.")
+            return False
     return False
 
 
