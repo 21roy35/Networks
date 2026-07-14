@@ -286,6 +286,60 @@ def test_recaptcha_uses_interactive_anchor_when_placeholder_comes_first():
     assert checkbox.checked is True
 
 
+def test_solved_recaptcha_widget_is_not_reported_as_pending_step():
+    class Widget:
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def input_value(self):
+            return ""
+
+        def nth(self, _index):
+            return self
+
+        def inner_text(self, **_kwargs):
+            return ""
+
+    class Checkbox:
+        def __init__(self, checked):
+            self.checked = checked
+
+        def get_attribute(self, name):
+            assert name == "aria-checked"
+            return "true" if self.checked else "false"
+
+    class AnchorFrame:
+        url = "https://www.google.com/recaptcha/api2/anchor?k=x"
+
+        def __init__(self, checked):
+            self.checkbox = Checkbox(checked)
+
+        def locator(self, selector):
+            assert selector == "#recaptcha-anchor"
+            return self.checkbox
+
+    class Page:
+        def __init__(self, checked):
+            self.frames = [AnchorFrame(checked)]
+
+        def locator(self, selector):
+            if "captcha" in selector or selector == "body":
+                return Widget()
+            empty = Widget()
+            empty.count = lambda: 0
+            return empty
+
+    assert portal_automation._needs_human_step(
+        Page(checked=False)) == "Solve the CAPTCHA challenge."
+    assert portal_automation._needs_human_step(Page(checked=True)) == ""
+
+
 def test_recaptcha_waits_for_stable_unselected_grid_before_next_prompt():
     class Count:
         def __init__(self, value):

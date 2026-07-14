@@ -345,6 +345,38 @@ def _dismiss_feedback_overlay(page) -> bool:
     return False
 
 
+def _captcha_completed(page) -> bool:
+    """True when a rendered anti-bot widget already holds a solved token.
+
+    Solved reCAPTCHA/hCaptcha widgets keep their iframe visible (checked
+    checkbox), so widget presence alone must not stall the submission as a
+    pending human step."""
+    for frame in getattr(page, "frames", []):
+        url = str(getattr(frame, "url", ""))
+        try:
+            if ("recaptcha" in url and "anchor" in url
+                    and frame.locator("#recaptcha-anchor")
+                    .get_attribute("aria-checked") == "true"):
+                return True
+            if ("hcaptcha.com" in url and "checkbox" in url
+                    and frame.locator("#checkbox")
+                    .get_attribute("aria-checked") == "true"):
+                return True
+        except Exception:
+            continue
+    try:
+        tokens = page.locator(
+            "textarea[name='g-recaptcha-response'], "
+            "textarea[name='h-captcha-response'], "
+            "input[name='cf-turnstile-response']")
+        for index in range(min(tokens.count(), 5)):
+            if tokens.nth(index).input_value():
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _needs_human_step(page) -> str:
     checks = (
         ("input[name*='otp' i], input[id*='otp' i], input[autocomplete='one-time-code']",
@@ -359,8 +391,12 @@ def _needs_human_step(page) -> str:
          "Complete the one-time portal sign-in."),
     )
     for selector, message in checks:
-        if _visible(page.locator(selector)):
-            return message
+        if not _visible(page.locator(selector)):
+            continue
+        if (("captcha" in selector or "cloudflare" in selector)
+                and _captcha_completed(page)):
+            continue
+        return message
     if re.search(r"Nafath|نفاذ|approve (?:the )?(?:login|request)",
                  _body_text(page), re.I):
         return "Approve the Nafath or sign-in request on your phone."
