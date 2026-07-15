@@ -1011,6 +1011,20 @@ def test_short_ai_follow_up_reuses_last_exact_complaint_not_another_case(
     assert api.photos[0]["image"] == b"first-case-photo"
 
 
+def test_explicit_details_request_corrects_an_ai_list_intent(coordinator):
+    bot, _api = coordinator
+    base = {
+        "name": "list_complaints", "flight_number": "", "pnr": "",
+        "reference": "", "passenger": "", "query": "",
+        "time_scope": "all", "latest": True, "limit": 1,
+    }
+
+    actual = bot._contextualize_ai_action(
+        base, "show me my latest complaint details")
+
+    assert actual["name"] == "complaint_details"
+
+
 def test_seven_day_no_response_auto_escalates_once(coordinator, monkeypatch):
     bot, api = coordinator
     load_demo(log=lambda *_args, **_kwargs: None)

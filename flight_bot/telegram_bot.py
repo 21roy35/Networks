@@ -586,6 +586,13 @@ class TelegramCoordinator:
     def _contextualize_ai_action(self, action: dict, message: str) -> dict:
         """Resolve short follow-ups from the last exact result, never by AI guess."""
         result = dict(action)
+        detail_requested = re.search(
+            r"\b(?:detail|details|everything|information|info|status)\b",
+            message, re.IGNORECASE)
+        if detail_requested and result.get("name") == "list_complaints":
+            result["name"] = "complaint_details"
+        elif detail_requested and result.get("name") == "list_flights":
+            result["name"] = "flight_details"
         updated = float(self._ai_context.get("updated") or 0)
         if not updated or time.monotonic() - updated > 30 * 60:
             return result
