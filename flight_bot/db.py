@@ -369,7 +369,7 @@ def list_complaints() -> list[dict]:
             """SELECT c.*, f.id AS flight_id, f.data AS flight_data
                FROM complaints c
                LEFT JOIN flights f ON f.flight_key = c.flight_key
-               ORDER BY c.created_at DESC""").fetchall()
+               ORDER BY c.created_at DESC, c.id DESC""").fetchall()
     results = []
     for row in rows:
         item = dict(row)

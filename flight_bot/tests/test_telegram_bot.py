@@ -250,6 +250,34 @@ def test_confirmation_email_recovers_missing_airline_reference(coordinator):
                for item in api.messages)
 
 
+def test_one_confirmation_reference_is_not_assigned_to_two_cases(coordinator):
+    bot, _api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Older complaint",
+        "submitted", details="An older issue.")
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE complaints SET created_at = datetime('now', '-1 day')")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "New screen complaint",
+        "confirmation_unknown", details="The screen was broken.")
+    db.save_mail_event({
+        "message_id": "<one-confirmation@example>",
+        "subject": "Complaint reference number is CAS-99880011",
+        "sender": "customer.relations@saudia.com", "date": datetime.now(),
+        "body": "Thank you. Your complaint was received.",
+    })
+
+    bot.check_complaint_responses()
+
+    older, newer = db.complaints_for_flight(flight["flight_key"])
+    assert older["reference"] is None
+    assert newer["reference"] == "CAS-99880011"
+
+
 def test_ghala_interprets_matched_airline_response_before_escalation(coordinator):
     bot, api = coordinator
 

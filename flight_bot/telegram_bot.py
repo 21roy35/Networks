@@ -770,10 +770,14 @@ class TelegramCoordinator:
                     continue
                 blob = " ".join((event.get("subject") or "", event.get("body") or ""))
                 if not reference:
+                    capture_key = f"reference-captured:{event['id']}"
+                    if db.event_seen(capture_key):
+                        continue
                     captured_reference = _extract_reference(blob)
                     if captured_reference:
                         db.finish_complaint(
                             complaint["id"], "submitted", captured_reference)
+                        db.mark_event_seen(capture_key)
                         complaint["reference"] = captured_reference
                         reference = captured_reference.casefold()
                         self.notify(
