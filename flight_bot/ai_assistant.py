@@ -235,7 +235,7 @@ class ClaudeAssistant:
                                 "country_code", "national_id", "alfursan_id",
                             ]},
                             "value": {"type": "string"},
-                            "source_index": {"type": "integer", "minimum": 0},
+                            "source_index": {"type": "integer"},
                             "evidence_excerpt": {"type": "string"},
                         },
                         "required": ["field", "value", "source_index",
