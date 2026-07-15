@@ -200,12 +200,14 @@ class TelegramCoordinator:
             "verification": "completing verification",
             "submitting": "submitting the complaint",
             "submitted": "complaint submitted",
+            "accepted_pending_reference": "waiting for the airline reference",
             "confirmation_unknown": "checking the airline confirmation",
             "needs_attention": "waiting for your attention",
             "error": "stopped with an error",
         }
         terminal = {
-            "submitted", "confirmation_unknown", "needs_attention", "error",
+            "submitted", "accepted_pending_reference", "confirmation_unknown",
+            "needs_attention", "error",
         }
 
         def deliver():
@@ -539,7 +541,8 @@ class TelegramCoordinator:
         if complaint_id is None:
             existing = db.active_complaint_for_flight(flight_key, "airline")
             if existing and existing.get("status") in {
-                    "submitted", "filed", "sent", "confirmation_unknown"}:
+                    "submitted", "filed", "sent",
+                    "accepted_pending_reference"}:
                 db.update_survey_status(flight_key, "filed")
                 self.notify(
                     "This flight already has an airline complaint on record. "
@@ -561,15 +564,23 @@ class TelegramCoordinator:
                 reference = f" Reference: {result.reference}." if result.reference else ""
                 self.notify("Complaint submitted on the official airline portal."
                             + reference + " I’ll watch for the airline’s response.")
-            elif result.status == "confirmation_unknown":
-                db.finish_complaint(complaint_id, "confirmation_unknown")
+            elif result.status == "accepted_pending_reference":
+                db.finish_complaint(
+                    complaint_id, "accepted_pending_reference")
                 db.update_survey_status(flight_key, "needs_attention")
                 self.notify(
-                    "The complaint was sent once, but the airline did not return "
-                    "a readable reference. I will not submit it again. Check the "
-                    "airline confirmation or response before taking another action.")
+                    "Saudia's production service accepted the complaint, but "
+                    "the airline reference has not arrived yet. This is not "
+                    "marked submitted and cannot be escalated to GACA. I will "
+                    "scan email for the reference and will not file a duplicate.")
+            elif result.status == "confirmation_unknown":
+                db.finish_complaint(complaint_id, "failed")
+                db.update_survey_status(flight_key, "needs_attention")
+                self.notify(
+                    "The airline did not return readable confirmation. The "
+                    "attempt is recorded as failed, not submitted.")
             else:
-                db.finish_complaint(complaint_id, "needs_attention")
+                db.finish_complaint(complaint_id, "failed")
                 db.update_survey_status(flight_key, "needs_attention")
                 self.notify(f"Portal filing needs attention: {result.message}")
 
@@ -633,10 +644,10 @@ class TelegramCoordinator:
                 suffix = f" Reference: {result.reference}." if result.reference else ""
                 self.notify("GACA escalation submitted." + suffix)
             elif result.status == "confirmation_unknown":
-                db.finish_complaint(complaint_id, "confirmation_unknown")
+                db.finish_complaint(complaint_id, "failed")
                 self.notify(
-                    "The GACA escalation was sent once without a readable "
-                    "reference. I will not submit it again automatically.")
+                    "GACA returned no readable confirmation. The escalation "
+                    "attempt is recorded as failed, not submitted.")
             else:
                 db.finish_complaint(complaint_id, "needs_attention")
                 self.notify(f"GACA escalation needs attention: {result.message}")
@@ -658,7 +669,7 @@ class TelegramCoordinator:
         for complaint in db.list_complaints():
             if (complaint.get("kind") != "airline"
                     or complaint.get("status") not in {
-                        "submitted", "confirmation_unknown"}):
+                        "submitted", "accepted_pending_reference"}):
                 continue
             complaint_id = complaint["id"]
             scheduled_key = f"auto-gaca:{complaint_id}"
@@ -761,7 +772,7 @@ class TelegramCoordinator:
         for complaint in db.list_complaints():
             if (complaint.get("kind") != "airline"
                     or complaint.get("status") not in {
-                        "submitted", "confirmation_unknown"}):
+                        "submitted", "accepted_pending_reference"}):
                 continue
             if db.event_seen(f"closed:{complaint['flight_key']}"):
                 continue

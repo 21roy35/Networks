@@ -122,7 +122,7 @@ def test_complaint_reservation_blocks_duplicates_but_allows_failed_retry(
     assert retry is not None
     db.finish_complaint(retry, "confirmation_unknown")
     assert db.begin_complaint(
-        flight["flight_key"], "airline", "Claim", "Broken baggage") is None
+        flight["flight_key"], "airline", "Claim", "Broken baggage") is not None
 
 
 def test_portal_progress_reports_stage_transitions_with_screenshots(coordinator):
@@ -233,7 +233,7 @@ def test_confirmation_email_recovers_missing_airline_reference(coordinator):
                   if item.get("airline_code") == "SV")
     db.add_complaint(
         flight["flight_key"], "airline", None, "Screen complaint",
-        "confirmation_unknown", details="The screen was broken.")
+        "accepted_pending_reference", details="The screen was broken.")
     db.save_mail_event({
         "message_id": "<confirmation@example>",
         "subject": "Complaint reference number is CAS-44556677",
@@ -263,7 +263,7 @@ def test_one_confirmation_reference_is_not_assigned_to_two_cases(coordinator):
             "UPDATE complaints SET created_at = datetime('now', '-1 day')")
     db.add_complaint(
         flight["flight_key"], "airline", None, "New screen complaint",
-        "confirmation_unknown", details="The screen was broken.")
+        "accepted_pending_reference", details="The screen was broken.")
     db.save_mail_event({
         "message_id": "<one-confirmation@example>",
         "subject": "Complaint reference number is CAS-99880011",
@@ -431,7 +431,7 @@ def test_due_escalation_waits_visibly_for_required_airline_reference(
                   if item.get("airline_code") == "SV")
     db.add_complaint(
         flight["flight_key"], "airline", None, "Screen complaint",
-        "confirmation_unknown", details="Broken screen")
+        "accepted_pending_reference", details="Broken screen")
     complaint_id = db.complaints_for_flight(flight["flight_key"])[0]["id"]
     with db.connect() as conn:
         conn.execute(

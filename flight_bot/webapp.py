@@ -574,14 +574,23 @@ def create_app(config: dict) -> Flask:
                     telegram.notify(
                         f"{kind.upper()} complaint submitted through the official portal."
                         + suffix)
-            elif result.status == "confirmation_unknown":
-                db.finish_complaint(complaint_id, "confirmation_unknown")
+            elif result.status == "accepted_pending_reference":
+                db.finish_complaint(
+                    complaint_id, "accepted_pending_reference")
                 if telegram:
                     telegram.notify(
-                        f"{kind.upper()} was sent once without a readable "
-                        "confirmation. FlightDeck will not submit it again.")
+                        f"{kind.upper()} was accepted by the production service, "
+                        "but is not marked submitted until its required reference "
+                        "is captured. Email monitoring will continue; no duplicate "
+                        "will be filed.")
+            elif result.status == "confirmation_unknown":
+                db.finish_complaint(complaint_id, "failed")
+                if telegram:
+                    telegram.notify(
+                        f"{kind.upper()} returned no readable confirmation and "
+                        "is recorded as failed, not submitted.")
             else:
-                db.finish_complaint(complaint_id, "needs_attention")
+                db.finish_complaint(complaint_id, "failed")
                 if telegram:
                     telegram.notify(
                         f"{kind.upper()} portal submission needs attention: {result.message}")

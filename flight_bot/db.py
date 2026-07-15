@@ -96,6 +96,12 @@ def init_db():
         if "attachments" not in columns:
             conn.execute(
                 "ALTER TABLE complaints ADD COLUMN attachments TEXT DEFAULT '[]'")
+        # Older builds incorrectly treated an unreadable portal confirmation
+        # as a protected success. Such rows are failures and must never unlock
+        # a GACA escalation or suppress a safe retry.
+        conn.execute(
+            "UPDATE complaints SET status = 'failed' "
+            "WHERE status = 'confirmation_unknown'")
 
 
 def save_mail_event(raw: dict) -> int:
@@ -299,7 +305,7 @@ def active_complaint_for_flight(flight_key: str, kind: str) -> dict | None:
             """SELECT * FROM complaints
                WHERE flight_key = ? AND kind = ?
                  AND status IN ('filing', 'submitted', 'filed', 'sent',
-                                'confirmation_unknown')
+                                'accepted_pending_reference')
                ORDER BY created_at DESC, id DESC LIMIT 1""",
             (flight_key, kind)).fetchone()
     if not row:
@@ -319,7 +325,7 @@ def begin_complaint(flight_key: str, kind: str, subject: str | None,
             """SELECT id, status, created_at FROM complaints
                WHERE flight_key = ? AND kind = ?
                  AND status IN ('filing', 'submitted', 'filed', 'sent',
-                                'confirmation_unknown')
+                                'accepted_pending_reference')
                ORDER BY created_at DESC, id DESC LIMIT 1""",
             (flight_key, kind)).fetchone()
         if current:

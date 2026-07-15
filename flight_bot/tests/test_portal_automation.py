@@ -100,8 +100,10 @@ def test_only_official_registry_hosts_are_accepted():
 
 def test_saudia_uses_current_public_complaint_form():
     assert AIRLINES["SV"]["complaint_url"] == (
-        "https://booking-uat.dcloud.saudia.com/forms/contact-form")
+        "https://www.saudia.com/en-SA/forms/contact-form")
     assert _is_official_url(AIRLINES["SV"]["complaint_url"])
+    assert not _is_official_url(
+        "https://booking-uat.dcloud.saudia.com/forms/contact-form")
 
 
 def test_block_page_is_not_mistaken_for_a_form():
@@ -1105,6 +1107,35 @@ def test_confirmation_wait_never_clicks_submit_again(monkeypatch):
         Page(), Page.url, lambda *_args: None, timeout_seconds=20)
     assert result.status == "confirmation_unknown"
     assert clicked == []
+
+
+def test_saudia_backend_acceptance_requires_a_real_reference():
+    accepted = portal_automation._saudia_submission_result({
+        "seen": True, "status": 200,
+        "json": {"data": {"complaintNumber": "CAS-44556677"}},
+    })
+    assert accepted.status == "submitted"
+    assert accepted.reference == "CAS-44556677"
+
+    pending = portal_automation._saudia_submission_result({
+        "seen": True, "status": 200, "json": {"data": {"saved": True}},
+    })
+    assert pending.status == "accepted_pending_reference"
+    assert pending.reference == ""
+
+
+def test_saudia_backend_rejection_and_unconfirmed_timeout_are_failures():
+    rejected = portal_automation._saudia_submission_result({
+        "seen": True, "status": 500, "json": {"data": None},
+    })
+    assert rejected.status == "error"
+
+    result = portal_automation._await_confirmation(
+        object(), "https://www.saudia.com/en-SA/forms/contact-form",
+        lambda *_args: None,
+        payload={"airline_code": "SV"}, timeout_seconds=0,
+        submission_capture={})
+    assert result.status == "error"
 
 
 def test_ai_portal_guardrails_block_final_and_security_actions(monkeypatch):

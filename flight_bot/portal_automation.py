@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import io
+import json
 import os
 import sys
 import threading
@@ -25,7 +26,10 @@ from .airlines import AIRLINES, GACA
 _PROFILE_DIR = Path(__file__).resolve().parent / ".portal-profile"
 _JOBS: dict[str, dict] = {}
 _JOBS_LOCK = threading.Lock()
-_TERMINAL = {"submitted", "confirmation_unknown", "needs_attention", "error"}
+_TERMINAL = {
+    "submitted", "accepted_pending_reference", "confirmation_unknown",
+    "needs_attention", "error",
+}
 _BROWSER_LOCK = threading.Lock()
 _VERIFICATION_HANDLER: Callable[[dict], object] | None = None
 _AI_HANDLER: Callable[[dict], dict | None] | None = None
@@ -137,6 +141,10 @@ def _official_url(payload: dict) -> str:
 
 def _is_official_url(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
+    # Never submit real customer data to an airline's test environment even
+    # when the test host is a subdomain of an otherwise trusted domain.
+    if re.search(r"(^|[.-])(?:uat|preprod|staging|test)(?:[.-]|$)", host):
+        return False
     allowed = {"gaca.gov.sa", "saudia.com", "flynas.com", "flyadeal.com"}
     allowed.update(domain for info in AIRLINES.values()
                    for domain in info.get("domains", []))
@@ -1430,13 +1438,33 @@ def _saudia_complaint_category(payload: dict) -> str:
 
 
 def _prepare_saudia(page, payload: dict, update):
-    update("filling", "Filling Saudia’s official Complaints & Feedback form…")
-    _dismiss_feedback_overlay(page)
-    _select(page, ["service type"], [
-        "travel complaint or compliment", "post.travel"])
+    update("filling", "Filling Saudia’s production Complaints & Feedback form…")
+    service_selected = False
+    for attempt in range(3):
+        _dismiss_feedback_overlay(page)
+        service_selected = _select(page, ["service type"], [
+            "travel complaint or compliment", "post.travel"])
+        if service_selected:
+            break
+        if attempt < 2:
+            update(
+                "opening",
+                "Saudia's production form is still loading. Waiting before "
+                "one safe reload; nothing has been submitted.",
+                _page_screenshot(page))
+            page.wait_for_timeout(5000)
+            page.reload(wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(4500)
+    if not service_selected:
+        raise RuntimeError(
+            "Saudia's production form did not expose its Service Type field "
+            "after three safe loading attempts; nothing was submitted.")
     page.wait_for_timeout(900)
-    _select(page, ["travel complaint or compliment", "request type"], [
-        r"^complaint$"])
+    if not _select(page, ["travel complaint or compliment", "request type"], [
+            r"^complaint$"]):
+        raise RuntimeError(
+            "Saudia's production form did not expose the Complaint option; "
+            "nothing was submitted.")
     _wait_for_any_visible(
         page, page.get_by_label(re.compile("booking reference", re.I)), 6000)
     _fill(page, ["booking reference"], payload["pnr"])
@@ -1445,21 +1473,39 @@ def _prepare_saudia(page, payload: dict, update):
     if _click(page, ["Next"]):
         _wait_for_any_visible(
             page, page.get_by_label(re.compile("first name", re.I)), 7000)
+    lookup_text = _body_text(page)
+    if re.search(r"unable to verify|trip (?:was )?not found|could not (?:find|verify)",
+                 lookup_text, re.I):
+        update(
+            "filling",
+            "Saudia could not retrieve this completed trip automatically. "
+            "Continuing with the same saved booking, ticket, and passenger "
+            "details on the production form.",
+            _page_screenshot(page))
     _fill_common(page, payload)
     category = _saudia_complaint_category(payload)
-    if _select(page, [r"^complaint\s*\*?$"], [
+    if not _select(page, [r"^complaint\s*\*?$"], [
             rf"^{re.escape(category)}$"]):
-        details = page.locator("textarea[name='descriptionInfo']")
-        details_control = _wait_for_any_visible(page, details, 7000)
-        if details_control is not None:
-            details_control.fill(payload["description"])
-        else:
-            _fill(page, ["describe your issue", "let us know",
-                         "complaint details", "what happened", "description",
-                         "message"], payload["description"])
-        _wait_for_any_visible(
-            page, page.locator("button:visible").filter(has_text=re.compile(
-                r"^\s*submit\s*$", re.I)), 7000)
+        raise RuntimeError(
+            f"Saudia's production form did not accept the '{category}' "
+            "complaint category; nothing was submitted.")
+    details = page.locator("textarea[name='descriptionInfo']")
+    details_control = _wait_for_any_visible(page, details, 7000)
+    if details_control is not None:
+        details_control.fill(payload["description"])
+    elif not _fill(page, ["describe your issue", "let us know",
+                          "complaint details", "what happened", "description",
+                          "message"], payload["description"]):
+        raise RuntimeError(
+            "Saudia's production form did not expose the complaint-details "
+            "field; nothing was submitted.")
+    submit = _wait_for_any_visible(
+        page, page.locator("button:visible").filter(has_text=re.compile(
+            r"^\s*submit\s*$", re.I)), 7000)
+    if submit is None:
+        raise RuntimeError(
+            "Saudia's production form did not expose its final Submit button; "
+            "nothing was submitted.")
 
 
 def _prepare_flynas(page, payload: dict, update):
@@ -1688,22 +1734,116 @@ def _extract_reference_from_url(url: str) -> str:
     return match.group(1) if match else ""
 
 
+def _submission_reference(body) -> str:
+    """Extract a public case/reference number from a portal JSON response."""
+    if body in (None, "", False):
+        return ""
+    try:
+        serialized = json.dumps(body, ensure_ascii=False)
+    except (TypeError, ValueError):
+        serialized = str(body)
+    reference = _extract_reference(serialized)
+    if reference:
+        return reference
+    if isinstance(body, dict):
+        for key, value in body.items():
+            if (re.search(r"(?:reference|complaint|request|case).*(?:number|id)|"
+                          r"^(?:reference|case|complaint|request)$", str(key), re.I)
+                    and isinstance(value, (str, int))):
+                candidate = str(value).strip()
+                if re.fullmatch(r"[A-Z0-9][A-Z0-9-]{4,}", candidate, re.I):
+                    return candidate
+            reference = _submission_reference(value)
+            if reference:
+                return reference
+    elif isinstance(body, list):
+        for value in body:
+            reference = _submission_reference(value)
+            if reference:
+                return reference
+    return ""
+
+
+def _saudia_submission_result(capture: dict | None) -> PortalResult | None:
+    """Interpret Saudia's production submission response conservatively."""
+    if not capture or not capture.get("seen"):
+        return None
+    try:
+        status = int(capture.get("status") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    body = capture.get("json")
+    data = body.get("data") if isinstance(body, dict) else None
+    if not 200 <= status < 300 or not data:
+        return PortalResult(
+            "error",
+            "Saudia's production submission service did not accept the "
+            "complaint. It is recorded as failed and may be retried safely.")
+    reference = _submission_reference(body)
+    if reference:
+        return PortalResult(
+            "submitted",
+            "Saudia's production service accepted the complaint and returned "
+            "an airline reference.",
+            reference)
+    return PortalResult(
+        "accepted_pending_reference",
+        "Saudia's production service accepted the complaint, but the required "
+        "airline reference has not arrived yet. FlightDeck will monitor email "
+        "and will not submit a duplicate.")
+
+
+def _capture_saudia_response(response, capture: dict) -> None:
+    """Capture the one production API call that proves Saudia acceptance."""
+    try:
+        if ("/utility/sxa-migration/form-data" not in response.url
+                or str(response.request.method).upper() != "POST"):
+            return
+        capture.update(seen=True, status=response.status, url=response.url)
+        try:
+            capture["json"] = response.json()
+        except Exception:
+            capture["text"] = response.text()[:2000]
+    except Exception:
+        return
+
+
 
 
 def _await_confirmation(page, before_url: str, update,
                         before_text: str = "",
                         payload: dict | None = None,
-                        timeout_seconds: int = 120) -> PortalResult:
+                        timeout_seconds: int = 120,
+                        submission_capture: dict | None = None) -> PortalResult:
     started = time.monotonic()
     deadline = started + timeout_seconds
     waiting_reported = False
     while time.monotonic() < deadline:
+        saudia_result = _saudia_submission_result(submission_capture)
+        if saudia_result:
+            update(
+                saudia_result.status,
+                saudia_result.message,
+                _page_screenshot(page) if not page.is_closed() else None)
+            return saudia_result
         if page.is_closed():
+            if payload and payload.get("airline_code") == "SV":
+                return PortalResult(
+                    "error",
+                    "Saudia's production form closed without a verified "
+                    "acceptance response or airline reference. The attempt is "
+                    "recorded as failed.")
             return PortalResult(
                 "confirmation_unknown",
                 "The form was sent once, but the portal closed before a "
                 "confirmation could be read.")
         if _request_blocked(page):
+            if payload and payload.get("airline_code") == "SV":
+                return PortalResult(
+                    "error",
+                    "Saudia blocked the confirmation page before its production "
+                    "service verified acceptance. The attempt is recorded as "
+                    "failed, not submitted.")
             return PortalResult(
                 "confirmation_unknown",
                 "The form was sent once, but the official site blocked the "
@@ -1716,6 +1856,15 @@ def _await_confirmation(page, before_url: str, update,
             text, re.I)
         new_reference = reference and reference not in before_text
         if new_reference or success or re.search(r"success|thank", page.url, re.I):
+            if (payload and payload.get("airline_code") == "SV"
+                    and not reference):
+                result = PortalResult(
+                    "accepted_pending_reference",
+                    "Saudia displayed a readable acceptance confirmation, but "
+                    "has not returned the required airline reference yet. "
+                    "FlightDeck will monitor email and will not submit a duplicate.")
+                update(result.status, result.message, _page_screenshot(page))
+                return result
             update(
                 "submitted",
                 "The official website confirmed the complaint submission.",
@@ -1735,6 +1884,12 @@ def _await_confirmation(page, before_url: str, update,
                 "confirmation without clicking Submit again.",
                 _page_screenshot(page))
         time.sleep(1)
+    if payload and payload.get("airline_code") == "SV":
+        return PortalResult(
+            "error",
+            "Saudia returned neither a verified production acceptance nor an "
+            "airline reference. The attempt is recorded as failed and may be "
+            "retried safely.")
     return PortalResult(
         "confirmation_unknown",
         "The complaint was sent once, but the official portal did not expose "
@@ -1760,6 +1915,20 @@ def submit_portal_claim(payload: dict, update: Callable[..., None]) -> PortalRes
             update("opening", "Opening the official website in Microsoft Edge…")
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(3500)
+            if (_request_blocked(page)
+                    and payload.get("airline_code") == "SV"):
+                for attempt in range(2):
+                    update(
+                        "opening",
+                        "Saudia's production security page has not released the "
+                        "form yet. Waiting before a safe reload; nothing has "
+                        "been submitted.",
+                        _page_screenshot(page))
+                    page.wait_for_timeout(5000 + attempt * 2000)
+                    page.reload(wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(4500)
+                    if not _request_blocked(page):
+                        break
             if _request_blocked(page):
                 return PortalResult(
                     "needs_attention",
@@ -1807,6 +1976,13 @@ def submit_portal_claim(payload: dict, update: Callable[..., None]) -> PortalRes
                 _page_screenshot(page))
             before_text = _body_text(page)
             before_url = page.url
+            submission_capture = None
+            if code == "SV":
+                submission_capture = {}
+                page.on(
+                    "response",
+                    lambda response: _capture_saudia_response(
+                        response, submission_capture))
             if not _click(page, ["Submit", "Send", "File complaint",
                                  "Submit request", "إرسال", "تقديم"]):
                 if _VERIFICATION_HANDLER:
@@ -1821,9 +1997,11 @@ def submit_portal_claim(payload: dict, update: Callable[..., None]) -> PortalRes
                         _submit_fallback(page)
                 update("verification", "The official site changed its final control. Telegram assistance is active while confirmation is tracked.")
                 return _await_confirmation(
-                    page, before_url, update, before_text, payload)
+                    page, before_url, update, before_text, payload,
+                    submission_capture=submission_capture)
             return _await_confirmation(
-                page, before_url, update, before_text, payload)
+                page, before_url, update, before_text, payload,
+                submission_capture=submission_capture)
         finally:
             context.close()
 
