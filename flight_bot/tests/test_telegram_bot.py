@@ -132,6 +132,10 @@ def test_portal_progress_reports_stage_transitions_with_screenshots(coordinator)
     relay("filling", "The site loaded.", b"loaded-screen")
     relay("filling", "The site loaded.", b"duplicate-screen")
     relay("submitting", "Form checks finished.", b"review-screen")
+    relay("submitted", "Submission confirmed.")
+    deadline = time.time() + 2
+    while (len(api.messages) < 2 or len(api.photos) < 2) and time.time() < deadline:
+        time.sleep(.01)
 
     assert "Doing now: opening the official website" in api.messages[0]["text"]
     assert api.photos[0]["image"] == b"loaded-screen"

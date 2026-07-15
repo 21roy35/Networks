@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import queue
 import re
 import threading
 import time
@@ -189,6 +190,8 @@ class TelegramCoordinator:
     def portal_progress_handler(self):
         """Return a per-job Telegram relay with readable stage transitions."""
         state = {"stage": "", "key": None}
+        deliveries: queue.Queue = queue.Queue()
+        worker_started = threading.Event()
         labels = {
             "queued": "preparing the portal",
             "opening": "opening the official website",
@@ -204,6 +207,21 @@ class TelegramCoordinator:
         terminal = {
             "submitted", "confirmation_unknown", "needs_attention", "error",
         }
+
+        def deliver():
+            while True:
+                status, text, image = deliveries.get()
+                try:
+                    if image:
+                        self.api.send_photo(self.chat_id, image, text)
+                    else:
+                        self.api.send_message(self.chat_id, text)
+                except Exception:
+                    pass
+                finally:
+                    deliveries.task_done()
+                if status in terminal:
+                    return
 
         def relay(status: str, message: str,
                   image: bytes | None = None) -> None:
@@ -226,11 +244,12 @@ class TelegramCoordinator:
             else:
                 heading = f"⏳ Doing now: {current_label}"
             text = f"{heading}\n{message}"[:1000]
-            if image:
-                self.api.send_photo(self.chat_id, image, text)
-            else:
-                self.notify(text)
             state.update(stage=status, key=key)
+            if not worker_started.is_set():
+                worker_started.set()
+                threading.Thread(
+                    target=deliver, name="portal-progress", daemon=True).start()
+            deliveries.put((status, text, image))
 
         return relay
 
