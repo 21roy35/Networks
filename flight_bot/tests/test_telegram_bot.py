@@ -256,6 +256,125 @@ def test_substantive_airline_response_offers_gaca_escalation(coordinator):
     assert buttons[0]["callback_data"].startswith("escalate:")
 
 
+def test_reference_less_resolutions_are_persistently_matched_fifo(coordinator):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Older claim", "submitted",
+        reference="C_7000001", details="The first screen was broken.")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Newer claim", "submitted",
+        reference="C_7000002", details="The second screen was broken.")
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE complaints SET created_at = datetime('now', '-2 days') "
+            "WHERE reference = 'C_7000001'")
+        conn.execute(
+            "UPDATE complaints SET created_at = datetime('now', '-1 day') "
+            "WHERE reference = 'C_7000002'")
+    first_event = db.save_mail_event({
+        "message_id": "<fifo-resolution-1@example>",
+        "subject": "Your complaint resolution",
+        "sender": "customer.relations@saudia.com", "date": datetime.now(),
+        "body": "Our review is complete. Compensation was declined and the case is closed.",
+    })
+    second_event = db.save_mail_event({
+        "message_id": "<fifo-resolution-2@example>",
+        "subject": "Your complaint resolution",
+        "sender": "customer.relations@saudia.com",
+        "date": datetime.now() + timedelta(seconds=1),
+        "body": "Our review is complete. A refund was approved and the case is resolved.",
+    })
+
+    bot.check_complaint_responses()
+    links = db.list_complaint_responses()
+    complaints = {item["reference"]: item for item in db.list_complaints()}
+
+    assert [(item["complaint_id"], item["mail_event_id"], item["match_method"])
+            for item in links] == [
+        (complaints["C_7000001"]["id"], first_event, "fifo_airline"),
+        (complaints["C_7000002"]["id"], second_event, "fifo_airline"),
+    ]
+    assert len(api.messages) == 2
+    assert "oldest unresolved ticket" in api.messages[0]["text"]
+
+    bot.check_complaint_responses()
+    assert len(db.list_complaint_responses()) == 2
+    assert len(api.messages) == 2
+
+
+def test_reference_match_wins_even_when_resolutions_arrive_out_of_order(
+        coordinator):
+    bot, _api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Older claim", "submitted",
+        reference="C_7100001", details="First issue.")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Newer claim", "submitted",
+        reference="C_7100002", details="Second issue.")
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE complaints SET created_at = datetime('now', '-2 days') "
+            "WHERE reference = 'C_7100001'")
+        conn.execute(
+            "UPDATE complaints SET created_at = datetime('now', '-1 day') "
+            "WHERE reference = 'C_7100002'")
+    newer_event = db.save_mail_event({
+        "message_id": "<newer-first@example>",
+        "subject": "Ticket C_7100002 resolved",
+        "sender": "customer.relations@saudia.com", "date": datetime.now(),
+        "body": "C_7100002 was reviewed and closed.",
+    })
+    older_event = db.save_mail_event({
+        "message_id": "<older-second@example>",
+        "subject": "Ticket C_7100001 resolved",
+        "sender": "customer.relations@saudia.com",
+        "date": datetime.now() + timedelta(seconds=1),
+        "body": "C_7100001 was reviewed and closed.",
+    })
+
+    bot.check_complaint_responses()
+    links = db.list_complaint_responses()
+    complaints = {item["reference"]: item for item in db.list_complaints()}
+    assert {(item["complaint_id"], item["mail_event_id"], item["match_method"])
+            for item in links} == {
+        (complaints["C_7100002"]["id"], newer_event, "exact_reference"),
+        (complaints["C_7100001"]["id"], older_event, "exact_reference"),
+    }
+
+
+def test_acknowledgement_does_not_consume_fifo_resolution_queue(coordinator):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Claim", "submitted",
+        reference="C_7200001", details="Broken screen.")
+    db.save_mail_event({
+        "message_id": "<generic-ack@example>", "subject": "We received your message",
+        "sender": "customer.relations@saudia.com", "date": datetime.now(),
+        "body": "Thank you for contacting us. We will review your message.",
+    })
+    resolution_event = db.save_mail_event({
+        "message_id": "<generic-resolution@example>",
+        "subject": "Complaint resolution",
+        "sender": "customer.relations@saudia.com",
+        "date": datetime.now() + timedelta(seconds=1),
+        "body": "The review is complete and compensation was declined. The case is closed.",
+    })
+
+    bot.check_complaint_responses()
+
+    assert len(api.messages) == 1
+    assert db.list_complaint_responses()[0]["mail_event_id"] == resolution_event
+
+
 def test_confirmation_email_recovers_missing_airline_reference(coordinator):
     bot, api = coordinator
     load_demo(log=lambda *_args, **_kwargs: None)

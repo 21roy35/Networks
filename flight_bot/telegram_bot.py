@@ -185,6 +185,7 @@ class TelegramCoordinator:
         self._intakes: dict[str, PendingIntake] = {}
         self._last_mail_scan = 0.0
         self._status_cache: dict[str, tuple[float, bool | None]] = {}
+        self._fifo_response_floor = db.initialize_fifo_response_floor()
 
     @property
     def enabled(self) -> bool:
@@ -993,82 +994,193 @@ class TelegramCoordinator:
             r"resolved|resolution|decision|outcome|approved|declined|denied|"
             r"refund|compensation|reimburse|closed|تعويض|استرداد|مرفوض|إغلاق|حل",
             re.I)
-        for complaint in db.list_complaints():
-            if (complaint.get("kind") != "airline"
-                    or complaint.get("status") not in {
-                        "submitted", "accepted_pending_reference"}):
-                continue
-            if db.event_seen(f"closed:{complaint['flight_key']}"):
+        complaints = [
+            complaint for complaint in db.list_complaints()
+            if (complaint.get("kind") == "airline"
+                and complaint.get("status") in {
+                    "submitted", "accepted_pending_reference"})
+        ]
+
+        # First recover references from acknowledgement messages. Keep the
+        # existing newest-pending-first behavior because a confirmation email
+        # belongs to the complaint that has just been submitted, not to the
+        # oldest ticket awaiting a later resolution.
+        for complaint in complaints:
+            if complaint.get("reference"):
                 continue
             flight = complaint.get("flight_data") or {}
             info = AIRLINES.get(flight.get("airline_code"), {})
             domains = info.get("domains") or []
-            reference = str(complaint.get("reference") or "").casefold()
             created = parse_flight_time(complaint.get("created_at"))
             for event in events:
-                key = f"complaint-response:{complaint['id']}:{event['id']}"
-                if db.event_seen(key):
+                capture_key = f"reference-captured:{event['id']}"
+                if db.event_seen(capture_key):
                     continue
                 event_date = parse_flight_time(event.get("date"))
                 if created and event_date and event_date < created:
                     continue
-                sender = parseaddr(event.get("sender") or "")[1].split("@")[-1].lower()
-                if domains and not any(sender == domain or sender.endswith("." + domain)
-                                       for domain in domains):
+                sender = parseaddr(event.get("sender") or "")[1].split(
+                    "@")[-1].lower()
+                if domains and not any(
+                        sender == domain or sender.endswith("." + domain)
+                        for domain in domains):
                     continue
-                blob = " ".join((event.get("subject") or "", event.get("body") or ""))
-                if not reference:
-                    capture_key = f"reference-captured:{event['id']}"
-                    if db.event_seen(capture_key):
-                        continue
-                    captured_reference = _airline_confirmation_reference(
-                        event.get("subject") or "", event.get("body") or "")
-                    if captured_reference:
-                        db.finish_complaint(
-                            complaint["id"], "submitted", captured_reference)
-                        db.mark_event_seen(capture_key)
-                        complaint["reference"] = captured_reference
-                        reference = captured_reference.casefold()
-                        self.notify(
-                            "Captured the airline complaint reference from its "
-                            f"confirmation email: {captured_reference}.")
-                if reference and reference not in blob.casefold():
+                captured_reference = _airline_confirmation_reference(
+                    event.get("subject") or "", event.get("body") or "")
+                if not captured_reference:
                     continue
-                analysis = None
-                if (reference and self.ai.enabled
-                        and self.ai.settings.get("analyze_responses", True)):
-                    analysis = self.ai.analyze_response(
-                        event.get("subject") or "", event.get("body") or "",
-                        complaint.get("reference") or "",
-                        info.get("name") or flight.get("airline_name") or "Airline")
-                if analysis is not None:
-                    if not analysis.get("substantive"):
-                        continue
-                elif not substantive.search(blob):
-                    continue
-                db.mark_event_seen(key)
-                db.mark_event_seen(f"airline-responded:{complaint['id']}")
-                if analysis:
-                    amounts = "; ".join(analysis.get("amounts_or_deadlines") or [])
-                    amount_line = f"\nAmounts/deadlines: {amounts}" if amounts else ""
-                    response_text = (
-                        f"{analysis.get('summary') or 'A substantive response was received.'}"
-                        f"\nOutcome: {str(analysis.get('outcome') or 'unknown').replace('_', ' ')}"
-                        f"{amount_line}\n{self.ai.name} recommends: "
-                        f"{str(analysis.get('recommendation') or 'review').replace('_', ' ')}"
-                        f" â€” {analysis.get('rationale') or 'Review the airline response.'}")
-                else:
-                    response_text = _clean_excerpt(
-                        event.get("body") or event.get("subject") or "")
+                db.finish_complaint(
+                    complaint["id"], "submitted", captured_reference)
+                db.mark_event_seen(capture_key)
+                complaint["reference"] = captured_reference
                 self.notify(
-                    f"{info.get('name') or 'The airline'} responded to complaint "
-                    f"{complaint.get('reference') or ''}:\n\n{response_text}\n\n"
-                    "Do you want me to escalate this to GACA?",
-                    buttons=_buttons([[
-                        ("Escalate to GACA", f"escalate:{complaint['flight_id']}"),
-                        ("No, close", f"close_case:{complaint['flight_id']}"),
-                    ]]))
+                    "Captured the airline complaint reference from its "
+                    f"confirmation email: {captured_reference}.")
+                break
 
+        def event_is_from_airline(event: dict, complaint: dict) -> tuple[bool, dict]:
+            flight = complaint.get("flight_data") or {}
+            info = AIRLINES.get(flight.get("airline_code"), {})
+            domains = info.get("domains") or []
+            sender = parseaddr(event.get("sender") or "")[1].split(
+                "@")[-1].lower()
+            valid = (not domains or any(
+                sender == domain or sender.endswith("." + domain)
+                for domain in domains))
+            return valid, info
+
+        def response_analysis(event: dict, complaint: dict,
+                              info: dict) -> tuple[bool, dict | None]:
+            blob = " ".join((event.get("subject") or "",
+                             event.get("body") or ""))
+            analysis = None
+            if (self.ai.enabled
+                    and self.ai.settings.get("analyze_responses", True)):
+                flight = complaint.get("flight_data") or {}
+                analysis = self.ai.analyze_response(
+                    event.get("subject") or "", event.get("body") or "",
+                    complaint.get("reference") or "",
+                    info.get("name") or flight.get("airline_name") or "Airline")
+            if analysis is not None:
+                return bool(analysis.get("substantive")), analysis
+            return bool(substantive.search(blob)), None
+
+        def notify_response(complaint: dict, info: dict, event: dict,
+                            analysis: dict | None, match_method: str) -> None:
+            flight = complaint.get("flight_data") or {}
+            if analysis:
+                amounts = "; ".join(analysis.get("amounts_or_deadlines") or [])
+                amount_line = f"\nAmounts/deadlines: {amounts}" if amounts else ""
+                response_text = (
+                    f"{analysis.get('summary') or 'A substantive response was received.'}"
+                    f"\nOutcome: {str(analysis.get('outcome') or 'unknown').replace('_', ' ')}"
+                    f"{amount_line}\n{self.ai.name} recommends: "
+                    f"{str(analysis.get('recommendation') or 'review').replace('_', ' ')}"
+                    f" — {analysis.get('rationale') or 'Review the airline response.'}")
+            else:
+                response_text = _clean_excerpt(
+                    event.get("body") or event.get("subject") or "")
+            if match_method == "exact_reference":
+                matched_by = "Matched by the complaint reference in the email."
+            else:
+                matched_by = (
+                    "The email omitted the reference, so I matched it to the "
+                    "oldest unresolved ticket for this airline, preserving filing order.")
+            self.notify(
+                f"{info.get('name') or 'The airline'} responded to complaint "
+                f"{complaint.get('reference') or ''} for "
+                f"{self._post_flight_label(flight)}.\n{matched_by}\n\n"
+                f"{response_text}\n\n"
+                "Do you want me to escalate this to GACA?",
+                buttons=_buttons([[
+                    ("Escalate to GACA", f"escalate:{complaint['flight_id']}"),
+                    ("No, close", f"close_case:{complaint['flight_id']}"),
+                ]]))
+
+        # Reference-bearing responses are authoritative and always win over
+        # receipt order. Process emails chronologically for deterministic state.
+        ordered_events = sorted(
+            events, key=lambda event: (
+                parse_flight_time(event.get("date")) or datetime.min,
+                int(event.get("id") or 0)))
+        ordered_complaints = sorted(
+            complaints, key=lambda complaint: (
+                parse_flight_time(complaint.get("created_at")) or datetime.min,
+                int(complaint.get("id") or 0)))
+        for event in ordered_events:
+            blob = " ".join((event.get("subject") or "",
+                             event.get("body") or ""))
+            blob_folded = blob.casefold()
+            for complaint in ordered_complaints:
+                if (db.event_seen(f"airline-responded:{complaint['id']}")
+                        or db.event_seen(f"closed:{complaint['flight_key']}")):
+                    continue
+                reference = str(complaint.get("reference") or "").casefold()
+                if not reference or reference not in blob_folded:
+                    continue
+                created = parse_flight_time(complaint.get("created_at"))
+                event_date = parse_flight_time(event.get("date"))
+                if created and event_date and event_date < created:
+                    continue
+                valid_sender, info = event_is_from_airline(event, complaint)
+                if not valid_sender:
+                    continue
+                is_substantive, analysis = response_analysis(
+                    event, complaint, info)
+                if not is_substantive:
+                    continue
+                if not db.link_complaint_response(
+                        complaint["id"], event["id"], "exact_reference"):
+                    break
+                db.mark_event_seen(
+                    f"complaint-response:{complaint['id']}:{event['id']}")
+                db.mark_event_seen(f"airline-responded:{complaint['id']}")
+                notify_response(
+                    complaint, info, event, analysis, "exact_reference")
+                break
+
+        # Some final-resolution templates omit the ticket number. Match those
+        # messages FIFO within the airline, never globally, and persist the
+        # assignment so restarts or rescans cannot reshuffle it.
+        known_references = {
+            str(complaint.get("reference") or "").casefold()
+            for complaint in ordered_complaints if complaint.get("reference")
+        }
+        for event in ordered_events:
+            if int(event.get("id") or 0) <= self._fifo_response_floor:
+                continue
+            blob = " ".join((event.get("subject") or "",
+                             event.get("body") or ""))
+            blob_folded = blob.casefold()
+            if any(reference in blob_folded for reference in known_references):
+                continue
+            # A different explicit case reference must never consume our FIFO.
+            if _airline_confirmation_reference(
+                    event.get("subject") or "", event.get("body") or ""):
+                continue
+            for complaint in ordered_complaints:
+                if (db.event_seen(f"airline-responded:{complaint['id']}")
+                        or db.event_seen(f"closed:{complaint['flight_key']}")):
+                    continue
+                created = parse_flight_time(complaint.get("created_at"))
+                event_date = parse_flight_time(event.get("date"))
+                if created and event_date and event_date < created:
+                    continue
+                valid_sender, info = event_is_from_airline(event, complaint)
+                if not valid_sender:
+                    continue
+                is_substantive, analysis = response_analysis(
+                    event, complaint, info)
+                if not is_substantive:
+                    break
+                if not db.link_complaint_response(
+                        complaint["id"], event["id"], "fifo_airline"):
+                    break
+                db.mark_event_seen(
+                    f"complaint-response:{complaint['id']}:{event['id']}")
+                db.mark_event_seen(f"airline-responded:{complaint['id']}")
+                notify_response(complaint, info, event, analysis, "fifo_airline")
+                break
 
 _COORDINATOR: TelegramCoordinator | None = None
 _COORDINATOR_LOCK = threading.Lock()

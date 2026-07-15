@@ -54,6 +54,20 @@ CREATE TABLE IF NOT EXISTS complaints (
     created_at TEXT DEFAULT (datetime('now', 'localtime'))
 );
 
+CREATE TABLE IF NOT EXISTS complaint_responses (
+    complaint_id INTEGER NOT NULL REFERENCES complaints(id) ON DELETE CASCADE,
+    mail_event_id INTEGER NOT NULL UNIQUE
+        REFERENCES mail_events(id) ON DELETE CASCADE,
+    match_method TEXT NOT NULL,  -- 'exact_reference' | 'fifo_airline'
+    matched_at TEXT DEFAULT (datetime('now', 'localtime')),
+    PRIMARY KEY (complaint_id, mail_event_id)
+);
+
+CREATE TABLE IF NOT EXISTS complaint_response_state (
+    state_key TEXT PRIMARY KEY,
+    state_value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS telegram_surveys (
     flight_key TEXT PRIMARY KEY,
     chat_id TEXT NOT NULL,
@@ -139,6 +153,44 @@ def list_mail_events() -> list[dict]:
         rows = conn.execute(
             "SELECT * FROM mail_events ORDER BY date DESC").fetchall()
     return [dict(row) for row in rows]
+
+
+def link_complaint_response(complaint_id: int, mail_event_id: int,
+                            match_method: str) -> bool:
+    """Persist one resolution email's complaint assignment exactly once."""
+    with connect() as conn:
+        cursor = conn.execute(
+            """INSERT OR IGNORE INTO complaint_responses
+                   (complaint_id, mail_event_id, match_method)
+               VALUES (?, ?, ?)""",
+            (complaint_id, mail_event_id, match_method))
+        return cursor.rowcount == 1
+
+
+def list_complaint_responses() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM complaint_responses
+               ORDER BY matched_at, mail_event_id""").fetchall()
+    return [dict(row) for row in rows]
+
+
+def initialize_fifo_response_floor() -> int:
+    """Snapshot the pre-feature inbox once so old unreferenced mail is ignored."""
+    key = "fifo_resolution_event_floor_v1"
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT state_value FROM complaint_response_state WHERE state_key = ?",
+            (key,)).fetchone()
+        if row:
+            return int(row["state_value"])
+        latest = int(conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM mail_events").fetchone()[0])
+        conn.execute(
+            "INSERT INTO complaint_response_state (state_key, state_value) "
+            "VALUES (?, ?)", (key, str(latest)))
+        return latest
 
 
 def save_email(parsed) -> int:
