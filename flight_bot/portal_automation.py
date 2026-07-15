@@ -1478,24 +1478,189 @@ def _prepare_flyadeal(page, payload: dict, update):
     _fill_common(page, payload)
 
 
+def _gaca_categories(payload: dict) -> tuple[str, str, str]:
+    """Map common incidents onto GACA's current three-level taxonomy."""
+    text = str(payload.get("incident") or "").casefold()
+    mappings = (
+        (r"screen|entertainment|in.?flight entertainment",
+         ("On Board Services", "Entertainment Services", "In- flight Screens")),
+        (r"wi.?fi|internet",
+         ("On Board Services", "Entertainment Services", "Internet")),
+        (r"seat|recline",
+         ("On Board Services", "Seats", "")),
+        (r"meal|food",
+         ("On Board Services", "Meals", "")),
+        (r"cabin crew|flight attendant|crew behavio",
+         ("On Board Services", "Crew Behavior", "")),
+        (r"check.?in",
+         ("Check-in Process", "", "")),
+        (r"boarding|\bgate\b",
+         ("Boarding Services", "", "")),
+        (r"bag|baggage|luggage|suitcase",
+         ("Baggage Services", "", "")),
+        (r"delay|cancel|flight",
+         ("Flights", "", "")),
+    )
+    return next((categories for pattern, categories in mappings
+                 if re.search(pattern, text)),
+                ("Customer Service", "", ""))
+
+
+def _gaca_airline_label(payload: dict) -> str:
+    if payload.get("airline_code") == "SV":
+        return "Saudi Arabian Airlines"
+    return str(payload.get("airline_name") or "").strip()
+
+
+def _gaca_mobile(payload: dict) -> str:
+    phone = re.sub(r"\D", "", str(payload.get("phone") or ""))
+    code = re.sub(r"\D", "", str(payload.get("country_code") or ""))
+    if code and phone.startswith(code):
+        phone = phone[len(code):]
+    return phone.lstrip("0") or phone
+
+
+def _selectize_by_label(page, label_pattern: str, query: str,
+                        choices: list[str]) -> bool:
+    """Choose an item from GACA's Selectize-backed hidden selects."""
+    labels = page.locator("label").all()
+    for label in labels:
+        try:
+            if not label.is_visible() or not re.search(
+                    label_pattern, label.inner_text(), re.I):
+                continue
+            control_id = str(label.get_attribute("for") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", control_id):
+                continue
+            select = page.locator(f"#{control_id}")
+            if select.count() != 1:
+                continue
+            # Some deployments leave the native select visible.
+            if select.is_visible():
+                options = select.locator("option").all_text_contents()
+                match = next((item for item in options if any(
+                    re.search(choice, item, re.I) for choice in choices)), None)
+                if match:
+                    select.select_option(label=match.strip())
+                    return True
+            input_control = page.locator(
+                f"#{control_id} + .selectize-control input")
+            candidate = _wait_for_any_visible(page, input_control, 1500)
+            if candidate is None:
+                continue
+            candidate.fill("")
+            candidate.type(query)
+            page.wait_for_timeout(650)
+            options = page.locator(
+                f"#{control_id} + .selectize-control "
+                ".selectize-dropdown .option")
+            for index in range(options.count()):
+                option = options.nth(index)
+                if not option.is_visible():
+                    continue
+                text = re.sub(r"\s+", " ", option.inner_text()).strip()
+                if any(re.search(choice, text, re.I) for choice in choices):
+                    option.click(force=True)
+                    page.wait_for_timeout(350)
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+_GACA_CITY_NAMES = {
+    "AHB": "Abha", "BAH": "Bahrain", "CAI": "Cairo",
+    "DMM": "Dammam", "DXB": "Dubai", "JED": "Jeddah",
+    "LHR": "London", "MED": "Madinah", "NUM": "Neom",
+    "RUH": "Riyadh",
+}
+
+
 def _prepare_gaca(page, payload: dict, update):
     update("opening", "Opening GACA’s official Airline Complaint service…")
-    _click(page, ["Apply Now", "Apply For Service", "تقديم الآن"])
-    page.wait_for_timeout(1800)
+    if _click(page, [r"^Apply Now$", "Apply For Service", "تقديم الآن"]):
+        _wait_for_any_visible(
+            page, page.get_by_role("button", name=re.compile(r"^Next$", re.I)),
+            7000)
     if _visible(page.locator("input[type='password']")):
         if not _wait_for_human_step(page, update):
             return
         page.wait_for_timeout(1500)
-    update("filling", "Filling the GACA airline-escalation form…")
-    _fill_common(page, payload)
-    _fill(page, ["itinerary", "route"], payload["route"])
-    _fill(page, ["time", "event time"], payload["event_time"])
-    _fill(page, ["air carrier", "airline", "carrier"], payload["airline_name"])
-    _fill(page, ["complaint number with the air carrier",
-                 "airline complaint number", "carrier complaint reference"],
+    update("filling", "GACA step 1 of 4: reviewing the escalation requirements…")
+    if _click(page, [r"^Next$"]):
+        _wait_for_any_visible(
+            page, page.get_by_label(re.compile("first name", re.I)), 7000)
+
+    update("filling", "GACA step 2 of 4: filling personal information…")
+    _fill(page, ["first name"], payload["first_name"])
+    _fill(page, ["middle name"], payload["middle_name"])
+    _fill(page, ["family name", "last name"], payload["last_name"])
+    _fill(page, [r"^email"], payload["email"])
+    _fill(page, [r"^mobile"], _gaca_mobile(payload))
+    _fill(page, ["national id", "passport number"], payload["national_id"])
+    _select(page, ["gender"], [r"^Male$"])
+    country_code = str(payload.get("country_code") or "").strip()
+    country_choices = [re.escape(country_code)] if country_code else []
+    if re.sub(r"\D", "", country_code) == "966":
+        country_choices += [r"Saudi Arabia.*\+966", r"\+966"]
+    _selectize_by_label(
+        page, r"country\s*code", country_code or "Saudi",
+        country_choices or [r"Saudi Arabia"])
+    if _click(page, [r"^Next$"]):
+        _wait_for_any_visible(
+            page, page.get_by_label(re.compile("main category", re.I)), 7000)
+
+    update("filling", "GACA step 3 of 4: selecting the complaint category…")
+    main, sub, detail = _gaca_categories(payload)
+    _select(page, [r"^main category"], [rf"^{re.escape(main)}$"])
+    page.wait_for_timeout(450)
+    if sub:
+        _select(page, [r"^subcategory"], [rf"^{re.escape(sub)}$"])
+        page.wait_for_timeout(450)
+    if detail:
+        _select(page, [r"sub-subcategory"], [rf"^{re.escape(detail)}$"])
+    if _click(page, [r"^Next$"]):
+        _wait_for_any_visible(
+            page, page.get_by_label(re.compile("flight date", re.I)), 7000)
+
+    update("filling", "GACA step 4 of 4: filling flight and complaint details…")
+    origin = str(payload.get("origin") or "").strip().upper()
+    destination = str(payload.get("destination") or "").strip().upper()
+    if origin:
+        _selectize_by_label(
+            page, r"flight\s*from", origin,
+            [rf"\b{re.escape(origin)}\b",
+             re.escape(_GACA_CITY_NAMES.get(origin, origin))])
+    if destination:
+        _selectize_by_label(
+            page, r"flight\s*to", destination,
+            [rf"\b{re.escape(destination)}\b",
+             re.escape(_GACA_CITY_NAMES.get(destination, destination))])
+    airline = _gaca_airline_label(payload)
+    _select(page, [r"^airline"], [rf"^{re.escape(airline)}$"])
+    _fill(page, ["flight date"], payload["flight_date"])
+    _fill(page, ["flight number"], payload["flight_number"])
+    _fill(page, ["flight ticket number", "ticket number"],
+          payload["ticket_number"])
+    _fill(page, ["booking number reference", "booking reference"],
+          payload["pnr"])
+    _fill(page, ["airline complaint number",
+                 "complaint number with the air carrier"],
           payload["airline_reference"])
-    _fill(page, ["date of complaint with the air carrier",
-                 "airline complaint date"], payload["airline_complaint_date"])
+    _fill(page, ["complaint date at the airline",
+                 "date of complaint with the air carrier"],
+          payload["airline_complaint_date"])
+    _fill(page, ["complaint details", "text of the complaint"],
+          payload["description"])
+    attachments = [str(path) for path in payload.get("attachments") or []
+                   if Path(path).is_file()]
+    if attachments:
+        inputs = page.locator("input[type='file']")
+        if inputs.count():
+            inputs.first.set_input_files(attachments)
+    _wait_for_any_visible(
+        page, page.get_by_role("button", name=re.compile(r"^Submit$", re.I)),
+        7000)
 
 
 def _prepare_generic(page, payload: dict, update):

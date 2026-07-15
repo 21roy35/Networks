@@ -892,6 +892,89 @@ def test_saudia_complaint_category_mapping(incident, category):
     }) == category
 
 
+def test_gaca_screen_issue_uses_exact_three_level_category():
+    assert portal_automation._gaca_categories({
+        "incident": "The seat-back entertainment screen was broken."
+    }) == ("On Board Services", "Entertainment Services",
+           "In- flight Screens")
+
+
+def test_gaca_normalizes_saudia_and_local_mobile_number():
+    assert portal_automation._gaca_airline_label({
+        "airline_code": "SV", "airline_name": "Saudia"
+    }) == "Saudi Arabian Airlines"
+    assert portal_automation._gaca_mobile({
+        "country_code": "+966", "phone": "+966599491494"
+    }) == "599491494"
+
+
+def test_gaca_adapter_walks_all_four_steps(monkeypatch):
+    class Page:
+        def locator(self, *_args, **_kwargs):
+            return object()
+
+        def get_by_role(self, *_args, **_kwargs):
+            return object()
+
+        def get_by_label(self, *_args, **_kwargs):
+            return object()
+
+        def wait_for_timeout(self, _milliseconds):
+            return None
+
+    clicks = []
+    fills = []
+    selects = []
+    selectize = []
+    updates = []
+    monkeypatch.setattr(
+        portal_automation, "_click",
+        lambda _page, names: clicks.append(names) or True)
+    monkeypatch.setattr(
+        portal_automation, "_wait_for_any_visible",
+        lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(portal_automation, "_visible", lambda _locator: False)
+    monkeypatch.setattr(
+        portal_automation, "_fill",
+        lambda _page, labels, value: fills.append((labels, value)) or True)
+    monkeypatch.setattr(
+        portal_automation, "_select",
+        lambda _page, labels, choices, **_kwargs:
+        selects.append((labels, choices)) or True)
+    monkeypatch.setattr(
+        portal_automation, "_selectize_by_label",
+        lambda _page, label, query, choices:
+        selectize.append((label, query, choices)) or True)
+
+    payload = {
+        "incident": "The seat-back entertainment screen was broken.",
+        "first_name": "Mansour", "middle_name": "Albu",
+        "last_name": "Asais", "email": "m@example.com",
+        "phone": "599491494", "country_code": "+966",
+        "national_id": "1108337526", "origin": "RUH",
+        "destination": "AHB", "airline_code": "SV",
+        "airline_name": "Saudia", "flight_date": "2026-07-05",
+        "flight_number": "SV1671", "ticket_number": "065-2200278935",
+        "pnr": "7V5F9V", "airline_reference": "CAS-123456",
+        "airline_complaint_date": "2026-07-15",
+        "description": "The screen was broken. " * 10,
+        "attachments": [],
+    }
+    portal_automation._prepare_gaca(
+        Page(), payload, lambda stage, message, *_args:
+        updates.append((stage, message)))
+
+    assert len(clicks) == 4  # Apply Now, then Next through steps 1-3.
+    assert any("main category" in labels[0] for labels, _choices in selects)
+    assert any("sub-subcategory" in labels[0] for labels, _choices in selects)
+    assert any(labels == ["airline complaint number",
+                          "complaint number with the air carrier"]
+               and value == "CAS-123456" for labels, value in fills)
+    assert [item[0] for item in selectize] == [
+        r"country\s*code", r"flight\s*from", r"flight\s*to"]
+    assert any("step 4 of 4" in message for _stage, message in updates)
+
+
 def test_claude_baggage_category_maps_to_saudia_quality_option():
     assert portal_automation._saudia_complaint_category({
         "incident": "My property was damaged during handling.",
