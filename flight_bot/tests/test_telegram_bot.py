@@ -315,6 +315,83 @@ def test_saudia_ticket_subject_recovers_missing_reference(coordinator):
     assert any("C_2771234" in item["text"] for item in api.messages)
 
 
+def test_telegram_pasted_sms_captures_only_reference_and_keeps_original_date(
+        coordinator, monkeypatch):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Screen complaint",
+        "accepted_pending_reference", details="The screen was broken.")
+    original = datetime.now() - timedelta(days=8)
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE complaints SET created_at = ? WHERE flight_key = ?",
+            (original.strftime("%Y-%m-%d %H:%M:%S"), flight["flight_key"]))
+
+    bot.handle_update({"message": {
+        "message_id": 301, "chat": {"id": 42},
+        "text": ("SAUDIA: We received your comment. Your reference is "
+                 "C_2774567. Keep this SMS for your records."),
+    }})
+
+    complaint = db.complaints_for_flight(flight["flight_key"])[0]
+    assert complaint["status"] == "submitted"
+    assert complaint["reference"] == "C_2774567"
+    assert complaint["details"] == "The screen was broken."
+    assert complaint["created_at"] == original.strftime("%Y-%m-%d %H:%M:%S")
+    assert "Keep this SMS" not in str(complaint)
+    assert any("stored only the reference" in item["text"] for item in api.messages)
+
+    launched = []
+    monkeypatch.setattr(
+        bot, "_launch_gaca",
+        lambda selected, incident_suffix="", automatic=False:
+        launched.append((selected["id"], incident_suffix, automatic)) or True)
+    bot.auto_escalate_due_complaints(now=datetime.now())
+    assert launched and launched[0][0] == flight["id"]
+    assert launched[0][2] is True
+
+
+def test_bot_asks_once_for_pending_saudia_sms_reference(coordinator):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Screen complaint",
+        "accepted_pending_reference", details="The screen was broken.")
+
+    bot.ask_for_pending_references()
+    bot.ask_for_pending_references()
+
+    assert len(api.messages) == 1
+    assert api.messages[0]["force_reply"] is True
+    assert "paste its text" in api.messages[0]["text"]
+    assert "C_ reference" in api.messages[0]["text"]
+
+
+def test_plain_ticket_number_is_not_mistaken_for_sms_reference(coordinator):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Screen complaint",
+        "accepted_pending_reference", details="The screen was broken.")
+
+    bot.handle_update({"message": {
+        "message_id": 302, "chat": {"id": 42},
+        "text": "My flight ticket number is 0652200120916.",
+    }})
+
+    complaint = db.complaints_for_flight(flight["flight_key"])[0]
+    assert complaint["status"] == "accepted_pending_reference"
+    assert complaint["reference"] is None
+    assert api.messages[-1]["text"].startswith("Reply to a post-flight")
+
+
 def test_e_ticket_subject_is_not_used_as_complaint_reference(coordinator):
     bot, api = coordinator
     load_demo(log=lambda *_args, **_kwargs: None)

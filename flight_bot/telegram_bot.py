@@ -62,6 +62,13 @@ def _airline_confirmation_reference(subject: str, body: str) -> str:
     return match.group(1).upper() if match else ""
 
 
+def _telegram_sms_reference(value: str) -> str:
+    """Return only a Saudia-style C_ reference from a pasted SMS."""
+    match = re.search(r"(?<![A-Z0-9])C[\s_-]*(\d{6,})(?!\d)",
+                      value or "", re.I)
+    return f"C_{match.group(1)}" if match else ""
+
+
 class TelegramAPI:
     def __init__(self, token: str, session=None):
         self.token = token
@@ -321,6 +328,7 @@ class TelegramCoordinator:
                 self._maybe_scan_mailbox()
                 self.send_due_surveys()
                 self.check_complaint_responses()
+                self.ask_for_pending_references()
                 self.auto_escalate_due_complaints()
             except Exception:
                 pass
@@ -395,6 +403,12 @@ class TelegramCoordinator:
             self.notify("Cancelled the pending complaint intake.")
             return
 
+        pasted = (message.get("text") or message.get("caption") or "").strip()
+        reference = _telegram_sms_reference(pasted)
+        if reference and self._capture_telegram_reference(
+                reference, pasted, message):
+            return
+
         reply_id = (message.get("reply_to_message") or {}).get("message_id")
         survey = db.pending_survey(self.chat_id, reply_id)
         if not survey:
@@ -411,6 +425,99 @@ class TelegramCoordinator:
             self.notify("Glad the flight went well ✈️")
             return
         self._collect_issue(survey, message)
+
+    @staticmethod
+    def _complaint_flight_numbers(complaint: dict) -> set[str]:
+        flight = complaint.get("flight_data") or {}
+        values = list(flight.get("flight_numbers") or [])
+        if flight.get("flight_number"):
+            values.append(flight["flight_number"])
+        return {re.sub(r"\s+", "", str(value)).upper()
+                for value in values if value}
+
+    def _capture_telegram_reference(self, reference: str, pasted: str,
+                                    message: dict) -> bool:
+        complaints = db.list_complaints()
+        existing = next((item for item in complaints
+                         if str(item.get("reference") or "").casefold()
+                         == reference.casefold()), None)
+        if existing:
+            self.notify(
+                f"Reference {reference} is already saved. No duplicate change was made.")
+            return True
+        pending = [item for item in complaints
+                   if item.get("kind") == "airline"
+                   and item.get("status") == "accepted_pending_reference"
+                   and not item.get("reference")
+                   and (item.get("flight_data") or {}).get("airline_code") == "SV"]
+        if not pending:
+            self.notify(
+                f"I found reference {reference}, but there is no pending Saudia "
+                "complaint to attach it to. Nothing was changed.")
+            return True
+        context = " ".join((
+            pasted,
+            str((message.get("reply_to_message") or {}).get("text") or ""),
+        ))
+        mentioned = {
+            re.sub(r"\s+", "", value).upper()
+            for value in re.findall(r"\bSV\s*\d{3,4}\b", context, re.I)
+        }
+        if mentioned:
+            matched = [item for item in pending
+                       if self._complaint_flight_numbers(item) & mentioned]
+            if len(matched) == 1:
+                pending = matched
+        if len(pending) != 1:
+            self.notify(
+                f"I extracted {reference}, but more than one Saudia complaint "
+                "is waiting for a reference. Reply with the SMS plus the flight "
+                "number, for example SV1671. Nothing was changed.",
+                force_reply=True)
+            return True
+        complaint = pending[0]
+        created_at = complaint.get("created_at") or ""
+        db.finish_complaint(complaint["id"], "submitted", reference)
+        db.mark_event_seen(f"reference-captured:telegram:{reference.casefold()}")
+        flight = complaint.get("flight_data") or {}
+        label = next(iter(self._complaint_flight_numbers(complaint)), "Saudia flight")
+        try:
+            delay_days = max(1, int(self.settings.get(
+                "gaca_auto_escalate_days", 7)))
+        except (TypeError, ValueError):
+            delay_days = 7
+        created = parse_flight_time(created_at)
+        due = created + timedelta(days=delay_days) if created else None
+        due_text = due.strftime("%Y-%m-%d %H:%M") if due else "the saved due date"
+        self.notify(
+            f"Saved {reference} as the airline complaint reference for {label}. "
+            "I stored only the reference, not the pasted SMS. The GACA "
+            f"seven-day countdown still starts from the original submission "
+            f"time ({created_at}); automatic escalation is due {due_text} if "
+            "Saudia does not provide a substantive response.")
+        return True
+
+    def ask_for_pending_references(self):
+        """Ask once for each accepted Saudia case whose SMS ref is missing."""
+        for complaint in db.list_complaints():
+            if (complaint.get("kind") != "airline"
+                    or complaint.get("status") != "accepted_pending_reference"
+                    or complaint.get("reference")
+                    or (complaint.get("flight_data") or {}).get("airline_code") != "SV"):
+                continue
+            key = f"telegram-reference-requested:{complaint['id']}"
+            if db.event_seen(key):
+                continue
+            label = next(iter(
+                self._complaint_flight_numbers(complaint)), "your Saudia flight")
+            self.notify(
+                f"Saudia accepted the complaint for {label}, but its reference "
+                "did not arrive by email. Please reply with the SMS or paste its "
+                "text here. I will extract and store only the C_ reference; the "
+                "seven-day GACA countdown remains based on the original "
+                "submission time.",
+                force_reply=True)
+            db.mark_event_seen(key)
 
     def _handle_callback(self, callback: dict):
         data = callback.get("data") or ""
@@ -590,11 +697,7 @@ class TelegramCoordinator:
                 db.finish_complaint(
                     complaint_id, "accepted_pending_reference")
                 db.update_survey_status(flight_key, "needs_attention")
-                self.notify(
-                    "Saudia's production service accepted the complaint, but "
-                    "the airline reference has not arrived yet. This is not "
-                    "marked submitted and cannot be escalated to GACA. I will "
-                    "scan email for the reference and will not file a duplicate.")
+                self.ask_for_pending_references()
             elif result.status == "confirmation_unknown":
                 db.finish_complaint(complaint_id, "failed")
                 db.update_survey_status(flight_key, "needs_attention")

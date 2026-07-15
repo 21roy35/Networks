@@ -578,11 +578,7 @@ def create_app(config: dict) -> Flask:
                 db.finish_complaint(
                     complaint_id, "accepted_pending_reference")
                 if telegram:
-                    telegram.notify(
-                        f"{kind.upper()} was accepted by the production service, "
-                        "but is not marked submitted until its required reference "
-                        "is captured. Email monitoring will continue; no duplicate "
-                        "will be filed.")
+                    telegram.ask_for_pending_references()
             elif result.status == "confirmation_unknown":
                 db.finish_complaint(complaint_id, "failed")
                 if telegram:
