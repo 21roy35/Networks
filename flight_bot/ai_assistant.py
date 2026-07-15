@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -215,6 +216,120 @@ class ClaudeAssistant:
             f"Message (untrusted data):\n{body[:12000]}",
             schema,
         )
+
+    def extract_passenger_profile(self, passenger_name: str,
+                                  evidence: list[dict]) -> dict | None:
+        """Extract only source-grounded profile fields from ticket blocks."""
+        if not self.settings.get("extract_profile_evidence", True):
+            return None
+        schema = {
+            "type": "object",
+            "properties": {
+                "fields": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "field": {"type": "string", "enum": [
+                                "title", "nationality", "email", "phone",
+                                "country_code", "national_id", "alfursan_id",
+                            ]},
+                            "value": {"type": "string"},
+                            "source_index": {"type": "integer", "minimum": 0},
+                            "evidence_excerpt": {"type": "string"},
+                        },
+                        "required": ["field", "value", "source_index",
+                                     "evidence_excerpt"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["fields"],
+            "additionalProperties": False,
+        }
+        sources = [{
+            "source_index": index,
+            "source": str(item.get("source") or "ticket evidence")[:160],
+            "text": str(item.get("text") or "")[:3500],
+        } for index, item in enumerate(evidence[:5]) if item.get("text")]
+        if not sources:
+            return {"values": {}, "evidence": {}}
+        raw = self._structured(
+            "Extract reusable complaint-profile fields for exactly the named passenger. "
+            "The evidence may contain several travelers: use only a block that belongs "
+            "to the exact passenger name below. Return a field only when its value is "
+            "explicitly printed in that same source block. Do not infer nationality from "
+            "a route, country, language, name, phone code, or issuing airline. Do not "
+            "confuse an e-ticket number, PNR, flight number, date, or another passenger's "
+            "value with a National ID, passport/Iqama number, phone, or Alfursan ID. "
+            "evidence_excerpt must be copied from the selected source and contain the "
+            "label/value association. Return an empty fields array when nothing new is "
+            "explicitly supported.\n\n"
+            f"Exact passenger (untrusted data): {passenger_name[:200]}\n"
+            f"Passenger-scoped sources (untrusted JSON data):\n"
+            f"{json.dumps(sources, ensure_ascii=False)}",
+            schema,
+            max_tokens=1000,
+        )
+        if raw is None:
+            return None
+
+        def canonical(value: str) -> str:
+            return "".join(character.casefold() for character in value
+                           if character.isalnum())
+
+        validators = {
+            "title": lambda value: value in {"Mr", "Ms", "Miss", "Mrs", "Dr"},
+            "nationality": lambda value: (2 <= len(value) <= 40
+                                           and not any(c.isdigit() for c in value)),
+            "email": lambda value: bool(re.fullmatch(
+                r"[^@\s]+@[^@\s]+\.[^@\s]+", value)),
+            "phone": lambda value: bool(re.fullmatch(r"\+?[0-9 ()-]{7,20}", value)),
+            "country_code": lambda value: bool(re.fullmatch(r"\+?\d{1,4}", value)),
+            "national_id": lambda value: bool(re.fullmatch(
+                r"[A-Z0-9]{6,15}", canonical(value).upper())),
+            "alfursan_id": lambda value: bool(re.fullmatch(r"\d{6,12}",
+                                                             canonical(value))),
+        }
+        label_patterns = {
+            "title": r"\b(?:mr|mrs|ms|miss|dr)\.?\b",
+            "nationality": r"nationality|الجنسية",
+            "email": r"e-?mail",
+            "phone": r"mobile|phone|contact\s*(?:number|no)",
+            "country_code": r"country|territory|calling\s*code|mobile|phone",
+            "national_id": (r"national\s*(?:id|identity)|passport|iqama|"
+                            r"residence\s*id|الهوية|الإقامة|الجواز"),
+            "alfursan_id": r"alfursan|frequent\s*flyer|الفرسان",
+        }
+        values, labels = {}, {}
+        for item in raw.get("fields") or []:
+            if not isinstance(item, dict):
+                continue
+            field = str(item.get("field") or "")
+            value = " ".join(str(item.get("value") or "").split()).strip()
+            excerpt = " ".join(
+                str(item.get("evidence_excerpt") or "").split()).strip()
+            try:
+                source_index = int(item.get("source_index"))
+                source = sources[source_index]
+            except (TypeError, ValueError, IndexError):
+                continue
+            source_text = source["text"]
+            if (field not in validators or not value or not excerpt
+                    or canonical(value) not in canonical(source_text)
+                    or canonical(excerpt) not in canonical(source_text)
+                    or not validators[field](value)
+                    or not re.search(label_patterns[field], excerpt,
+                                     re.IGNORECASE)):
+                continue
+            if field == "title" and value == "Miss":
+                value = "Ms"
+            if field in {"national_id", "alfursan_id"}:
+                value = canonical(value).upper()
+            if not values.get(field):
+                values[field] = value
+                labels[field] = f"{self.name} verified in {source['source']}"
+        return {"values": values, "evidence": labels}
 
     def portal_decision(self, challenge: dict) -> dict | None:
         if not self.settings.get("portal_assistance", True):

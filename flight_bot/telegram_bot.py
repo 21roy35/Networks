@@ -398,6 +398,9 @@ class TelegramCoordinator:
                              f"but its last request failed: {self.ai.last_error}.")
             elif self.ai.enabled:
                 ai_status = f" {self.ai.name} AI is configured on {self.ai.model}."
+                if self.ai.settings.get("extract_profile_evidence", True):
+                    ai_status += (" Guarded ticket/PDF review is enabled for "
+                                  "missing passenger-profile fields.")
             else:
                 ai_status = " AI assistance is off."
             captcha_status = (" 2Captcha is configured with Telegram fallback."
@@ -740,10 +743,14 @@ class TelegramCoordinator:
                         field.replace("_", " ") for field in found))
                     found_text = (f" I already found these labeled fields in "
                                   f"matching ticket evidence: {labels}.")
+                ai_text = (f" {self.ai.name} will check the remaining scoped "
+                           "ticket/PDF evidence when you open the profile."
+                           if self.ai.enabled and self.ai.settings.get(
+                               "extract_profile_evidence", True) else "")
                 self.notify(
                     f"This booking belongs to {passenger}, not the account "
                     "owner. I stopped before submission so I do not reuse "
-                    "Mansour's National ID or AlFursan number." + found_text
+                    "Mansour's National ID or AlFursan number." + found_text + ai_text
                     + " Save this "
                     "passenger's identity once, then tap Try filing again.",
                     buttons=self._passenger_profile_buttons(payload, flight))

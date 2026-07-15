@@ -81,6 +81,7 @@ DEFAULTS = {
         "analyze_incidents": True,
         "analyze_attachments": True,
         "analyze_responses": True,
+        "extract_profile_evidence": True,
         "portal_assistance": True,
         "max_portal_attempts": 3,
     },

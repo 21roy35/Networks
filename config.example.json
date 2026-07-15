@@ -62,6 +62,7 @@
     "analyze_incidents": true,
     "analyze_attachments": true,
     "analyze_responses": true,
+    "extract_profile_evidence": true,
     "portal_assistance": true,
     "max_portal_attempts": 3
   }

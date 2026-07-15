@@ -67,6 +67,14 @@ CREATE TABLE IF NOT EXISTS telegram_events (
     event_key TEXT PRIMARY KEY,
     created_at TEXT DEFAULT (datetime('now', 'localtime'))
 );
+
+CREATE TABLE IF NOT EXISTS ai_profile_cache (
+    passenger_key TEXT PRIMARY KEY,
+    evidence_hash TEXT NOT NULL,
+    model TEXT NOT NULL,
+    result TEXT NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now', 'localtime'))
+);
 """
 
 
@@ -193,7 +201,7 @@ def identity_suggestions(passenger_name: str) -> dict:
     """
     key = passenger_profile_key(passenger_name)
     if not key:
-        return {"values": {}, "evidence": {}}
+        return {"values": {}, "evidence": {}, "conflicts": []}
     with connect() as conn:
         rows = conn.execute(
             "SELECT parsed, subject FROM emails ORDER BY date DESC, id DESC"
@@ -236,22 +244,101 @@ def identity_suggestions(passenger_name: str) -> dict:
                 source = f"Email: {subject[:100]}"
             candidates.setdefault(field, []).append((value, source))
 
-    values, evidence = {}, {}
+    values, evidence, conflicts = {}, {}, set()
     for id_type in ("national_id", "iqama", "passport"):
         occurrences = national_candidates.get(id_type) or []
+        if not occurrences:
+            continue
         distinct = {value.casefold(): value for value, _source in occurrences}
         if len(distinct) == 1:
             values["national_id"], evidence["national_id"] = occurrences[0]
-            break
+        else:
+            conflicts.add("national_id")
+        break
     immutable = {"alfursan_id", "title", "nationality"}
     for field, occurrences in candidates.items():
         distinct = {value.casefold(): value for value, _source in occurrences}
         if field in immutable and len(distinct) != 1:
+            conflicts.add(field)
             continue
         value, source = occurrences[0]
         values[field] = value
         evidence[field] = source
-    return {"values": values, "evidence": evidence}
+    return {"values": values, "evidence": evidence,
+            "conflicts": sorted(conflicts)}
+
+
+def identity_evidence(passenger_name: str, limit: int = 8) -> list[dict]:
+    """Load bounded, exact-passenger ticket blocks for Claude extraction."""
+    from .parser import passenger_evidence_blocks
+
+    key = passenger_profile_key(passenger_name)
+    if not key:
+        return []
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT subject, parsed, body FROM emails
+               ORDER BY date DESC, id DESC""").fetchall()
+    evidence, seen = [], set()
+    for row in rows:
+        parsed = json.loads(row["parsed"] or "{}")
+        profiles = parsed.get("passenger_profiles") or {}
+        profile_match = key in profiles or any(
+            isinstance(profile, dict) and passenger_profile_key(
+                profile.get("booking_name") or profile.get("full_name") or "") == key
+            for profile in profiles.values())
+        body = str(row["body"] or "")
+        if not profile_match and passenger_name.casefold() not in body.casefold():
+            continue
+        for block in passenger_evidence_blocks(body, passenger_name, limit=limit):
+            text = " ".join(str(block.get("text") or "").split())[:6000]
+            fingerprint = text.casefold()
+            if not text or fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            source = str(block.get("source") or "").strip()
+            if not source or source == "linked ticket or booking email":
+                source = f"Email: {str(row['subject'] or 'ticket or booking email')[:100]}"
+            evidence.append({"source": source, "text": text})
+            if len(evidence) >= limit:
+                return evidence
+    return evidence
+
+
+def get_ai_profile_cache(passenger_name: str, evidence_hash: str,
+                         model: str) -> dict | None:
+    key = passenger_profile_key(passenger_name)
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT result FROM ai_profile_cache
+               WHERE passenger_key = ? AND evidence_hash = ? AND model = ?""",
+            (key, evidence_hash, model)).fetchone()
+    if not row:
+        return None
+    try:
+        result = json.loads(row["result"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def save_ai_profile_cache(passenger_name: str, evidence_hash: str,
+                          model: str, result: dict) -> None:
+    key = passenger_profile_key(passenger_name)
+    if not key:
+        return
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO ai_profile_cache
+                   (passenger_key, evidence_hash, model, result, updated_at)
+               VALUES (?, ?, ?, ?, datetime('now', 'localtime'))
+               ON CONFLICT(passenger_key) DO UPDATE SET
+                   evidence_hash=excluded.evidence_hash,
+                   model=excluded.model,
+                   result=excluded.result,
+                   updated_at=excluded.updated_at""",
+            (key, evidence_hash, model,
+             json.dumps(result, ensure_ascii=False)))
 
 
 def email_flight_map() -> dict[int, dict]:
@@ -557,3 +644,4 @@ def reset():
         conn.execute("DELETE FROM complaints")
         conn.execute("DELETE FROM telegram_surveys")
         conn.execute("DELETE FROM telegram_events")
+        conn.execute("DELETE FROM ai_profile_cache")

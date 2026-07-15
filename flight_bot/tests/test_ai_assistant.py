@@ -108,3 +108,44 @@ def test_low_credit_error_is_actionable_without_copying_api_response():
     assert assistant.analyze_response(
         "subject", "body", "CASE-1", "Airline") is None
     assert len(session.calls) == 1
+
+
+def test_profile_extraction_accepts_only_labeled_verbatim_evidence():
+    result = {"fields": [
+        {
+            "field": "national_id", "value": "1122334455",
+            "source_index": 0,
+            "evidence_excerpt": "National ID: 1122334455",
+        },
+        {
+            "field": "alfursan_id", "value": "0652200741431",
+            "source_index": 0,
+            "evidence_excerpt": "e-Ticket: 0652200741431",
+        },
+        {
+            "field": "nationality", "value": "Saudi",
+            "source_index": 0,
+            "evidence_excerpt": "Flight from Saudi Arabia",
+        },
+        {
+            "field": "title", "value": "Miss", "source_index": 0,
+            "evidence_excerpt": "Miss Lujain Alasais",
+        },
+    ]}
+    session = FakeSession({
+        "content": [{"type": "text", "text": json.dumps(result)}],
+    })
+    assistant = ClaudeAssistant(enabled_config(), session=session)
+    actual = assistant.extract_passenger_profile("Lujain Alasais", [{
+        "source": "PDF attachment: ticket.pdf",
+        "text": ("Miss Lujain Alasais e-Ticket: 0652200741431 "
+                 "National ID: 1122334455 Flight from Saudi Arabia"),
+    }])
+
+    assert actual["values"] == {
+        "national_id": "1122334455", "title": "Ms"}
+    assert actual["evidence"]["national_id"].startswith(
+        "Ghala-200 verified in PDF attachment")
+    prompt = session.calls[0][1]["json"]["messages"][0]["content"][-1]["text"]
+    assert "exactly the named passenger" in prompt
+    assert "Lujain Alasais" in prompt

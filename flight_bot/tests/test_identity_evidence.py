@@ -45,7 +45,29 @@ def test_conflicting_sensitive_ticket_values_are_not_suggested(tmp_path,
 
     suggestions = db.identity_suggestions("Muhannad Alqahtani")
     assert "alfursan_id" not in suggestions["values"]
+    assert suggestions["conflicts"] == ["alfursan_id"]
     assert suggestions["values"]["title"] == "Mr"
+
+
+def test_passenger_ai_evidence_and_cache_are_scoped_and_invalidated(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "ai-evidence.db")
+    db.init_db()
+    db.save_email(_ticket("<identity-ai@example>", "30681234"))
+
+    evidence = db.identity_evidence("Muhannad Alqahtani")
+    assert evidence
+    assert "Muhannad Alqahtani" in evidence[0]["text"]
+    assert "Lujain Alasais" not in evidence[0]["text"]
+
+    db.save_ai_profile_cache(
+        "Muhannad Alqahtani", "hash-one", "claude-test",
+        {"values": {"nationality": "Saudi"}, "evidence": {}})
+    assert db.get_ai_profile_cache(
+        "Muhannad Alqahtani", "hash-one", "claude-test")["values"] == {
+            "nationality": "Saudi"}
+    assert db.get_ai_profile_cache(
+        "Muhannad Alqahtani", "changed-hash", "claude-test") is None
 
 
 def test_pdf_attachment_text_is_added_to_the_parseable_email(monkeypatch):

@@ -194,6 +194,66 @@ def test_family_profile_is_prefilled_from_matching_ticket_evidence(client):
     assert b'<option value="Mr" selected' in page.data
 
 
+def test_anthropic_profile_fallback_is_on_demand_grounded_and_cached(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "ai-profile.db")
+    calls = []
+
+    class Assistant:
+        enabled = True
+        name = "Ghala"
+        model = "claude-test"
+        last_error = ""
+        settings = {
+            "extract_profile_evidence": True,
+            "max_portal_attempts": 3,
+        }
+
+        def __init__(self, _config):
+            pass
+
+        def portal_decision(self, _challenge):
+            return None
+
+        def extract_passenger_profile(self, passenger, evidence):
+            calls.append((passenger, evidence))
+            return {
+                "values": {"nationality": "Saudi"},
+                "evidence": {"nationality": "Ghala verified in ticket"},
+            }
+
+    monkeypatch.setattr(webapp, "ClaudeAssistant", Assistant)
+    config = deepcopy(DEFAULTS)
+    config["ai"].update({"enabled": True, "api_key": "test-key"})
+    application = webapp.create_app(config)
+    application.config.update(TESTING=True)
+    parsed = parse_email(
+        "<ai-family-profile@example>", "Your Saudia e-ticket SV1650",
+        "noreply@saudia.com", datetime(2026, 7, 15, 12, 0),
+        """Booking reference: ABC123
+        Flight SV1650 - JED to AHB
+        Mr Muhannad Alqahtani e-Ticket: 065-2200741431
+        Citizenship: Saudi
+        """)
+    db.save_email(parsed)
+    client = application.test_client()
+
+    page = client.get(
+        "/settings/profile?passenger=Muhannad%20Alqahtani&next=/")
+    assert b"Ghala is checking" in page.data
+    first = client.post("/settings/profile/ai-suggestions", data={
+        "passenger": "Muhannad Alqahtani", "fields": "nationality",
+    })
+    second = client.post("/settings/profile/ai-suggestions", data={
+        "passenger": "Muhannad Alqahtani", "fields": "nationality",
+    })
+    assert first.json["values"] == {"nationality": "Saudi"}
+    assert first.json["cached"] is False
+    assert second.json["cached"] is True
+    assert len(calls) == 1
+    assert "Lujain" not in calls[0][1][0]["text"]
+
+
 def test_scan_without_credentials_gives_actionable_message(client):
     response = client.post("/scan", follow_redirects=True)
     assert response.status_code == 200

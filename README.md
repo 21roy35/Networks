@@ -69,6 +69,8 @@ Set `FLIGHTBOT_ANTHROPIC_API_KEY` on the server to enable the guarded Anthropic 
 
 Ghala-200 receives only the complaint facts needed for its task. For portal recovery it may receive the current official-page screenshot, visible control metadata, and complaint payload. It may fill exact values already present in that payload or select safe navigation such as **Next**, **Continue**, or **Retry**. Code-level guardrails prevent it from supplying passwords, OTPs, CAPTCHA answers, security information, declarations, payment details, invented values, or final submission actions. Those protected steps are relayed to Telegram with a screenshot.
 
+For incomplete passenger profiles, Ghala-200 reviews only the matching passenger's bounded ticket or PDF blocks after deterministic extraction runs. A proposed field is accepted only when its value and the correct field label both appear in the cited source block. Results are cached by passenger, evidence hash, and model, and conflicting deterministic identifiers remain blocked.
+
 If Anthropic is unavailable or returns an unusable answer, FlightDeck continues with its deterministic form mappings and Telegram assistance. AI output can be wrong and is not legal advice. Anthropic API usage may incur model charges.
 
 ## Automatic CAPTCHA solving

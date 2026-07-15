@@ -1,5 +1,7 @@
 """Local Flask interface for inbox-derived flights and passenger claims."""
 
+import hashlib
+import json
 import math
 import re
 import secrets
@@ -30,6 +32,7 @@ from .web_access import verify_web_token
 _ACTIVE_PHASES = {"starting", "connecting", "searching", "fetching", "linking"}
 _scan_progress: dict = {}
 _scan_lock = threading.Lock()
+_ai_profile_lock = threading.Lock()
 
 _TEMPLATES = Path(__file__).resolve().parent / "templates"
 _REQUIRED_TEMPLATES = (
@@ -477,7 +480,71 @@ def create_app(config: dict) -> Flask:
         return render_template(
             "profile.html", profile=profile, next_url=next_url,
             passenger_name=passenger_name, family_mode=family_mode,
-            suggested_evidence=suggested_evidence)
+            suggested_evidence=suggested_evidence,
+            profile_lookup_name=(passenger_name or profile.get("full_name") or ""),
+            ai_profile_enabled=bool(
+                assistant.enabled and
+                assistant.settings.get("extract_profile_evidence", True)),
+            ai_profile_name=assistant.name)
+
+    @app.route("/settings/profile/ai-suggestions", methods=["POST"])
+    def ai_profile_suggestions():
+        passenger_name = request.form.get("passenger", "").strip()
+        allowed_fields = {
+            "title", "nationality", "email", "phone", "country_code",
+            "national_id", "alfursan_id",
+        }
+        requested = {
+            field for field in request.form.get("fields", "").split(",")
+            if field in allowed_fields
+        }
+        if not passenger_name or not requested:
+            return jsonify(status="nothing_needed", values={}, evidence={})
+        if (not assistant.enabled
+                or not assistant.settings.get("extract_profile_evidence", True)):
+            return jsonify(status="disabled", values={}, evidence={})
+
+        deterministic = db.identity_suggestions(passenger_name)
+        blocked = set(deterministic.get("conflicts") or [])
+        requested -= blocked
+        requested -= set(deterministic.get("values") or {})
+        if not requested:
+            return jsonify(status="nothing_needed", values={}, evidence={})
+        evidence = db.identity_evidence(passenger_name, limit=5)
+        if not evidence:
+            return jsonify(status="no_evidence", values={}, evidence={})
+        evidence_hash = hashlib.sha256(json.dumps({
+            "version": 1,
+            "passenger": passenger_profile_key(passenger_name),
+            "evidence": evidence,
+        }, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+        with _ai_profile_lock:
+            result = db.get_ai_profile_cache(
+                passenger_name, evidence_hash, assistant.model)
+            cached = result is not None
+            if result is None:
+                result = assistant.extract_passenger_profile(
+                    passenger_name, evidence)
+                if result is None:
+                    return jsonify(
+                        status="unavailable", values={}, evidence={},
+                        message=assistant.last_error or
+                        "Anthropic profile extraction is temporarily unavailable.")
+                db.save_ai_profile_cache(
+                    passenger_name, evidence_hash, assistant.model, result)
+        values = {
+            field: value for field, value in (result.get("values") or {}).items()
+            if field in requested and field not in blocked
+        }
+        labels = {
+            field: source
+            for field, source in (result.get("evidence") or {}).items()
+            if field in values
+        }
+        return jsonify(
+            status="found" if values else "checked", values=values,
+            evidence=labels, cached=cached, assistant=assistant.name)
 
     @app.route("/flight/<int:flight_id>")
     def flight_detail(flight_id):

@@ -649,6 +649,45 @@ def _extract_passenger_profiles(text: str) -> dict[str, dict]:
     return profiles
 
 
+def passenger_evidence_blocks(text: str, passenger_name: str,
+                              limit: int = 8) -> list[dict]:
+    """Return small, passenger-scoped source blocks for guarded AI review."""
+    target = _identity_key(passenger_name)
+    if not target:
+        return []
+    people = list(_IDENTITY_PERSON_RE.finditer(text or ""))
+    blocks = []
+    for index, match in enumerate(people):
+        name = _clean_passenger_name(match.group("name"))
+        if _identity_key(name) != target:
+            continue
+        end = people[index + 1].start() if index + 1 < len(people) else len(text)
+        value = (text[match.start():min(end, match.start() + 1800)]).strip()
+        if value:
+            blocks.append({
+                "source": _identity_source(text, match.start()),
+                "text": value,
+            })
+        if len(blocks) >= limit:
+            break
+    if blocks:
+        return blocks
+
+    # Some airline layouts omit a title.  Use a narrow exact-name window and
+    # never the whole multi-passenger document.
+    simple = " ".join(str(passenger_name or "").split())
+    for match in re.finditer(re.escape(simple), text or "", re.IGNORECASE):
+        value = (text[max(0, match.start() - 100):match.start() + 1700]).strip()
+        if value:
+            blocks.append({
+                "source": _identity_source(text, match.start()),
+                "text": value,
+            })
+        if len(blocks) >= limit:
+            break
+    return blocks
+
+
 def _extract_passenger(text: str) -> str | None:
     for pattern in (_PASSENGER_LABEL_RE, _PASSENGER_TITLE_RE, _PASSENGER_DEAR_RE):
         for m in pattern.finditer(text):

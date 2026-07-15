@@ -31,6 +31,12 @@
       <span><strong>Auto-filled from matching travel evidence:</strong> {{ suggested_evidence.keys()|map('replace', '_', ' ')|join(', ') }}. Review the pre-filled values and save once before they are used on an official form.</span>
     </div>
     {% endif %}
+    {% if ai_profile_enabled and profile_lookup_name %}
+    <div id="ai-profile-note" class="profile-note" style="background:#f1edff;color:#4c2b78">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m12 3 1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5L12 3Z"/><path d="m19 15 .8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15Z"/></svg>
+      <span>{{ ai_profile_name }} is checking this passengerâ€™s matching ticket and PDF evidence for any remaining fieldsâ€¦</span>
+    </div>
+    {% endif %}
     <div class="profile-grid">
       <label class="form-field"><span>First name</span><input name="first_name" value="{{ profile.first_name or '' }}" autocomplete="given-name" required></label>
       <label class="form-field"><span>Second / middle name</span><input name="middle_name" value="{{ profile.middle_name or '' }}" autocomplete="additional-name"></label>
@@ -46,4 +52,53 @@
     <div class="profile-actions"><a class="btn" href="{{ next_url }}">Cancel</a><button class="btn primary">Save complaint profile</button></div>
   </form>
 </div>
+{% endblock %}
+{% block scripts %}
+{% if ai_profile_enabled and profile_lookup_name %}
+<script>
+(() => {
+  const note = document.getElementById('ai-profile-note');
+  const form = document.querySelector('.profile-card');
+  const fields = ['title','nationality','email','phone','country_code','national_id','alfursan_id'];
+  const missing = fields.filter(name => {
+    const control = form.elements[name];
+    return control && !String(control.value || '').trim();
+  });
+  if (!missing.length) {
+    note.hidden = true;
+    return;
+  }
+  fetch({{ url_for('ai_profile_suggestions')|tojson }}, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'},
+    body: new URLSearchParams({
+      passenger: {{ profile_lookup_name|tojson }},
+      fields: missing.join(',')
+    })
+  }).then(response => response.json()).then(result => {
+    const found = [];
+    Object.entries(result.values || {}).forEach(([name, value]) => {
+      const control = form.elements[name];
+      if (control && !String(control.value || '').trim()) {
+        control.value = value;
+        found.push(name.replaceAll('_', ' '));
+      }
+    });
+    if (found.length) {
+      note.querySelector('span').textContent =
+        `${result.assistant || {{ ai_profile_name|tojson }}} found and source-verified: ${found.join(', ')}. Review and save before use.`;
+    } else if (result.status === 'unavailable') {
+      note.querySelector('span').textContent = result.message ||
+        'Anthropic evidence review is temporarily unavailable; deterministic fields remain available.';
+    } else {
+      note.querySelector('span').textContent =
+        `${result.assistant || {{ ai_profile_name|tojson }}} checked the matching evidence and found no additional reliable fields.`;
+    }
+  }).catch(() => {
+    note.querySelector('span').textContent =
+      'Anthropic evidence review is temporarily unavailable; deterministic fields remain available.';
+  });
+})();
+</script>
+{% endif %}
 {% endblock %}
