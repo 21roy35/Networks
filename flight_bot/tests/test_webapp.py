@@ -62,8 +62,10 @@ def test_manual_corrections_are_validated_and_saved(client):
 
 def test_official_portal_route_uses_only_the_incident(client, monkeypatch):
     launched = {}
+    launches = []
 
     def fake_start(payload, on_complete, on_update=None):
+        launches.append(payload)
         launched.update(payload)
         on_complete(webapp.PortalResult(
             "submitted", "Submitted.", "CASE-123456"))
@@ -92,6 +94,15 @@ def test_official_portal_route_uses_only_the_incident(client, monkeypatch):
     flight = db.get_flight(flight_id)
     assert flight["complaints"][0]["status"] == "submitted"
     assert flight["complaints"][0]["reference"] == "CASE-123456"
+
+    duplicate = client.post(
+        f"/flight/{flight_id}/complaint/airline/submit", data={
+            "incident": "The flight was cancelled and I had to buy a hotel room.",
+        }, follow_redirects=True)
+    assert duplicate.status_code == 200
+    assert b"will not submit it again" in duplicate.data
+    assert len(launches) == 1
+    assert len(db.complaints_for_flight(flight["flight_key"])) == 1
 
 
 def test_gaca_requires_and_reuses_airline_reference(client):

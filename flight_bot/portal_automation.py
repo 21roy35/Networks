@@ -25,7 +25,7 @@ from .airlines import AIRLINES, GACA
 _PROFILE_DIR = Path(__file__).resolve().parent / ".portal-profile"
 _JOBS: dict[str, dict] = {}
 _JOBS_LOCK = threading.Lock()
-_TERMINAL = {"submitted", "needs_attention", "error"}
+_TERMINAL = {"submitted", "confirmation_unknown", "needs_attention", "error"}
 _BROWSER_LOCK = threading.Lock()
 _VERIFICATION_HANDLER: Callable[[dict], object] | None = None
 _AI_HANDLER: Callable[[dict], dict | None] | None = None
@@ -175,10 +175,26 @@ def _visible(locator):
         return False
 
 
+def _wait_for_any_visible(page, locator, timeout_ms: int = 6000):
+    """Wait for any match, including later controls with duplicate labels."""
+    deadline = time.monotonic() + max(0, timeout_ms) / 1000
+    while time.monotonic() < deadline:
+        try:
+            for index in range(locator.count()):
+                candidate = locator.nth(index)
+                if candidate.is_visible():
+                    return candidate
+        except Exception:
+            pass
+        page.wait_for_timeout(150)
+    return None
+
+
 def _fill(page, labels: list[str], value, *, required: bool = False) -> bool:
     value = str(value or "").strip()
     if not value:
         return not required
+    filled_any = False
     for label in labels:
         pattern = re.compile(label, re.I)
         for matches in (page.get_by_label(pattern),
@@ -192,9 +208,11 @@ def _fill(page, labels: list[str], value, *, required: bool = False) -> bool:
                 try:
                     if control.is_visible() and control.is_editable():
                         control.fill(value)
-                        return True
+                        filled_any = True
                 except Exception:
                     pass
+    if filled_any:
+        return True
     keywords = [re.sub(r"[^a-z0-9]", "", label.lower()) for label in labels]
     try:
         controls = page.locator("input:not([type=hidden]), textarea").all()
@@ -1143,6 +1161,40 @@ def _apply_control_answer(control, response) -> bool:
         return False
 
 
+def _known_control_value(control, payload: dict | None) -> str:
+    """Return a saved payload value for a recognizable invalid control."""
+    if not payload:
+        return ""
+    try:
+        attributes = " ".join(filter(None, (
+            _control_label(control), control.get_attribute("name"),
+            control.get_attribute("id"), control.get_attribute("placeholder"),
+            control.get_attribute("aria-label"),
+            control.get_attribute("type"),
+        ))).casefold()
+    except Exception:
+        attributes = _control_label(control).casefold()
+    mappings = (
+        (r"\bemail\b|e-mail", "email"),
+        (r"country.{0,20}(?:code|territory)", "country_code"),
+        (r"\b(?:mobile|phone|telephone)\b", "phone"),
+        (r"\b(?:first|given).{0,10}name\b", "first_name"),
+        (r"\b(?:second|middle).{0,10}name\b", "middle_name"),
+        (r"\b(?:last|family).{0,10}name\b|\bsurname\b", "last_name"),
+        (r"alfursan|frequent.{0,10}flyer", "alfursan_id"),
+        (r"passport|national.?id|iqama|identity", "national_id"),
+        (r"booking.{0,15}(?:reference|number)|\bpnr\b", "pnr"),
+        (r"e-?ticket|ticket.{0,10}number", "ticket_number"),
+        (r"flight.{0,10}number", "flight_number"),
+        (r"flight.{0,10}date|date.{0,10}flight", "flight_date"),
+        (r"\bsubject\b", "subject"),
+    )
+    for pattern, field in mappings:
+        if re.search(pattern, attributes, re.I):
+            return str(payload.get(field) or "").strip()
+    return ""
+
+
 def _control_screenshot(page, control) -> bytes:
     try:
         control.scroll_into_view_if_needed()
@@ -1181,8 +1233,6 @@ def _invalid_controls(page):
 def _resolve_invalid_fields(page, update,
                             payload: dict | None = None) -> tuple[bool, bool]:
     """Ask for invalid field values in Telegram. Returns changed, cancelled."""
-    if not _VERIFICATION_HANDLER:
-        return False, False
     changed = False
     ai_used = False
     attempts: dict[str, int] = {}
@@ -1203,6 +1253,14 @@ def _resolve_invalid_fields(page, update,
             validation = ""
         option_text = ("\nAvailable choices: " + "; ".join(options)
                        if options else "")
+        known_value = _known_control_value(control, payload)
+        if known_value and _apply_control_answer(control, known_value):
+            changed = True
+            update("filling", f"Restored saved {label} automatically.")
+            page.wait_for_timeout(250)
+            continue
+        if not _VERIFICATION_HANDLER:
+            return changed, False
         if _AI_HANDLER and payload and not ai_used:
             ai_used = True
             decision = _ask_ai(
@@ -1283,7 +1341,7 @@ def _fill_common(page, payload: dict):
     _fill(page, ["first name", "given name"], payload["first_name"])
     _fill(page, ["second name", "middle name"], payload["middle_name"])
     _fill(page, ["last name", "family name", "surname"], payload["last_name"])
-    _fill(page, ["full name", "passenger name", "name"], payload["passenger_name"])
+    _fill(page, ["full name", "passenger name"], payload["passenger_name"])
     _fill(page, ["national id", "passport", "iqama", "identity"],
           payload["national_id"])
     _fill(page, ["alfursan id", "alfursan", "frequent flyer number"],
@@ -1325,13 +1383,16 @@ def _fill_common(page, payload: dict):
 
 
 def _saudia_complaint_category(payload: dict) -> str:
-    text = " ".join((
-        str(payload.get("incident") or ""),
-        str((payload.get("ai_analysis") or {}).get("category") or ""),
-    )).casefold()
+    text = str(payload.get("incident") or "").casefold()
+    ai_category = str(
+        (payload.get("ai_analysis") or {}).get("category") or "").casefold()
     mappings = (
-        (r"cancel", "Flight Cancellation"),
-        (r"delay|late", "Flight Delay"),
+        # Saudia currently exposes no baggage-specific option. Baggage damage,
+        # loss, or delay belongs under Quality of services and must take
+        # priority over the word "delay" in phrases such as "delayed baggage".
+        (r"\b(?:bag|bags|baggage|luggage|suitcase|suitcases)\b",
+         "Quality of services"),
+        (r"\bcancel(?:led|ed|lation)?\b", "Flight Cancellation"),
         (r"denied boarding|bumped|overbook", "Denied Boarding"),
         (r"downgrade", "Downgrade"),
         (r"seat|recline", "Seats"),
@@ -1343,9 +1404,29 @@ def _saudia_complaint_category(payload: dict) -> str:
         (r"website|online|app", "Online Services"),
         (r"call cent", "Call Center"),
         (r"alfursan|miles", "AlFursan"),
+        (r"\bflight\b.{0,40}\b(?:delay|delayed|late)\b|"
+         r"\b(?:delay|delayed|late)\b.{0,40}\bflight\b|"
+         r"\b(?:departure|arrival|departed|arrived)\b.{0,30}\blate\b",
+         "Flight Delay"),
+        (r"entertainment|screen|in.?flight system|accessibility|wheelchair|"
+         r"refund|damag|lost", "Quality of services"),
     )
-    return next((category for pattern, category in mappings
-                 if re.search(pattern, text)), "Quality of services")
+    deterministic = next((category for pattern, category in mappings
+                          if re.search(pattern, text)), None)
+    if deterministic:
+        return deterministic
+    ai_mappings = {
+        "delay": "Flight Delay",
+        "cancellation": "Flight Cancellation",
+        "baggage": "Quality of services",
+        "seat": "Seats",
+        "entertainment": "Quality of services",
+        "service": "Quality of services",
+        "accessibility": "Quality of services",
+        "refund": "Quality of services",
+        "other": "Quality of services",
+    }
+    return ai_mappings.get(ai_category, "Quality of services")
 
 
 def _prepare_saudia(page, payload: dict, update):
@@ -1356,41 +1437,29 @@ def _prepare_saudia(page, payload: dict, update):
     page.wait_for_timeout(900)
     _select(page, ["travel complaint or compliment", "request type"], [
         r"^complaint$"])
-    try:
-        page.get_by_label(re.compile("booking reference", re.I)).first.wait_for(
-            state="visible", timeout=10000)
-    except Exception:
-        page.wait_for_timeout(1500)
+    _wait_for_any_visible(
+        page, page.get_by_label(re.compile("booking reference", re.I)), 6000)
     _fill(page, ["booking reference"], payload["pnr"])
     _fill(page, ["ticket number"], payload["ticket_number"])
     _fill(page, ["last name"], payload["last_name"])
     if _click(page, ["Next"]):
-        try:
-            page.get_by_label(re.compile("first name", re.I)).first.wait_for(
-                state="visible", timeout=15000)
-        except Exception:
-            page.wait_for_timeout(3500)
+        _wait_for_any_visible(
+            page, page.get_by_label(re.compile("first name", re.I)), 7000)
     _fill_common(page, payload)
     category = _saudia_complaint_category(payload)
     if _select(page, [r"^complaint\s*\*?$"], [
             rf"^{re.escape(category)}$"]):
         details = page.locator("textarea[name='descriptionInfo']")
-        try:
-            details.first.wait_for(state="visible", timeout=15000)
-        except Exception:
-            page.wait_for_timeout(1500)
-        if _visible(details):
-            details.first.fill(payload["description"])
+        details_control = _wait_for_any_visible(page, details, 7000)
+        if details_control is not None:
+            details_control.fill(payload["description"])
         else:
             _fill(page, ["describe your issue", "let us know",
                          "complaint details", "what happened", "description",
                          "message"], payload["description"])
-        try:
-            page.locator("button:visible").filter(has_text=re.compile(
-                r"^\s*submit\s*$", re.I)).first.wait_for(
-                    state="visible", timeout=15000)
-        except Exception:
-            pass
+        _wait_for_any_visible(
+            page, page.locator("button:visible").filter(has_text=re.compile(
+                r"^\s*submit\s*$", re.I)), 7000)
 
 
 def _prepare_flynas(page, payload: dict, update):
@@ -1459,21 +1528,21 @@ def _extract_reference_from_url(url: str) -> str:
 def _await_confirmation(page, before_url: str, update,
                         before_text: str = "",
                         payload: dict | None = None,
-                        timeout_seconds: int = 600) -> PortalResult:
+                        timeout_seconds: int = 120) -> PortalResult:
     started = time.monotonic()
     deadline = started + timeout_seconds
-    prompted = False
-    last_assistance = 0.0
-    ai_attempts = 0
+    waiting_reported = False
     while time.monotonic() < deadline:
         if page.is_closed():
-            return PortalResult("needs_attention",
-                                "The official portal was closed before a confirmation was detected.")
+            return PortalResult(
+                "confirmation_unknown",
+                "The form was sent once, but the portal closed before a "
+                "confirmation could be read.")
         if _request_blocked(page):
             return PortalResult(
-                "needs_attention",
-                "The official site blocked the VPS browser request. This is not a "
-                "CAPTCHA or a missing form field, so no verification reply was applied.")
+                "confirmation_unknown",
+                "The form was sent once, but the official site blocked the "
+                "confirmation page. FlightDeck will not submit it again.")
         text = _body_text(page)
         reference = _extract_reference(text) or _extract_reference_from_url(page.url)
         success = re.search(
@@ -1491,71 +1560,20 @@ def _await_confirmation(page, before_url: str, update,
         human = _needs_human_step(page)
         if human:
             update("verification", human)
-            prompted = True
             if _VERIFICATION_HANDLER and _wait_for_human_step(page, update):
                 update("submitting", "Verification complete. Waiting for confirmation…")
-        elif page.url != before_url and prompted:
-            update("submitting", "Verification complete. Waiting for confirmation…")
-        elif (time.monotonic() - started > 12
-              and time.monotonic() - last_assistance > 30):
-            last_assistance = time.monotonic()
-            changed, cancelled = _resolve_invalid_fields(page, update)
-            if cancelled:
-                return PortalResult(
-                    "needs_attention", "Portal input was cancelled in Telegram.")
-            handled = False
-            if changed:
-                _click(page, ["Submit", "Send", "Continue", "Confirm",
-                              "إرسال", "تقديم", "متابعة", "تأكيد"])
-                update("submitting", "Telegram inputs applied. Trying the official portal again…")
-                prompted = True
-            elif (_AI_HANDLER and payload
-                  and ai_attempts < _AI_MAX_ATTEMPTS):
-                ai_attempts += 1
-                decision = _ask_ai(
-                    page, payload,
-                    "The form was submitted or advanced, but no deterministic "
-                    "confirmation appeared. Identify a safe correction or navigation step.")
-                handled, cancelled = _apply_ai_decision(
-                    page, decision, payload, update)
-                if cancelled:
-                    return PortalResult(
-                        "needs_attention", "Portal assistance was cancelled in Telegram.")
-                if handled:
-                    prompted = True
-                    continue
-                # If AI cannot take a code-validated action, fall through to
-                # the existing screenshot-based human review on this cycle.
-                if not _VERIFICATION_HANDLER:
-                    update("verification",
-                           "Ghala-200 could not safely resolve the portal state.")
-                    prompted = True
-            if not changed and _VERIFICATION_HANDLER and not handled:
-                details = _validation_summary(page)
-                extra = f"\n\nPortal message:\n{details}" if details else ""
-                response = _ask_verification(
-                    "approval",
-                    "The official portal has not confirmed yet. Review this screenshot, then tap Retry to submit again or Cancel to stop safely."
-                    + extra,
-                    page, choices=["Retry", "Cancel"])
-                prompted = True
-                if str(response or "").lower() == "cancel":
-                    return PortalResult(
-                        "needs_attention", "Portal submission was cancelled in Telegram.")
-                if str(response or "").lower() == "retry":
-                    if not _click(page, [
-                            "Submit", "Send", "Continue", "Confirm",
-                            "إرسال", "تقديم", "متابعة", "تأكيد"]):
-                        _submit_fallback(page)
-                    update("submitting", "Retry approved in Telegram. Waiting for confirmation…")
-            elif not changed and not _VERIFICATION_HANDLER:
-                update("verification",
-                       "The official site needs one correction or confirmation.")
-                prompted = True
+        elif not waiting_reported and time.monotonic() - started > 12:
+            waiting_reported = True
+            update(
+                "submitting",
+                "The complaint was sent once. Waiting for the official "
+                "confirmation without clicking Submit again.",
+                _page_screenshot(page))
         time.sleep(1)
     return PortalResult(
-        "needs_attention",
-        "The official portal did not expose a confirmation before the tracking window ended.")
+        "confirmation_unknown",
+        "The complaint was sent once, but the official portal did not expose "
+        "a readable confirmation. FlightDeck will not submit it again.")
 
 
 def submit_portal_claim(payload: dict, update: Callable[..., None]) -> PortalResult:

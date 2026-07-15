@@ -62,24 +62,21 @@ def airline_complaint(flight: dict, user: dict, incident: str = "") -> dict:
     airline = flight.get("airline_name") or code or "the airline"
     incident = incident.strip() or "Describe what went wrong."
     subject = _subject(flight, "Passenger rights complaint")
-    body = f"""Dear {airline} Customer Relations,
+    body = f"""{incident}
 
-I am filing a formal complaint about the following journey:
-
+Flight details:
 {_flight_facts(flight, user)}
 
-What went wrong:
-  {incident}
-
-Requested resolution:
-  Please apply every refund, compensation, reimbursement and duty-of-care
-  remedy available under the applicable passenger-rights rules, and provide a
-  written decision with a complaint reference number.
+Requested compensation and resolution:
+  I request fair financial compensation for what occurred, reimbursement for
+  every related loss or expense, and every additional refund, repair,
+  replacement, or duty-of-care remedy available. Please provide a written
+  decision and complaint reference number.
 
 Assessment basis:
   {"; ".join(assessment["frameworks"])}.
 
-Yours faithfully,
+Contact:
 {user.get('full_name') or effective(flight, 'passenger') or '[Passenger]'}
 {user.get('email') or ''}
 {user.get('phone') or ''}
@@ -101,7 +98,9 @@ def gaca_complaint(flight: dict, user: dict, incident: str = "",
     airline = flight.get("airline_name") or flight.get("airline_code") or "the airline"
     incident = incident.strip() or "Describe what went wrong."
     subject = _subject(flight, f"GACA escalation against {airline}")
-    body = f"""Formal escalation to {GACA['name']}
+    body = f"""{incident}
+
+Formal escalation to {GACA['name']}
 
 Airline complaint reference: {airline_reference or '[required]'}
 Airline complaint date: {airline_complaint_date or '[required]'}
@@ -109,12 +108,10 @@ Airline complaint date: {airline_complaint_date or '[required]'}
 Flight details:
 {_flight_facts(flight, user)}
 
-What went wrong and why escalation is required:
-  {incident}
-
-Requested resolution:
-  Please investigate this complaint and require the carrier to provide every
-  remedy due under the applicable passenger-rights rules.
+Requested compensation and resolution:
+  Please investigate this complaint and require the carrier to provide fair
+  financial compensation, reimbursement for every related loss or expense,
+  and every additional remedy due under the applicable passenger-rights rules.
 
 Assessment basis:
   {"; ".join(assessment["frameworks"])}.
@@ -165,9 +162,9 @@ def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
     if ai_analysis:
         facts = [str(item).strip() for item in ai_analysis.get("facts") or []
                  if str(item).strip()]
-        sections = [f"Passenger's original statement: {incident}"]
+        sections = [incident]
         if ai_analysis.get("summary"):
-            sections.append("Organized issue summary: "
+            sections.append("Additional issue summary: "
                             + str(ai_analysis["summary"]).strip())
         if facts:
             sections.append("Facts stated by the passenger: " + "; ".join(facts))

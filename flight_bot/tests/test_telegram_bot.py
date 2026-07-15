@@ -96,9 +96,33 @@ def test_otp_is_relayed_and_deleted_after_use(coordinator):
 
 def test_start_registers_telegram_command_menu(coordinator, monkeypatch):
     bot, api = coordinator
-    monkeypatch.setattr(threading.Thread, "start", lambda _thread: None)
+    started = []
+    monkeypatch.setattr(
+        threading.Thread, "start", lambda thread: started.append(thread.name))
     bot.start()
+    assert set(started) == {
+        "telegram-commands", "telegram-updates", "telegram-monitor"}
+    bot._register_commands()
     assert api.commands_registered is True
+
+
+def test_complaint_reservation_blocks_duplicates_but_allows_failed_retry(
+        coordinator):
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = db.list_flights()[0]
+    first = db.begin_complaint(
+        flight["flight_key"], "airline", "Claim", "Broken baggage")
+    assert first is not None
+    assert db.begin_complaint(
+        flight["flight_key"], "airline", "Claim", "Broken baggage") is None
+
+    db.finish_complaint(first, "needs_attention")
+    retry = db.begin_complaint(
+        flight["flight_key"], "airline", "Claim", "Broken baggage")
+    assert retry is not None
+    db.finish_complaint(retry, "confirmation_unknown")
+    assert db.begin_complaint(
+        flight["flight_key"], "airline", "Claim", "Broken baggage") is None
 
 
 def test_portal_progress_reports_stage_transitions_with_screenshots(coordinator):

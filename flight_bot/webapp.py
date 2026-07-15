@@ -553,21 +553,38 @@ def create_app(config: dict) -> Flask:
 
         flight_key = flight["flight_key"]
         subject = payload["subject"]
+        complaint_id = db.begin_complaint(
+            flight_key, kind, subject, incident,
+            payload.get("attachments") or [])
+        if complaint_id is None:
+            existing = db.active_complaint_for_flight(flight_key, kind)
+            status = (existing or {}).get("status") or "filing"
+            flash(
+                f"This {kind.upper()} complaint is already {status.replace('_', ' ')}. "
+                "FlightDeck will not submit it again.")
+            return redirect(url_for("flight_detail", flight_id=flight_id))
 
         def record_result(result: PortalResult):
             if result.status == "submitted":
-                db.add_complaint(
-                    flight_key, kind, None, subject, "submitted",
-                    reference=result.reference or None, details=incident)
+                db.finish_complaint(
+                    complaint_id, "submitted", result.reference or None)
                 if telegram:
                     suffix = (f" Reference: {result.reference}."
                               if result.reference else "")
                     telegram.notify(
                         f"{kind.upper()} complaint submitted through the official portal."
                         + suffix)
-            elif telegram:
-                telegram.notify(
-                    f"{kind.upper()} portal submission needs attention: {result.message}")
+            elif result.status == "confirmation_unknown":
+                db.finish_complaint(complaint_id, "confirmation_unknown")
+                if telegram:
+                    telegram.notify(
+                        f"{kind.upper()} was sent once without a readable "
+                        "confirmation. FlightDeck will not submit it again.")
+            else:
+                db.finish_complaint(complaint_id, "needs_attention")
+                if telegram:
+                    telegram.notify(
+                        f"{kind.upper()} portal submission needs attention: {result.message}")
 
         if telegram:
             telegram.notify(

@@ -158,17 +158,23 @@ class TelegramCoordinator:
             int(self.ai.settings.get("max_portal_attempts", 3)))
         set_captcha_solver(
             self.captcha.solve_recaptcha if self.captcha.enabled else None)
+        threading.Thread(
+            target=self._register_commands, name="telegram-commands",
+            daemon=True).start()
+        threading.Thread(target=self._poll_loop, name="telegram-updates",
+                         daemon=True).start()
+        threading.Thread(target=self._monitor_loop, name="telegram-monitor",
+                         daemon=True).start()
+        return self
+
+    def _register_commands(self):
+        """Register Telegram commands without delaying web-server startup."""
         try:
             self.api.set_commands()
         except Exception:
             # Command-menu registration is convenient but must never prevent
             # polling, monitoring, or complaint filing from starting.
             pass
-        threading.Thread(target=self._poll_loop, name="telegram-updates",
-                         daemon=True).start()
-        threading.Thread(target=self._monitor_loop, name="telegram-monitor",
-                         daemon=True).start()
-        return self
 
     def stop(self):
         self.stop_event.set()
@@ -191,16 +197,21 @@ class TelegramCoordinator:
             "verification": "completing verification",
             "submitting": "submitting the complaint",
             "submitted": "complaint submitted",
+            "confirmation_unknown": "checking the airline confirmation",
             "needs_attention": "waiting for your attention",
             "error": "stopped with an error",
         }
-        terminal = {"submitted", "needs_attention", "error"}
+        terminal = {
+            "submitted", "confirmation_unknown", "needs_attention", "error",
+        }
 
         def relay(status: str, message: str,
                   image: bytes | None = None) -> None:
             key = (status, message)
             previous = state["stage"]
-            if key == state["key"] or (status in terminal and previous == status):
+            if (key == state["key"]
+                    or (status in terminal and previous == status)
+                    or (status == previous and not image)):
                 return
             current_label = labels.get(status, status.replace("_", " "))
             if status == "submitted":
@@ -495,20 +506,43 @@ class TelegramCoordinator:
             self.notify("I need these one-time profile/flight details before filing: "
                         + ", ".join(missing) + ". Complete them in FlightDeck.")
             return
+        complaint_id = db.begin_complaint(
+            flight_key, "airline", payload["subject"], intake.incident,
+            intake.attachments)
+        if complaint_id is None:
+            existing = db.active_complaint_for_flight(flight_key, "airline")
+            if existing and existing.get("status") in {
+                    "submitted", "filed", "sent", "confirmation_unknown"}:
+                db.update_survey_status(flight_key, "filed")
+                self.notify(
+                    "This flight already has an airline complaint on record. "
+                    "I will not submit it again.")
+            else:
+                db.update_survey_status(flight_key, "filing")
+                self.notify(
+                    "A complaint for this flight is already being filed. "
+                    "I will not start a duplicate job.")
+            return
         db.update_survey_status(flight_key, "filing")
         self.notify(f"Filing with {payload['airline_name']} on its official website now…")
 
         def complete(result: PortalResult):
             if result.status == "submitted":
-                db.add_complaint(
-                    flight_key, "airline", None, payload["subject"], "submitted",
-                    reference=result.reference or None, details=intake.incident,
-                    attachments=intake.attachments)
+                db.finish_complaint(
+                    complaint_id, "submitted", result.reference or None)
                 db.update_survey_status(flight_key, "filed")
                 reference = f" Reference: {result.reference}." if result.reference else ""
                 self.notify("Complaint submitted on the official airline portal."
                             + reference + " I’ll watch for the airline’s response.")
+            elif result.status == "confirmation_unknown":
+                db.finish_complaint(complaint_id, "confirmation_unknown")
+                db.update_survey_status(flight_key, "needs_attention")
+                self.notify(
+                    "The complaint was sent once, but the airline did not return "
+                    "a readable reference. I will not submit it again. Check the "
+                    "airline confirmation or response before taking another action.")
             else:
+                db.finish_complaint(complaint_id, "needs_attention")
                 db.update_survey_status(flight_key, "needs_attention")
                 self.notify(f"Portal filing needs attention: {result.message}")
 
@@ -546,17 +580,29 @@ class TelegramCoordinator:
         if missing:
             self.notify("GACA filing still needs: " + ", ".join(missing) + ".")
             return
+        complaint_id = db.begin_complaint(
+            flight["flight_key"], "gaca", payload["subject"], incident,
+            prior.get("attachments") or [])
+        if complaint_id is None:
+            self.notify(
+                "A GACA escalation for this flight is already underway or on "
+                "record. I will not submit it again.")
+            return
         self.notify("Escalating to GACA’s official E-Services portal now…")
 
         def complete(result: PortalResult):
             if result.status == "submitted":
-                db.add_complaint(
-                    flight["flight_key"], "gaca", None, payload["subject"],
-                    "submitted", reference=result.reference or None,
-                    details=incident, attachments=prior.get("attachments") or [])
+                db.finish_complaint(
+                    complaint_id, "submitted", result.reference or None)
                 suffix = f" Reference: {result.reference}." if result.reference else ""
                 self.notify("GACA escalation submitted." + suffix)
+            elif result.status == "confirmation_unknown":
+                db.finish_complaint(complaint_id, "confirmation_unknown")
+                self.notify(
+                    "The GACA escalation was sent once without a readable "
+                    "reference. I will not submit it again automatically.")
             else:
+                db.finish_complaint(complaint_id, "needs_attention")
                 self.notify(f"GACA escalation needs attention: {result.message}")
 
         start_portal_job(

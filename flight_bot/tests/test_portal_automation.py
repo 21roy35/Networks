@@ -79,8 +79,9 @@ def test_ai_analysis_augments_letter_but_preserves_original_incident():
         })
     assert payload["incident"] == original
     assert payload["ai_analysis"]["category"] == "seat"
-    assert "Passenger's original statement" in payload["description"]
-    assert original in payload["description"]
+    assert payload["description"].startswith(original)
+    assert "financial compensation" in payload["description"]
+    assert not payload["description"].startswith("Dear")
 
 
 def test_gaca_payload_cannot_skip_the_airline_reference():
@@ -119,7 +120,7 @@ def test_block_page_is_not_mistaken_for_a_form():
     assert portal_automation._request_blocked(Page()) is True
 
 
-def test_fill_prefers_latest_visible_duplicate_control():
+def test_fill_updates_every_visible_duplicate_control():
     filled = []
 
     class Control:
@@ -160,7 +161,59 @@ def test_fill_prefers_latest_visible_duplicate_control():
             raise AssertionError("fallback should not be needed")
 
     assert portal_automation._fill(Page(), ["last name"], "ProfileLast")
-    assert filled == [("current-step", "ProfileLast")]
+    assert filled == [
+        ("current-step", "ProfileLast"),
+        ("earlier-step", "ProfileLast"),
+    ]
+
+
+def test_fill_updates_controls_reached_by_different_label_aliases():
+    filled = []
+
+    class Control:
+        def __init__(self, name):
+            self.name = name
+
+        def is_visible(self):
+            return True
+
+        def is_editable(self):
+            return True
+
+        def fill(self, value):
+            filled.append((self.name, value))
+
+    class Matches:
+        def __init__(self, controls=()):
+            self.controls = list(controls)
+
+        def count(self):
+            return len(self.controls)
+
+        def nth(self, index):
+            return self.controls[index]
+
+    class Page:
+        def get_by_label(self, pattern):
+            if pattern.pattern == "email address":
+                return Matches([Control("email-address")])
+            if pattern.pattern == "email":
+                return Matches([Control("email-required")])
+            return Matches()
+
+        def get_by_placeholder(self, _pattern):
+            return Matches()
+
+        def locator(self, _selector):
+            raise AssertionError("fallback should not be needed")
+
+    assert portal_automation._fill(
+        Page(), ["email address", "e-mail address", "email"],
+        "saved@example.com")
+    assert filled == [
+        ("email-address", "saved@example.com"),
+        ("email-required", "saved@example.com"),
+    ]
 
 
 def test_material_dropdown_is_selected_from_allowed_choice():
@@ -827,6 +880,8 @@ def test_unstable_captcha_tile_reprompts_instead_of_crashing(monkeypatch):
 @pytest.mark.parametrize(("incident", "category"), [
     ("The seat recline was broken.", "Seats"),
     ("The flight was delayed for five hours.", "Flight Delay"),
+    ("My baggage was delayed and the suitcase was damaged.",
+     "Quality of services"),
     ("The flight was cancelled.", "Flight Cancellation"),
     ("The cabin crew handled the issue badly.", "Flight attendants/Pilots"),
     ("The entertainment screen was broken.", "Quality of services"),
@@ -835,6 +890,13 @@ def test_saudia_complaint_category_mapping(incident, category):
     assert portal_automation._saudia_complaint_category({
         "incident": incident, "ai_analysis": {},
     }) == category
+
+
+def test_claude_baggage_category_maps_to_saudia_quality_option():
+    assert portal_automation._saudia_complaint_category({
+        "incident": "My property was damaged during handling.",
+        "ai_analysis": {"category": "baggage"},
+    }) == "Quality of services"
 
 
 def test_reference_is_extracted_from_official_confirmation_text():
@@ -896,6 +958,70 @@ def test_invalid_portal_field_is_screenshot_and_filled_from_telegram(monkeypatch
     assert challenges[0]["image"] == b"portal-screenshot"
     assert "Passport number" in challenges[0]["message"]
     assert updates[-1][0] == "filling"
+
+
+def test_saved_email_repairs_invalid_control_without_asking_telegram(monkeypatch):
+    class Control:
+        value = ""
+
+        def evaluate(self, script):
+            if "tagName" in script:
+                return "input"
+            if "validationMessage" in script:
+                return "Please fill out this field."
+            return "Email"
+
+        def get_attribute(self, name):
+            return "email" if name in {"type", "name"} else ""
+
+        def fill(self, value):
+            self.value = value
+
+    class Page:
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+    control = Control()
+    monkeypatch.setattr(
+        portal_automation, "_invalid_controls",
+        lambda _page: [] if control.value else [control])
+    monkeypatch.setattr(
+        portal_automation, "_control_label", lambda _control: "Email*")
+    monkeypatch.setattr(
+        portal_automation, "_VERIFICATION_HANDLER",
+        lambda _challenge: pytest.fail("Telegram must not be asked for saved email"))
+
+    changed, cancelled = portal_automation._resolve_invalid_fields(
+        Page(), lambda *_args: None,
+        payload={"email": "saved@example.com"})
+    assert (changed, cancelled) == (True, False)
+    assert control.value == "saved@example.com"
+
+
+def test_confirmation_wait_never_clicks_submit_again(monkeypatch):
+    ticks = iter([0.0, 1.0, 13.0, 21.0])
+
+    class Page:
+        url = "https://official.example/form"
+
+        def is_closed(self):
+            return False
+
+    clicked = []
+    monkeypatch.setattr(portal_automation.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(portal_automation.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(portal_automation, "_request_blocked", lambda _page: False)
+    monkeypatch.setattr(portal_automation, "_body_text", lambda _page: "Still processing")
+    monkeypatch.setattr(portal_automation, "_needs_human_step", lambda _page: "")
+    monkeypatch.setattr(portal_automation, "_page_screenshot", lambda _page: b"shot")
+    monkeypatch.setattr(
+        portal_automation, "_click",
+        lambda _page, names: clicked.extend(names) or True)
+
+    result = portal_automation._await_confirmation(
+        Page(), Page.url, lambda *_args: None, timeout_seconds=20)
+    assert result.status == "confirmation_unknown"
+    assert clicked == []
 
 
 def test_ai_portal_guardrails_block_final_and_security_actions(monkeypatch):

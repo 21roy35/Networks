@@ -292,6 +292,64 @@ def add_complaint(flight_key: str, kind: str, to_addr: str | None,
              json.dumps(attachments or [])))
 
 
+def active_complaint_for_flight(flight_key: str, kind: str) -> dict | None:
+    """Return a filing/submitted claim that must not be launched again."""
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT * FROM complaints
+               WHERE flight_key = ? AND kind = ?
+                 AND status IN ('filing', 'submitted', 'filed', 'sent',
+                                'confirmation_unknown')
+               ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (flight_key, kind)).fetchone()
+    if not row:
+        return None
+    item = dict(row)
+    item["attachments"] = json.loads(item.get("attachments") or "[]")
+    return item
+
+
+def begin_complaint(flight_key: str, kind: str, subject: str | None,
+                    details: str | None = None,
+                    attachments: list[str] | None = None) -> int | None:
+    """Atomically reserve one official filing per flight and destination."""
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            """SELECT id, status, created_at FROM complaints
+               WHERE flight_key = ? AND kind = ?
+                 AND status IN ('filing', 'submitted', 'filed', 'sent',
+                                'confirmation_unknown')
+               ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (flight_key, kind)).fetchone()
+        if current:
+            stale = conn.execute(
+                """SELECT 1 WHERE ? = 'filing'
+                   AND datetime(?) < datetime('now', 'localtime', '-45 minutes')""",
+                (current["status"], current["created_at"])).fetchone()
+            if not stale:
+                return None
+            conn.execute(
+                "UPDATE complaints SET status = 'interrupted' WHERE id = ?",
+                (current["id"],))
+        cursor = conn.execute(
+            """INSERT INTO complaints
+               (flight_key, kind, subject, status, details, attachments)
+               VALUES (?, ?, ?, 'filing', ?, ?)""",
+            (flight_key, kind, subject, details,
+             json.dumps(attachments or [])))
+        return int(cursor.lastrowid)
+
+
+def finish_complaint(complaint_id: int, status: str,
+                     reference: str | None = None) -> None:
+    with connect() as conn:
+        conn.execute(
+            """UPDATE complaints SET status = ?,
+               reference = COALESCE(?, reference) WHERE id = ?""",
+            (status, reference, complaint_id))
+
+
 def complaints_for_flight(flight_key: str) -> list[dict]:
     with connect() as conn:
         rows = conn.execute(
