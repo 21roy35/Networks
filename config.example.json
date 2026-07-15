@@ -20,6 +20,7 @@
     "country_code": "+966",
     "alfursan_id": ""
   },
+  "passengers": {},
   "web": {
     "host": "127.0.0.1",
     "port": 5000,

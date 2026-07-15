@@ -15,7 +15,7 @@ FlightDeck turns airline messages into complete flight records, tracks each jour
 - Uses Telegram for post-flight check-ins, issue/photo intake, OTP and CAPTCHA assistance, airline-response alerts, and one-tap GACA escalation.
 - Uses the optional Ghala-200 Claude assistant to organize plain-language incidents, understand airline decisions, and recover safely when an official portal changes.
 
-After the one-time profile and integration setup, the only per-incident input is a plain-language description such as “the seat was broken and the screen did not work,” plus any photos. FlightDeck supplies the stored passenger, booking, flight, evidence, legal basis, and requested remedies.
+After the one-time profile and integration setup, the only per-incident input is a plain-language description such as “the seat was broken and the screen did not work,” plus any photos. FlightDeck supplies the stored passenger, booking, flight, evidence, legal basis, and requested remedies. Family bookings use separate passenger profiles: the bot asks once for that passenger's identity and never substitutes the account owner's National ID or loyalty number.
 
 ## Quick start
 
