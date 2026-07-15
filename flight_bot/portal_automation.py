@@ -1439,32 +1439,36 @@ def _saudia_complaint_category(payload: dict) -> str:
 
 def _prepare_saudia(page, payload: dict, update):
     update("filling", "Filling Saudia’s production Complaints & Feedback form…")
-    service_selected = False
-    for attempt in range(3):
-        _dismiss_feedback_overlay(page)
-        service_selected = _select(page, ["service type"], [
-            "travel complaint or compliment", "post.travel"])
-        if service_selected:
-            break
-        if attempt < 2:
-            update(
-                "opening",
-                "Saudia's production form is still loading. Waiting before "
-                "one safe reload; nothing has been submitted.",
-                _page_screenshot(page))
-            page.wait_for_timeout(5000)
-            page.reload(wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(4500)
-    if not service_selected:
-        raise RuntimeError(
-            "Saudia's production form did not expose its Service Type field "
-            "after three safe loading attempts; nothing was submitted.")
-    page.wait_for_timeout(900)
-    if not _select(page, ["travel complaint or compliment", "request type"], [
-            r"^complaint$"]):
-        raise RuntimeError(
-            "Saudia's production form did not expose the Complaint option; "
-            "nothing was submitted.")
+    # The official production complaint page is directly addressable. Keep the
+    # contact-page selection flow only as a compatibility fallback if Saudia
+    # redirects an older URL there.
+    if "complaint-form" not in urlparse(page.url).path.casefold():
+        service_selected = False
+        for attempt in range(3):
+            _dismiss_feedback_overlay(page)
+            service_selected = _select(page, ["service type"], [
+                "travel complaint or compliment", "post.travel"])
+            if service_selected:
+                break
+            if attempt < 2:
+                update(
+                    "opening",
+                    "Saudia's production form is still loading. Waiting before "
+                    "one safe reload; nothing has been submitted.",
+                    _page_screenshot(page))
+                page.wait_for_timeout(5000)
+                page.reload(wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(4500)
+        if not service_selected:
+            raise RuntimeError(
+                "Saudia's production form did not expose its Service Type field "
+                "after three safe loading attempts; nothing was submitted.")
+        page.wait_for_timeout(900)
+        if not _select(page, ["travel complaint or compliment", "request type"], [
+                r"^complaint$"]):
+            raise RuntimeError(
+                "Saudia's production form did not expose the Complaint option; "
+                "nothing was submitted.")
     _wait_for_any_visible(
         page, page.get_by_label(re.compile("booking reference", re.I)), 6000)
     _fill(page, ["booking reference"], payload["pnr"])

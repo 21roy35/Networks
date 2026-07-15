@@ -292,6 +292,52 @@ def test_one_confirmation_reference_is_not_assigned_to_two_cases(coordinator):
     assert newer["reference"] == "CAS-99880011"
 
 
+def test_saudia_ticket_subject_recovers_missing_reference(coordinator):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Screen complaint",
+        "accepted_pending_reference", details="The screen was broken.")
+    db.save_mail_event({
+        "message_id": "<saudia-ticket@example>",
+        "subject": "Your Ticket\xa0C_2771234 is Registered with us",
+        "sender": "CR-NORPLY@saudia.com", "date": datetime.now(),
+        "body": "Thank you for contacting Saudia Guest Relations.",
+    })
+
+    bot.check_complaint_responses()
+
+    complaint = db.complaints_for_flight(flight["flight_key"])[0]
+    assert complaint["reference"] == "C_2771234"
+    assert complaint["status"] == "submitted"
+    assert any("C_2771234" in item["text"] for item in api.messages)
+
+
+def test_e_ticket_subject_is_not_used_as_complaint_reference(coordinator):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Screen complaint",
+        "accepted_pending_reference", details="The screen was broken.")
+    db.save_mail_event({
+        "message_id": "<eticket@example>",
+        "subject": "Flight Confirmation ETicket Receipt",
+        "sender": "info@saudia.com", "date": datetime.now(),
+        "body": "Ticket number 0652200120916",
+    })
+
+    bot.check_complaint_responses()
+
+    complaint = db.complaints_for_flight(flight["flight_key"])[0]
+    assert complaint["reference"] is None
+    assert complaint["status"] == "accepted_pending_reference"
+    assert api.messages == []
+
+
 def test_ghala_interprets_matched_airline_response_before_escalation(coordinator):
     bot, api = coordinator
 

@@ -100,7 +100,7 @@ def test_only_official_registry_hosts_are_accepted():
 
 def test_saudia_uses_current_public_complaint_form():
     assert AIRLINES["SV"]["complaint_url"] == (
-        "https://www.saudia.com/en-SA/forms/contact-form")
+        "https://www.saudia.com/en/forms/complaint-form")
     assert _is_official_url(AIRLINES["SV"]["complaint_url"])
     assert not _is_official_url(
         "https://booking-uat.dcloud.saudia.com/forms/contact-form")

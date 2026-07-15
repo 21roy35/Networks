@@ -4,7 +4,9 @@ AIRLINES = {
     "SV": {
         "name": "Saudia",
         "domains": ["saudia.com", "saudiairlines.com", "alfursan.saudia.com"],
-        "complaint_url": "https://www.saudia.com/en-SA/forms/contact-form",
+        # Open the official production complaint route directly instead of
+        # depending on the generic contact page's cascading redirect fields.
+        "complaint_url": "https://www.saudia.com/en/forms/complaint-form",
     },
     "XY": {
         "name": "flynas",

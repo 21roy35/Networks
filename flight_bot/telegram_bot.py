@@ -40,6 +40,28 @@ def _clean_excerpt(value: str, limit: int = 1300) -> str:
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
+def _airline_confirmation_reference(subject: str, body: str) -> str:
+    """Extract case ids, including Saudia's real Ticket C_123456 format.
+
+    Plain ticket numbers are accepted only from complaint-lifecycle subjects,
+    so itinerary and e-ticket messages cannot be attached to a complaint.
+    """
+    blob = " ".join((subject or "", body or ""))
+    reference = _extract_reference(blob)
+    if reference:
+        return reference
+    if not re.search(
+            r"SAUDIA-Guest Relations|Registered with us|Under Investigation|"
+            r"Your Ticket|Ticket\s+[A-Z]_\d+",
+            subject or "", re.I):
+        return ""
+    match = re.search(
+        r"(?:\[\s*)?(?:Your\s+)?Ticket\s*:?[\s\xa0]*"
+        r"([A-Z]_\d{6,}|\d{6,})(?:\s*\])?",
+        subject or "", re.I)
+    return match.group(1).upper() if match else ""
+
+
 class TelegramAPI:
     def __init__(self, token: str, session=None):
         self.token = token
@@ -797,7 +819,8 @@ class TelegramCoordinator:
                     capture_key = f"reference-captured:{event['id']}"
                     if db.event_seen(capture_key):
                         continue
-                    captured_reference = _extract_reference(blob)
+                    captured_reference = _airline_confirmation_reference(
+                        event.get("subject") or "", event.get("body") or "")
                     if captured_reference:
                         db.finish_complaint(
                             complaint["id"], "submitted", captured_reference)
