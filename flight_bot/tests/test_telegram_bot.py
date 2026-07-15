@@ -125,6 +125,20 @@ def test_complaint_reservation_blocks_duplicates_but_allows_failed_retry(
         flight["flight_key"], "airline", "Claim", "Broken baggage") is not None
 
 
+def test_legacy_submitted_airline_row_without_reference_is_migrated_to_failed(
+        coordinator):
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = db.list_flights()[0]
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Legacy UAT attempt",
+        "submitted", details="No verifiable production reference.")
+
+    db.init_db()
+
+    complaint = db.complaints_for_flight(flight["flight_key"])[0]
+    assert complaint["status"] == "failed"
+
+
 def test_portal_progress_reports_stage_transitions_with_screenshots(coordinator):
     bot, api = coordinator
     relay = bot.portal_progress_handler()

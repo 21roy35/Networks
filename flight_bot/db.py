@@ -100,8 +100,10 @@ def init_db():
         # as a protected success. Such rows are failures and must never unlock
         # a GACA escalation or suppress a safe retry.
         conn.execute(
-            "UPDATE complaints SET status = 'failed' "
-            "WHERE status = 'confirmation_unknown'")
+            """UPDATE complaints SET status = 'failed'
+               WHERE status = 'confirmation_unknown'
+                  OR (kind = 'airline' AND status = 'submitted'
+                      AND TRIM(COALESCE(reference, '')) = '')""")
 
 
 def save_mail_event(raw: dict) -> int:
