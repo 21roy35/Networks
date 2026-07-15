@@ -924,6 +924,58 @@ def test_pending_post_flight_survey_keeps_priority_over_ai(coordinator,
     assert bot._ai_chat_thread is None
 
 
+def test_unanswered_checkin_does_not_swallow_unrelated_ai_question(coordinator):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = db.list_flights()[0]
+    db.record_survey(flight["flight_key"], bot.chat_id, 701, "asked")
+
+    class FakeGhala:
+        enabled = True
+        name = "Ghala"
+        last_error = ""
+
+        def interpret_telegram(self, message, _catalog):
+            assert message == "show my latest complaint"
+            return {"actions": [{
+                "name": "help", "flight_number": "", "pnr": "",
+                "reference": "", "passenger": "", "query": "",
+                "time_scope": "all", "latest": False, "limit": 5,
+            }], "reply": ""}
+
+    bot.ai = FakeGhala()
+    bot.handle_update({"message": {
+        "message_id": 995, "chat": {"id": 42},
+        "text": "show my latest complaint",
+    }})
+    _wait_for_ai(bot)
+
+    assert len(api.messages) == 2
+    assert "checking your FlightDeck records" in api.messages[0]["text"]
+    assert "Ask naturally" in api.messages[1]["text"]
+    assert db.survey_for_flight(flight["flight_key"])["status"] == "asked"
+
+
+def test_clear_issue_text_still_answers_unreplied_post_flight_checkin(
+        coordinator, monkeypatch):
+    bot, _api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = db.list_flights()[0]
+    db.record_survey(flight["flight_key"], bot.chat_id, 702, "asked")
+    collected = []
+    monkeypatch.setattr(bot, "_collect_issue",
+                        lambda survey, message: collected.append((survey, message)))
+
+    bot.handle_update({"message": {
+        "message_id": 996, "chat": {"id": 42},
+        "text": "The baggage was damaged and the screen was broken.",
+    }})
+
+    assert len(collected) == 1
+    assert collected[0][0]["flight_key"] == flight["flight_key"]
+    assert bot._ai_chat_thread is None
+
+
 def test_short_ai_follow_up_reuses_last_exact_complaint_not_another_case(
         coordinator, tmp_path):
     bot, api = coordinator

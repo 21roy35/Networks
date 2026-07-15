@@ -384,6 +384,25 @@ class TelegramCoordinator:
             self.api.delete_message(self.chat_id, message["message_id"])
         return True
 
+    @staticmethod
+    def _looks_like_survey_issue(value: str) -> bool:
+        """Separate a flight-issue answer from an unrelated bot question."""
+        value = " ".join(str(value or "").split()).strip()
+        if not value:
+            return False
+        if re.match(
+                r"^(?:show|list|find|send|check|sync|open|what|which|when|"
+                r"where|who|how|is|are|did|do|does|can|could|tell me)\b",
+                value, re.IGNORECASE):
+            return False
+        return bool(re.search(
+            r"\b(?:broken|broke|damag\w*|delay\w*|cancel\w*|lost|missing|"
+            r"didn['’]?t work|doesn['’]?t work|not working|failed|"
+            r"unavailable|rude|bad service|seat|screen|baggage|bag|luggage|"
+            r"meal|wheelchair|refund|complain|issue|problem)\b|"
+            r"(?:مكسور|تالف|تعطل|تأخر|ضاعت|حقيبة|شنطة|مشكلة)",
+            value, re.IGNORECASE))
+
     def _handle_message(self, message: dict):
         if self._handle_verification_message(message):
             return
@@ -409,10 +428,19 @@ class TelegramCoordinator:
                 reference, pasted, message):
             return
 
+        positive = re.fullmatch(
+            r"(?:good|great|fine|perfect|all good|no issues?|it was good|"
+            r"ممتاز|جيد|تمام|ما فيه مشاكل)[.! ]*", text, re.I)
         reply_id = (message.get("reply_to_message") or {}).get("message_id")
-        survey = db.pending_survey(self.chat_id, reply_id)
+        survey = (db.pending_survey(self.chat_id, reply_id)
+                  if reply_id is not None else None)
         if not survey:
-            survey = db.pending_survey(self.chat_id)
+            pending = db.pending_survey(self.chat_id)
+            if (pending and (
+                    pending.get("status") in {"awaiting_details", "collecting"}
+                    or positive or message.get("photo")
+                    or self._looks_like_survey_issue(pasted))):
+                survey = pending
         if not survey:
             if pasted and self.ai.enabled:
                 self._dispatch_ai_message(pasted)
@@ -425,9 +453,6 @@ class TelegramCoordinator:
                     "Reply to a post-flight question, use /status, or ask me "
                     "about a flight, passenger, complaint, email, or screenshot.")
             return
-        positive = re.fullmatch(
-            r"(?:good|great|fine|perfect|all good|no issues?|it was good|"
-            r"ممتاز|جيد|تمام|ما فيه مشاكل)[.! ]*", text, re.I)
         if (survey.get("status") == "asked" and positive
                 and not message.get("photo")):
             db.update_survey_status(survey["flight_key"], "good")
