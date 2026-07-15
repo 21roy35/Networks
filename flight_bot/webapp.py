@@ -18,7 +18,8 @@ from .compensation import (ELIGIBLE, POSSIBLY, assess, effective)
 from .complaints import (airline_complaint, complaint_payload, gaca_complaint,
                          missing_portal_fields)
 from .mail_client import eta_text
-from .config import save_user_profile
+from .config import (passenger_profile_key, save_passenger_profile,
+                     save_user_profile)
 from .pipeline import (load_demo, rebuild_flights, reparse_emails,
                        scan_mailbox)
 from .portal_automation import (PortalResult, portal_job_status, set_ai_handler,
@@ -395,8 +396,10 @@ def create_app(config: dict) -> Flask:
     @app.route("/settings/profile", methods=["GET", "POST"])
     def profile_settings():
         next_url = request.values.get("next", "").strip()
+        passenger_name = request.values.get("passenger", "").strip()
         if not (next_url.startswith("/") and not next_url.startswith("//")):
             next_url = url_for("index")
+        family_mode = bool(passenger_name)
         if request.method == "POST":
             fields = (
                 "first_name", "middle_name", "last_name", "email", "phone",
@@ -423,12 +426,39 @@ def create_app(config: dict) -> Flask:
             elif not re.fullmatch(r"\+?\d{1,4}", values["country_code"]):
                 flash("Use a country calling code such as +966.")
             else:
-                config["user"].update(values)
-                save_user_profile(values)
-                flash("Complaint profile saved. Future forms will be auto-filled.")
+                if family_mode:
+                    values["booking_name"] = passenger_name
+                    key = passenger_profile_key(passenger_name)
+                    config.setdefault("passengers", {})[key] = values
+                    save_passenger_profile(passenger_name, values)
+                    flash(f"Complaint profile saved for {passenger_name}.")
+                else:
+                    config["user"].update(values)
+                    save_user_profile(values)
+                    flash("Complaint profile saved. Future forms will be auto-filled.")
                 return redirect(next_url)
+        if family_mode:
+            key = passenger_profile_key(passenger_name)
+            profile = dict((config.get("passengers") or {}).get(key) or {})
+            if not profile:
+                parts = passenger_name.split()
+                profile.update({
+                    "booking_name": passenger_name,
+                    "full_name": passenger_name,
+                    "first_name": parts[0] if parts else "",
+                    "middle_name": " ".join(parts[1:-1]) if len(parts) > 2 else "",
+                    "last_name": parts[-1] if len(parts) > 1 else "",
+                    # The account owner's contact can receive updates, but no
+                    # identity/loyalty field is copied to a relative.
+                    "email": config["user"].get("email") or "",
+                    "phone": config["user"].get("phone") or "",
+                    "country_code": config["user"].get("country_code") or "",
+                })
+        else:
+            profile = config["user"]
         return render_template(
-            "profile.html", profile=config["user"], next_url=next_url)
+            "profile.html", profile=profile, next_url=next_url,
+            passenger_name=passenger_name, family_mode=family_mode)
 
     @app.route("/flight/<int:flight_id>")
     def flight_detail(flight_id):
@@ -500,12 +530,24 @@ def create_app(config: dict) -> Flask:
         reference = prior.get("reference") if prior else ""
         complaint_date = (prior.get("created_at") or "")[:10] if prior else ""
         incident = (prior.get("details") or "") if prior else ""
+        missing = []
+        profile_passenger = ""
+        if reference:
+            preview = complaint_payload(
+                flight, config["user"], "gaca",
+                incident if len(incident.strip()) >= 15 else
+                "The airline did not resolve the passenger complaint.",
+                reference or "", complaint_date,
+                passenger_profiles=config.get("passengers") or {})
+            missing = missing_portal_fields(preview)
+            profile_passenger = preview.get("profile_passenger_name") or ""
         return render_template(
             "complaint.html", flight=_flight_view(flight),
             letter=gaca_complaint(flight, config["user"], incident,
                                   reference or "", complaint_date),
             kind="gaca", incident=incident, prior=prior,
-            gaca_ready=bool(reference), missing=[])
+            gaca_ready=bool(reference), missing=missing,
+            profile_passenger=profile_passenger)
 
     @app.route("/flight/<int:flight_id>/complaint/airline")
     def complaint_airline(flight_id):
@@ -514,12 +556,14 @@ def create_app(config: dict) -> Flask:
             abort(404)
         preview = complaint_payload(
             flight, config["user"], "airline",
-            "Complaint details will be entered before submission.")
+            "Complaint details will be entered before submission.",
+            passenger_profiles=config.get("passengers") or {})
         return render_template(
             "complaint.html", flight=_flight_view(flight),
             letter=airline_complaint(flight, config["user"]), kind="airline",
             incident="", prior=None, gaca_ready=False,
-            missing=missing_portal_fields(preview))
+            missing=missing_portal_fields(preview),
+            profile_passenger=preview.get("profile_passenger_name") or "")
 
     @app.route("/flight/<int:flight_id>/complaint/<kind>/submit",
                methods=["POST"])
@@ -540,7 +584,8 @@ def create_app(config: dict) -> Flask:
         try:
             payload = complaint_payload(
                 flight, config["user"], kind, incident,
-                reference or "", complaint_date, ai_analysis=ai_analysis)
+                reference or "", complaint_date, ai_analysis=ai_analysis,
+                passenger_profiles=config.get("passengers") or {})
         except ValueError as exc:
             flash(str(exc))
             endpoint = "complaint_gaca" if kind == "gaca" else "complaint_airline"
@@ -549,7 +594,13 @@ def create_app(config: dict) -> Flask:
         if missing:
             flash("Add the missing trip/profile data before submitting: "
                   + ", ".join(missing) + ".")
-            return redirect(url_for("flight_detail", flight_id=flight_id))
+            endpoint = "complaint_gaca" if kind == "gaca" else "complaint_airline"
+            claim_url = url_for(endpoint, flight_id=flight_id)
+            if payload.get("passenger_profile_missing"):
+                return redirect(url_for(
+                    "profile_settings", next=claim_url,
+                    passenger=payload.get("profile_passenger_name") or ""))
+            return redirect(claim_url)
 
         flight_key = flight["flight_key"]
         subject = payload["subject"]

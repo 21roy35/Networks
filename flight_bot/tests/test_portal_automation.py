@@ -67,6 +67,74 @@ def test_payload_prefers_exact_saved_profile_names_and_alfursan_id():
     assert payload["alfursan_id"] == "30680000"
 
 
+def test_family_booking_never_inherits_primary_users_identity():
+    flight = sample_flight()
+    flight["passenger"] = "Muhannad Alqahtani"
+    owner = profile()
+    owner.update({
+        "full_name": "Mansour Albu Asais",
+        "first_name": "Mansour",
+        "middle_name": "Albu",
+        "last_name": "Asais",
+        "national_id": "OWNER-ID",
+        "alfursan_id": "30689772",
+    })
+
+    payload = complaint_payload(
+        flight, owner, "airline",
+        "The flight was cancelled without a suitable alternative.")
+
+    assert payload["passenger_name"] == "Muhannad Alqahtani"
+    assert payload["first_name"] == "Muhannad"
+    assert payload["last_name"] == "Alqahtani"
+    assert payload["national_id"] == ""
+    assert payload["title"] == ""
+    assert payload["nationality"] == ""
+    assert payload["alfursan_id"] == ""
+    assert payload["email"] == "passenger@example.com"
+    assert missing_portal_fields(payload) == [
+        "saved identity profile for Muhannad Alqahtani"]
+
+
+def test_family_booking_uses_only_that_passengers_saved_profile():
+    flight = sample_flight()
+    flight["passenger"] = "Muhannad Alqahtani"
+    owner = profile()
+    owner.update({
+        "full_name": "Mansour Albu Asais",
+        "first_name": "Mansour",
+        "national_id": "OWNER-ID",
+        "alfursan_id": "30689772",
+    })
+    family = {
+        "muhannad alqahtani": {
+            "booking_name": "Muhannad Alqahtani",
+            "full_name": "Muhannad Alqahtani",
+            "first_name": "Muhannad",
+            "last_name": "Alqahtani",
+            "email": "muhannad@example.com",
+            "phone": "+966511111111",
+            "country_code": "+966",
+            "national_id": "MUHANNAD-ID",
+            "title": "Mr",
+            "nationality": "Saudi Arabian",
+            "alfursan_id": "FAMILY-123",
+        },
+    }
+
+    payload = complaint_payload(
+        flight, owner, "airline",
+        "The flight was cancelled without a suitable alternative.",
+        passenger_profiles=family)
+
+    assert payload["passenger_name"] == "Muhannad Alqahtani"
+    assert payload["national_id"] == "MUHANNAD-ID"
+    assert payload["alfursan_id"] == "FAMILY-123"
+    assert payload["email"] == "muhannad@example.com"
+    assert payload["passenger_profile_missing"] is False
+    assert missing_portal_fields(payload) == []
+
+
 def test_ai_analysis_augments_letter_but_preserves_original_incident():
     original = "My seat was broken and the screen did not work."
     payload = complaint_payload(

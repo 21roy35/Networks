@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from copy import deepcopy
 from pathlib import Path
 
@@ -33,6 +34,9 @@ DEFAULTS = {
         "national_id": "",
         "alfursan_id": "",
     },
+    # Identity details belong to a passenger, not to the whole inbox.  Keys
+    # are normalized booking names (for example ``muhannad alqahtani``).
+    "passengers": {},
     "web": {
         "host": "127.0.0.1",
         "port": 5000,
@@ -142,6 +146,8 @@ def load_config() -> dict:
             raise SystemExit(f"{section}.{key} must be a number.") from exc
     if not isinstance(config["imap"].get("folders"), list):
         raise SystemExit("imap.folders must be a JSON list of mailbox names.")
+    if not isinstance(config.get("passengers"), dict):
+        raise SystemExit("passengers must be a JSON object keyed by passenger name.")
     if config["telegram"].get("bot_token") and config["telegram"].get("chat_id"):
         config["telegram"]["enabled"] = True
     if config["captcha"].get("api_key"):
@@ -167,6 +173,44 @@ def save_user_profile(profile: dict) -> None:
         **{key: str(value or "").strip() for key, value in profile.items()
            if key in allowed},
     }
+    temporary = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
+    temporary.write_text(json.dumps(current, indent=2, ensure_ascii=False) + "\n",
+                         encoding="utf-8")
+    temporary.replace(CONFIG_PATH)
+
+
+def passenger_profile_key(name: str) -> str:
+    """Return a stable lookup key for one passenger's booking name."""
+    value = re.sub(r"\be[\s-]*ticket\b.*$", "", str(name or ""),
+                   flags=re.IGNORECASE)
+    value = re.sub(r"[^\w]+", " ", value, flags=re.UNICODE)
+    return " ".join(value.casefold().split())
+
+
+def save_passenger_profile(passenger_name: str, profile: dict) -> None:
+    """Persist identity/contact fields for one family passenger."""
+    key = passenger_profile_key(passenger_name)
+    if not key:
+        raise ValueError("A passenger name is required.")
+    current = _load_file()
+    passengers = current.get("passengers")
+    if not isinstance(passengers, dict):
+        passengers = {}
+    existing = passengers.get(key)
+    if not isinstance(existing, dict):
+        existing = {}
+    allowed = {
+        "booking_name", "full_name", "first_name", "middle_name",
+        "last_name", "email", "phone", "national_id", "title",
+        "nationality", "country_code", "alfursan_id",
+    }
+    cleaned = {
+        field: str(value or "").strip()
+        for field, value in profile.items() if field in allowed
+    }
+    cleaned["booking_name"] = str(passenger_name).strip()
+    passengers[key] = {**existing, **cleaned}
+    current["passengers"] = passengers
     temporary = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
     temporary.write_text(json.dumps(current, indent=2, ensure_ascii=False) + "\n",
                          encoding="utf-8")

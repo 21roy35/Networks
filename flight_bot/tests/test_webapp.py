@@ -140,6 +140,38 @@ def test_profile_is_saved_once_and_returns_to_claim(client, monkeypatch):
     assert saved["country_code"] == "+966"
 
 
+def test_family_passenger_gets_separate_profile_and_claim_is_blocked_until_saved(
+        client, monkeypatch):
+    flight = db.list_flights()[0]
+    db.set_overrides(flight["id"], {"passenger": "Muhannad Alqahtani"})
+    claim_url = f"/flight/{flight['id']}/complaint/airline"
+
+    page = client.get(claim_url)
+    assert b"saved identity profile for Muhannad Alqahtani" in page.data
+    assert b"Complete Muhannad Alqahtani" in page.data
+
+    saved = {}
+    monkeypatch.setattr(
+        webapp, "save_passenger_profile",
+        lambda passenger, values: saved.update(passenger=passenger, **values))
+    response = client.post("/settings/profile", data={
+        "next": claim_url, "passenger": "Muhannad Alqahtani",
+        "first_name": "Muhannad", "middle_name": "",
+        "last_name": "Alqahtani", "email": "m@example.com",
+        "phone": "+966511111111", "national_id": "MUHANNAD-ID",
+        "title": "Mr", "nationality": "Saudi Arabian",
+        "country_code": "+966", "alfursan_id": "FAMILY-123",
+    })
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith(claim_url)
+    assert saved["passenger"] == "Muhannad Alqahtani"
+    assert saved["national_id"] == "MUHANNAD-ID"
+    assert saved["alfursan_id"] == "FAMILY-123"
+
+    updated = client.get(claim_url)
+    assert b"saved identity profile for Muhannad Alqahtani" not in updated.data
+
+
 def test_scan_without_credentials_gives_actionable_message(client):
     response = client.post("/scan", follow_redirects=True)
     assert response.status_code == 200

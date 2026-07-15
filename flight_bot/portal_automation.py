@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import io
 import json
+import logging
 import os
 import sys
 import threading
@@ -21,6 +22,10 @@ from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
 from .airlines import AIRLINES, GACA
+from .config import TELEGRAM_EVIDENCE_DIR
+
+
+logger = logging.getLogger(__name__)
 
 
 _PROFILE_DIR = Path(__file__).resolve().parent / ".portal-profile"
@@ -71,7 +76,8 @@ def set_captcha_solver(handler: Callable[[dict], dict | None] | None):
 
 
 def _public_job(job: dict) -> dict:
-    return {key: value for key, value in job.items() if key != "payload"}
+    return {key: value for key, value in job.items()
+            if key not in {"payload", "screenshot_file"}}
 
 
 def portal_job_status(job_id: str) -> dict | None:
@@ -98,24 +104,41 @@ def start_portal_job(payload: dict,
         _JOBS[job_id] = job
 
     def update(status: str, message: str, image: bytes | None = None):
+        screenshot_file = None
+        if image:
+            try:
+                evidence_dir = TELEGRAM_EVIDENCE_DIR / "portal_jobs"
+                evidence_dir.mkdir(parents=True, exist_ok=True)
+                screenshot_file = evidence_dir / f"{job_id}.png"
+                temporary = screenshot_file.with_suffix(".png.tmp")
+                temporary.write_bytes(image)
+                temporary.replace(screenshot_file)
+            except Exception:
+                logger.exception("Could not persist portal screenshot for job %s",
+                                 job_id)
         with _JOBS_LOCK:
             current = _JOBS.get(job_id)
             if current:
                 current.update(status=status, message=message,
                                terminal=status in _TERMINAL)
+                if screenshot_file:
+                    current.update(screenshot_available=True,
+                                   screenshot_file=str(screenshot_file))
         if on_update:
             try:
                 on_update(status, message, image)
             except Exception:
                 # Telegram progress reporting must never interrupt a portal
                 # submission that is otherwise proceeding normally.
-                pass
+                logger.exception("Portal progress callback failed for job %s",
+                                 job_id)
 
     def worker():
         try:
             with _BROWSER_LOCK:
                 result = submit_portal_claim(payload, update)
         except Exception as exc:  # pragma: no cover - final safety boundary
+            logger.exception("Portal automation job %s crashed", job_id)
             result = PortalResult(
                 "error", f"Portal automation stopped: {exc}")
         update(result.status, result.message)
@@ -125,7 +148,11 @@ def start_portal_job(payload: dict,
                 current.update(reference=result.reference)
                 current.pop("payload", None)
         if on_complete:
-            on_complete(result)
+            try:
+                on_complete(result)
+            except Exception:
+                logger.exception("Portal completion callback failed for job %s",
+                                 job_id)
 
     threading.Thread(target=worker, name=f"portal-{job_id[:8]}",
                      daemon=True).start()

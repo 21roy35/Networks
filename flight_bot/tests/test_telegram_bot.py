@@ -174,6 +174,22 @@ def test_due_flight_gets_one_telegram_survey(coordinator):
     assert len(api.messages) == 1
 
 
+def test_post_flight_question_names_the_actual_family_passenger(coordinator):
+    bot, _api = coordinator
+    family_flight = {
+        "flight_number": "SV1650", "origin": "JED", "destination": "AHB",
+        "passenger": "Muhannad Alqahtani", "overrides": {},
+    }
+    owner_flight = {
+        **family_flight, "passenger": "Test Passenger",
+    }
+
+    assert bot._post_flight_label(family_flight) == (
+        "Muhannad Alqahtani's flight SV1650 from JED to AHB")
+    assert bot._post_flight_label(owner_flight) == (
+        "your flight SV1650 from JED to AHB")
+
+
 def test_web_command_returns_short_lived_private_link(coordinator):
     bot, api = coordinator
     bot.config["web"].update({

@@ -6,6 +6,7 @@ from datetime import date
 
 from .airlines import AIRLINES, GACA
 from .compensation import ELIGIBLE, POSSIBLY, assess, effective
+from .config import passenger_profile_key
 
 
 def _line(label: str, value) -> str:
@@ -46,6 +47,49 @@ def _names(full_name: str) -> tuple[str, str, str]:
     if len(parts) == 1:
         return parts[0], "", parts[0]
     return parts[0], " ".join(parts[1:-1]), parts[-1]
+
+
+def _clean_passenger_name(value: str) -> str:
+    """Remove parser labels that can trail a passenger's booking name."""
+    import re
+    value = re.sub(r"\be[\s-]*ticket\b.*$", "", str(value or ""),
+                   flags=re.IGNORECASE)
+    return " ".join(value.split()).strip(" ,;:-")
+
+
+def _same_passenger(booking_name: str, profile: dict) -> bool:
+    """Match a booking name to the primary user without fuzzy family guesses."""
+    booking_key = passenger_profile_key(booking_name)
+    candidates = [
+        profile.get("full_name"),
+        " ".join(filter(None, (
+            str(profile.get("first_name") or "").strip(),
+            str(profile.get("middle_name") or "").strip(),
+            str(profile.get("last_name") or "").strip(),
+        ))),
+    ]
+    candidate_keys = {passenger_profile_key(value) for value in candidates if value}
+    if booking_key in candidate_keys:
+        return True
+    # Some itinerary emails expose only the first name.  Accept that exact
+    # one-token match, but never use partial/fuzzy surname matching.
+    booking_parts = booking_key.split()
+    first = passenger_profile_key(profile.get("first_name") or "").split()
+    return len(booking_parts) == 1 and bool(first) and booking_parts == first[:1]
+
+
+def _passenger_profile(booking_name: str, profiles: dict) -> dict | None:
+    key = passenger_profile_key(booking_name)
+    direct = profiles.get(key)
+    if isinstance(direct, dict):
+        return direct
+    for profile in profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        known_name = profile.get("booking_name") or profile.get("full_name") or ""
+        if passenger_profile_key(known_name) == key:
+            return profile
+    return None
 
 
 def _subject(flight: dict, prefix: str) -> str:
@@ -129,7 +173,8 @@ def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
                       airline_reference: str = "",
                       airline_complaint_date: str = "",
                       attachments: list[str] | None = None,
-                      ai_analysis: dict | None = None) -> dict:
+                      ai_analysis: dict | None = None,
+                      passenger_profiles: dict | None = None) -> dict:
     """Return normalized fields consumed by all official-site adapters."""
     incident = " ".join((incident or "").split()).strip()
     if len(incident) < 15:
@@ -139,16 +184,23 @@ def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
     if kind == "gaca" and not airline_reference:
         raise ValueError("Submit to the airline first so GACA receives its reference number.")
 
-    trip_passenger = effective(flight, "passenger") or ""
-    profile_name = user.get("full_name") or ""
+    trip_passenger = _clean_passenger_name(effective(flight, "passenger") or "")
+    profiles = passenger_profiles if isinstance(passenger_profiles, dict) else {}
+    is_primary = not trip_passenger or _same_passenger(trip_passenger, user)
+    selected_profile = (user if is_primary
+                        else _passenger_profile(trip_passenger, profiles))
+    passenger_profile_missing = bool(trip_passenger and not is_primary
+                                     and selected_profile is None)
+    identity = selected_profile or {}
+    profile_name = identity.get("full_name") or trip_passenger
     explicit_names = [
-        str(user.get("first_name") or "").strip(),
-        str(user.get("middle_name") or "").strip(),
-        str(user.get("last_name") or "").strip(),
+        str(identity.get("first_name") or "").strip(),
+        str(identity.get("middle_name") or "").strip(),
+        str(identity.get("last_name") or "").strip(),
     ]
     passenger = (" ".join(filter(None, explicit_names))
                  if explicit_names[0] or explicit_names[2]
-                 else profile_name or trip_passenger)
+                 else trip_passenger or profile_name)
     parsed_first, parsed_middle, parsed_last = _names(
         profile_name or trip_passenger)
     first = explicit_names[0] or parsed_first
@@ -180,10 +232,21 @@ def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
             sections.append("Requested resolution: "
                             + str(ai_analysis["requested_remedy"]).strip())
         complaint_incident = "\n  ".join(sections)
+    contact_email = identity.get("email") or user.get("email") or ""
+    contact_phone = identity.get("phone") or user.get("phone") or ""
+    contact_country_code = (identity.get("country_code")
+                            or user.get("country_code") or "")
+    letter_user = {
+        **identity,
+        "full_name": passenger or trip_passenger,
+        "email": contact_email,
+        "phone": contact_phone,
+    }
     letter = (gaca_complaint(
-        flight, user, complaint_incident, airline_reference, airline_complaint_date)
+        flight, letter_user, complaint_incident, airline_reference,
+        airline_complaint_date)
         if kind == "gaca" else airline_complaint(
-            flight, user, complaint_incident))
+            flight, letter_user, complaint_incident))
     departure = effective(flight, "departure") or ""
     return {
         "kind": kind,
@@ -191,16 +254,20 @@ def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
         "airline_name": flight.get("airline_name")
                         or flight.get("airline_code") or "",
         "passenger_name": passenger,
+        "booking_passenger_name": trip_passenger,
+        "passenger_is_primary": is_primary,
+        "passenger_profile_missing": passenger_profile_missing,
+        "profile_passenger_name": trip_passenger if passenger_profile_missing else "",
         "first_name": first,
         "middle_name": middle,
         "last_name": last,
-        "email": user.get("email") or "",
-        "phone": user.get("phone") or "",
-        "national_id": user.get("national_id") or "",
-        "title": user.get("title") or "",
-        "nationality": user.get("nationality") or "",
-        "country_code": user.get("country_code") or "",
-        "alfursan_id": user.get("alfursan_id") or "",
+        "email": contact_email,
+        "phone": contact_phone,
+        "national_id": identity.get("national_id") or "",
+        "title": identity.get("title") or "",
+        "nationality": identity.get("nationality") or "",
+        "country_code": contact_country_code,
+        "alfursan_id": identity.get("alfursan_id") or "",
         "pnr": flight.get("pnr") or "",
         "ticket_number": ticket_numbers[0] if ticket_numbers else "",
         "flight_number": effective(flight, "flight_number")
@@ -232,7 +299,12 @@ def missing_portal_fields(payload: dict) -> list[str]:
         "flight_number": "flight number",
         "flight_date": "flight date",
     }
-    if payload.get("airline_code") == "SV" and payload["kind"] == "airline":
+    missing = []
+    if payload.get("passenger_profile_missing"):
+        name = payload.get("profile_passenger_name") or "this passenger"
+        missing.append(f"saved identity profile for {name}")
+    if (payload.get("airline_code") == "SV" and payload["kind"] == "airline"
+            and not payload.get("passenger_profile_missing")):
         required["ticket_number"] = "e-ticket number"
         required["title"] = "title"
         required["nationality"] = "nationality"
@@ -243,4 +315,6 @@ def missing_portal_fields(payload: dict) -> list[str]:
             "airline_reference": "airline complaint reference",
             "airline_complaint_date": "airline complaint date",
         })
-    return [label for field, label in required.items() if not payload.get(field)]
+    missing.extend(label for field, label in required.items()
+                   if not payload.get(field))
+    return missing

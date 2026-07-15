@@ -188,7 +188,8 @@ _NOT_NAMES = {
 # "... MEMBERSHIP"), not part of it.
 _NAME_TRAILING_JUNK = re.compile(
     r"\s+(?:pas(?:senger)?s?|memb(?:er(?:ship)?)?|guest|frequent|flyer|"
-    r"class|economy|business|adult|seat|mr|mrs|ms)$", re.IGNORECASE)
+    r"class|economy|business|adult|seat|e[\s-]*ticket|mr|mrs|ms)$",
+    re.IGNORECASE)
 
 _PNR_STOPWORDS = {"NUMBER", "BOOKING", "TICKET", "FLIGHT", "TRAVEL",
                   "ONLINE", "PLEASE", "BELOW"}

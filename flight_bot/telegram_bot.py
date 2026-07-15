@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import queue
 import re
 import threading
@@ -13,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from email.utils import parseaddr
 from pathlib import Path
+from urllib.parse import urlencode
 
 import requests
 
@@ -21,13 +23,16 @@ from .ai_assistant import ClaudeAssistant
 from .airlines import AIRLINES
 from .captcha_solver import TwoCaptchaSolver
 from .complaints import complaint_payload, missing_portal_fields
-from .config import TELEGRAM_EVIDENCE_DIR
+from .config import TELEGRAM_EVIDENCE_DIR, passenger_profile_key
 from .flight_status import live_landed, parse_flight_time, schedule_has_finished
 from .pipeline import scan_mailbox
 from .portal_automation import (PortalResult, _extract_reference, set_ai_handler,
                                 set_captcha_solver, set_verification_handler,
                                 start_portal_job)
 from .web_access import create_web_token
+
+
+logger = logging.getLogger(__name__)
 
 
 def _buttons(rows: list[list[tuple[str, str]]]) -> dict:
@@ -213,7 +218,7 @@ class TelegramCoordinator:
         except Exception:
             # Command-menu registration is convenient but must never prevent
             # polling, monitoring, or complaint filing from starting.
-            pass
+            logger.exception("Telegram command registration failed")
 
     def stop(self):
         self.stop_event.set()
@@ -257,7 +262,7 @@ class TelegramCoordinator:
                     else:
                         self.api.send_message(self.chat_id, text)
                 except Exception:
-                    pass
+                    logger.exception("Telegram portal progress delivery failed")
                 finally:
                     deliveries.task_done()
                 if status in terminal:
@@ -328,6 +333,7 @@ class TelegramCoordinator:
                     self.offset = max(self.offset, int(update["update_id"]) + 1)
                     self.handle_update(update)
             except Exception:
+                logger.exception("Telegram update polling failed")
                 self.stop_event.wait(3)
 
     def _monitor_loop(self):
@@ -340,7 +346,7 @@ class TelegramCoordinator:
                 self.ask_for_pending_references()
                 self.auto_escalate_due_complaints()
             except Exception:
-                pass
+                logger.exception("Telegram monitor cycle failed")
             self.stop_event.wait(interval)
 
     def _authorized(self, chat_id) -> bool:
@@ -586,7 +592,48 @@ class TelegramCoordinator:
         origin = flight.get("origin") or "your origin"
         destination = flight.get("destination") or "your destination"
         prefix = f" {number}" if number else ""
-        return f"your flight{prefix} from {origin} to {destination}"
+        passenger = ((flight.get("overrides") or {}).get("passenger")
+                     or flight.get("passenger") or "")
+        passenger = re.sub(r"\s+e[\s-]*ticket\b.*$", "", passenger,
+                           flags=re.IGNORECASE).strip()
+        owner = self.config.get("user") or {}
+        owner_names = {
+            passenger_profile_key(owner.get("full_name") or ""),
+            passenger_profile_key(" ".join(filter(None, (
+                owner.get("first_name"), owner.get("middle_name"),
+                owner.get("last_name"),
+            )))),
+        }
+        booking_key = passenger_profile_key(passenger)
+        owner_first = passenger_profile_key(owner.get("first_name") or "")
+        is_owner = (not booking_key or booking_key in owner_names
+                    or (len(booking_key.split()) == 1
+                        and booking_key == owner_first))
+        subject = "your flight" if is_owner else f"{passenger}'s flight"
+        return f"{subject}{prefix} from {origin} to {destination}"
+
+    def _passenger_profile_buttons(self, payload: dict, flight: dict) -> dict | None:
+        """Create a signed mobile link without exposing another person's data."""
+        passenger = payload.get("profile_passenger_name") or ""
+        settings = self.config.get("web") or {}
+        base_url = str(settings.get("public_base_url") or "").rstrip("/")
+        secret = str(settings.get("access_secret") or "")
+        if not passenger or not base_url or not secret:
+            return None
+        token = create_web_token(secret, self.chat_id)
+        next_path = f"/flight/{flight['id']}/complaint/airline"
+        query = urlencode({
+            "passenger": passenger,
+            "next": next_path,
+            "access": token,
+        })
+        return {"inline_keyboard": [[{
+            "text": f"Complete {passenger}'s profile",
+            "url": f"{base_url}/settings/profile?{query}",
+        }], [{
+            "text": "Try filing again after saving",
+            "callback_data": f"submit_issue:{flight['id']}",
+        }]]}
 
     def _send_web_link(self):
         settings = self.config.get("web") or {}
@@ -674,15 +721,27 @@ class TelegramCoordinator:
         try:
             payload = complaint_payload(
                 flight, self.config["user"], "airline", intake.incident,
-                attachments=intake.attachments, ai_analysis=ai_analysis)
+                attachments=intake.attachments, ai_analysis=ai_analysis,
+                passenger_profiles=self.config.get("passengers") or {})
         except ValueError as exc:
             self.notify(str(exc))
             return
         missing = missing_portal_fields(payload)
         if missing:
             db.update_survey_status(flight_key, "needs_profile")
-            self.notify("I need these one-time profile/flight details before filing: "
-                        + ", ".join(missing) + ". Complete them in FlightDeck.")
+            with self._lock:
+                self._intakes[flight_key] = intake
+            if payload.get("passenger_profile_missing"):
+                passenger = payload.get("profile_passenger_name")
+                self.notify(
+                    f"This booking belongs to {passenger}, not the account "
+                    "owner. I stopped before submission so I do not reuse "
+                    "Mansour's National ID or AlFursan number. Save this "
+                    "passenger's identity once, then tap Try filing again.",
+                    buttons=self._passenger_profile_buttons(payload, flight))
+            else:
+                self.notify("I need these one-time profile/flight details before filing: "
+                            + ", ".join(missing) + ". Complete them in FlightDeck.")
             return
         complaint_id = db.begin_complaint(
             flight_key, "airline", payload["subject"], intake.incident,
@@ -762,7 +821,8 @@ class TelegramCoordinator:
                 flight, self.config["user"], "gaca", incident,
                 prior["reference"], (prior.get("created_at") or "")[:10],
                 attachments=prior.get("attachments") or [],
-                ai_analysis=ai_analysis)
+                ai_analysis=ai_analysis,
+                passenger_profiles=self.config.get("passengers") or {})
         except ValueError as exc:
             self.notify(str(exc))
             return False

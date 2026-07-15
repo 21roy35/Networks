@@ -72,7 +72,7 @@
   {% endif %}
 
   {% if missing %}
-  <div class="alert errorish"><strong>Missing auto-fill data:</strong> {{ missing|join(', ') }}.<div class="actions" style="margin-top:11px"><a class="btn small-btn" href="{{ url_for('profile_settings', next=request.path) }}">Complete one-time profile</a><a class="btn small-btn" href="{{ url_for('flight_detail', flight_id=flight.id) }}#corrections">Correct trip details</a></div></div>
+  <div class="alert errorish"><strong>Missing auto-fill data:</strong> {{ missing|join(', ') }}.<div class="actions" style="margin-top:11px"><a class="btn small-btn" href="{{ url_for('profile_settings', next=request.path, passenger=profile_passenger) }}">{% if profile_passenger %}Complete {{ profile_passenger }}â€™s profile{% else %}Complete one-time profile{% endif %}</a><a class="btn small-btn" href="{{ url_for('flight_detail', flight_id=flight.id) }}#corrections">Correct trip details</a></div></div>
   {% endif %}
 
   <section class="card automation-card">
