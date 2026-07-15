@@ -423,6 +423,40 @@ def test_auto_escalation_waits_and_skips_detected_response(
     assert calls == []
 
 
+def test_due_escalation_waits_visibly_for_required_airline_reference(
+        coordinator, monkeypatch):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Screen complaint",
+        "confirmation_unknown", details="Broken screen")
+    complaint_id = db.complaints_for_flight(flight["flight_key"])[0]["id"]
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE complaints SET created_at = ? WHERE id = ?",
+            ((datetime.now() - timedelta(days=8)).strftime(
+                "%Y-%m-%d %H:%M:%S"), complaint_id))
+    calls = []
+    monkeypatch.setattr(
+        bot, "_launch_gaca",
+        lambda *_args, **_kwargs: calls.append(1) or True)
+
+    bot.auto_escalate_due_complaints(now=datetime.now())
+    bot.auto_escalate_due_complaints(now=datetime.now())
+
+    assert calls == []
+    assert sum("GACA requires" in item["text"] for item in api.messages) == 1
+    assert db.event_seen(f"auto-gaca-waiting-reference:{complaint_id}")
+    assert not db.event_seen(f"auto-gaca:{complaint_id}")
+
+    db.finish_complaint(complaint_id, "submitted", "CAS-700003")
+    bot.auto_escalate_due_complaints(now=datetime.now())
+    assert calls == [1]
+    assert db.event_seen(f"auto-gaca:{complaint_id}")
+
+
 def test_every_candidate_mail_is_kept_for_response_matching(
         coordinator):
     raw = [{

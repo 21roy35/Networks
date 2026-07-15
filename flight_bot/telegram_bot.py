@@ -657,8 +657,8 @@ class TelegramCoordinator:
         cutoff = now - timedelta(days=delay_days)
         for complaint in db.list_complaints():
             if (complaint.get("kind") != "airline"
-                    or complaint.get("status") != "submitted"
-                    or not complaint.get("reference")):
+                    or complaint.get("status") not in {
+                        "submitted", "confirmation_unknown"}):
                 continue
             complaint_id = complaint["id"]
             scheduled_key = f"auto-gaca:{complaint_id}"
@@ -667,6 +667,19 @@ class TelegramCoordinator:
                 continue
             created = parse_flight_time(complaint.get("created_at"))
             if not created or created > cutoff:
+                continue
+            if not complaint.get("reference"):
+                waiting_key = f"auto-gaca-waiting-reference:{complaint_id}"
+                if not db.event_seen(waiting_key):
+                    scan_minutes = max(1, int(self.settings.get(
+                        "mailbox_scan_minutes", 10)))
+                    self.notify(
+                        "GACA escalation is now due, but GACA requires the "
+                        "airline complaint number. I am continuing to scan "
+                        f"email every {scan_minutes} minutes and will launch "
+                        "the escalation automatically as soon as the airline "
+                        "reference is recovered.")
+                    db.mark_event_seen(waiting_key)
                 continue
             flight_id = complaint.get("flight_id")
             flight = db.get_flight(int(flight_id)) if flight_id else None
