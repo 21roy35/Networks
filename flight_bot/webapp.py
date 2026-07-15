@@ -578,7 +578,11 @@ def create_app(config: dict) -> Flask:
                 db.finish_complaint(
                     complaint_id, "accepted_pending_reference")
                 if telegram:
-                    telegram.ask_for_pending_references()
+                    telegram.notify(
+                        f"{kind.upper()} was accepted without returning its "
+                        "reference on the page. I will check email first; if the "
+                        "reference is still missing after the mailbox scan, I will "
+                        "ask for the SMS in Telegram. No duplicate will be filed.")
             elif result.status == "confirmation_unknown":
                 db.finish_complaint(complaint_id, "failed")
                 if telegram:

@@ -362,6 +362,10 @@ def test_bot_asks_once_for_pending_saudia_sms_reference(coordinator):
     db.add_complaint(
         flight["flight_key"], "airline", None, "Screen complaint",
         "accepted_pending_reference", details="The screen was broken.")
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE complaints SET created_at = datetime('now', '-3 minutes') "
+            "WHERE flight_key = ?", (flight["flight_key"],))
 
     bot.ask_for_pending_references()
     bot.ask_for_pending_references()
@@ -369,7 +373,42 @@ def test_bot_asks_once_for_pending_saudia_sms_reference(coordinator):
     assert len(api.messages) == 1
     assert api.messages[0]["force_reply"] is True
     assert "paste its text" in api.messages[0]["text"]
-    assert "C_ reference" in api.messages[0]["text"]
+    assert "service-ticket number" in api.messages[0]["text"]
+
+
+def test_contextual_saudia_ticket_number_is_normalized_to_case_reference(
+        coordinator):
+    bot, _api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Screen complaint",
+        "accepted_pending_reference", details="The screen was broken.")
+
+    bot.handle_update({"message": {
+        "message_id": 303, "chat": {"id": 42},
+        "text": "SAUDIA: Your Ticket 2777654 is Registered with us.",
+    }})
+
+    complaint = db.complaints_for_flight(flight["flight_key"])[0]
+    assert complaint["status"] == "submitted"
+    assert complaint["reference"] == "C_2777654"
+
+
+def test_bot_waits_for_email_scan_window_before_asking_for_sms(coordinator):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Screen complaint",
+        "accepted_pending_reference", details="The screen was broken.")
+
+    bot.ask_for_pending_references(now=datetime.now())
+
+    assert api.messages == []
+    assert not db.event_seen("telegram-reference-requested:1")
 
 
 def test_plain_ticket_number_is_not_mistaken_for_sms_reference(coordinator):

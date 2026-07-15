@@ -63,10 +63,19 @@ def _airline_confirmation_reference(subject: str, body: str) -> str:
 
 
 def _telegram_sms_reference(value: str) -> str:
-    """Return only a Saudia-style C_ reference from a pasted SMS."""
+    """Return a Saudia case ref, not a passenger's 13-digit e-ticket."""
     match = re.search(r"(?<![A-Z0-9])C[\s_-]*(\d{6,})(?!\d)",
                       value or "", re.I)
-    return f"C_{match.group(1)}" if match else ""
+    if match:
+        return f"C_{match.group(1)}"
+    # Some Saudia notifications say only "Your Ticket 2774567" even though
+    # later correspondence renders the same case as C_2774567. Require clear
+    # case context and 6-9 digits so a 13-digit passenger e-ticket is ignored.
+    contextual = re.search(
+        r"\b(?:reference|complaint|case|(?:service\s+)?ticket)\s*"
+        r"(?:number|no\.?|id)?\s*(?:is\s*)?[:#-]?\s*(\d{6,9})\b",
+        value or "", re.I)
+    return f"C_{contextual.group(1)}" if contextual else ""
 
 
 class TelegramAPI:
@@ -497,13 +506,23 @@ class TelegramCoordinator:
             "Saudia does not provide a substantive response.")
         return True
 
-    def ask_for_pending_references(self):
-        """Ask once for each accepted Saudia case whose SMS ref is missing."""
+    def ask_for_pending_references(self, now: datetime | None = None):
+        """After an email grace period, ask once for a missing Saudia ref."""
+        now = now or datetime.now()
+        try:
+            grace_minutes = max(2, int(self.settings.get(
+                "mailbox_scan_minutes", 10)))
+        except (TypeError, ValueError):
+            grace_minutes = 10
+        cutoff = now - timedelta(minutes=grace_minutes)
         for complaint in db.list_complaints():
             if (complaint.get("kind") != "airline"
                     or complaint.get("status") != "accepted_pending_reference"
                     or complaint.get("reference")
                     or (complaint.get("flight_data") or {}).get("airline_code") != "SV"):
+                continue
+            created = parse_flight_time(complaint.get("created_at"))
+            if not created or created > cutoff:
                 continue
             key = f"telegram-reference-requested:{complaint['id']}"
             if db.event_seen(key):
@@ -511,9 +530,10 @@ class TelegramCoordinator:
             label = next(iter(
                 self._complaint_flight_numbers(complaint)), "your Saudia flight")
             self.notify(
-                f"Saudia accepted the complaint for {label}, but its reference "
-                "did not arrive by email. Please reply with the SMS or paste its "
-                "text here. I will extract and store only the C_ reference; the "
+                f"I checked email first for the Saudia complaint on {label}, but "
+                "no complaint reference arrived. Please reply with the SMS or "
+                "paste its text here. I will extract and store only the complaint "
+                "reference or service-ticket number; the "
                 "seven-day GACA countdown remains based on the original "
                 "submission time.",
                 force_reply=True)
@@ -697,7 +717,11 @@ class TelegramCoordinator:
                 db.finish_complaint(
                     complaint_id, "accepted_pending_reference")
                 db.update_survey_status(flight_key, "needs_attention")
-                self.ask_for_pending_references()
+                self.notify(
+                    "Saudia accepted the complaint without returning its "
+                    "reference on the page. I will check email first; if the "
+                    "reference is still missing after the mailbox scan, I will "
+                    "ask you for the SMS in Telegram. I will not submit a duplicate.")
             elif result.status == "confirmation_unknown":
                 db.finish_complaint(complaint_id, "failed")
                 db.update_survey_status(flight_key, "needs_attention")
