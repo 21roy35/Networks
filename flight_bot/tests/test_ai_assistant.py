@@ -88,6 +88,23 @@ def test_portal_vision_places_png_before_the_untrusted_page_text():
     assert content[0]["source"]["media_type"] == "image/png"
 
 
+def test_structured_output_accepts_thinking_before_the_json_text():
+    result = {
+        "category": "service", "summary": "Service issue.",
+        "facts": ["A service issue was reported"],
+        "evidence_observations": [],
+        "requested_remedy": "Investigate.", "severity": "low",
+        "needs_more_info": False, "follow_up_question": "",
+    }
+    session = FakeSession({"content": [
+        {"type": "thinking", "thinking": "internal"},
+        {"type": "text", "text": json.dumps(result)},
+    ]})
+    assistant = ClaudeAssistant(enabled_config(), session=session)
+    assert assistant.analyze_incident(
+        "The cabin service was unavailable.", {}) == result
+
+
 def test_ai_failure_is_non_fatal_and_does_not_expose_response_data():
     assistant = ClaudeAssistant(
         enabled_config(), session=FakeSession({"error": "sensitive"}, status=500))

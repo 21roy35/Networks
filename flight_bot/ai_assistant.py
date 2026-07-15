@@ -109,9 +109,11 @@ class ClaudeAssistant:
                 return None
             result = response.json()
             blocks = result.get("content") or []
-            if not blocks or blocks[0].get("type") != "text":
+            text_block = next((block for block in blocks
+                               if block.get("type") == "text"), None)
+            if not text_block:
                 raise ValueError("Claude returned no structured text")
-            parsed = json.loads(blocks[0].get("text") or "")
+            parsed = json.loads(text_block.get("text") or "")
             if not isinstance(parsed, dict):
                 raise ValueError("Claude output was not an object")
             self.last_error = ""
