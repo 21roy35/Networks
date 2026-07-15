@@ -24,7 +24,7 @@ from .complaints import complaint_payload, missing_portal_fields
 from .config import TELEGRAM_EVIDENCE_DIR
 from .flight_status import live_landed, parse_flight_time, schedule_has_finished
 from .pipeline import scan_mailbox
-from .portal_automation import (PortalResult, set_ai_handler,
+from .portal_automation import (PortalResult, _extract_reference, set_ai_handler,
                                 set_captcha_solver, set_verification_handler,
                                 start_portal_job)
 from .web_access import create_web_token
@@ -297,6 +297,7 @@ class TelegramCoordinator:
                 self._maybe_scan_mailbox()
                 self.send_due_surveys()
                 self.check_complaint_responses()
+                self.auto_escalate_due_complaints()
             except Exception:
                 pass
             self.stop_event.wait(interval)
@@ -340,6 +341,11 @@ class TelegramCoordinator:
             return
         if text == "/status":
             counts = db.counts()
+            try:
+                auto_days = max(1, int(self.settings.get(
+                    "gaca_auto_escalate_days", 7)))
+            except (TypeError, ValueError):
+                auto_days = 7
             if self.ai.enabled and self.ai.last_error:
                 ai_status = (f" {self.ai.name} is configured on {self.ai.model}, "
                              f"but its last request failed: {self.ai.last_error}.")
@@ -353,7 +359,9 @@ class TelegramCoordinator:
             self.notify(
                 f"FlightDeck is running. {counts['flights']} flights, "
                 f"{counts['complaints']} complaints, {counts['emails']} parsed emails."
-                + ai_status + captcha_status)
+                + ai_status + captcha_status
+                + f" GACA auto-escalation is on after {auto_days} days "
+                  "without a substantive airline response.")
             return
         if text and text.split(maxsplit=1)[0].lower() == "/web":
             self._send_web_link()
@@ -575,12 +583,15 @@ class TelegramCoordinator:
                 return item
         return None
 
-    def _launch_gaca(self, flight: dict):
+    def _launch_gaca(self, flight: dict, incident_suffix: str = "",
+                     automatic: bool = False) -> bool:
         prior = self._latest_airline_complaint(flight)
         if not prior or not prior.get("reference"):
             self.notify("GACA requires the airline complaint reference, which has not been captured yet.")
-            return
+            return False
         incident = prior.get("details") or "The airline response was unsatisfactory."
+        if incident_suffix:
+            incident = incident.rstrip() + "\n\n" + incident_suffix.strip()
         ai_analysis = None
         if (self.ai.enabled
                 and self.ai.settings.get("analyze_incidents", True)):
@@ -594,11 +605,11 @@ class TelegramCoordinator:
                 ai_analysis=ai_analysis)
         except ValueError as exc:
             self.notify(str(exc))
-            return
+            return False
         missing = missing_portal_fields(payload)
         if missing:
             self.notify("GACA filing still needs: " + ", ".join(missing) + ".")
-            return
+            return False
         complaint_id = db.begin_complaint(
             flight["flight_key"], "gaca", payload["subject"], incident,
             prior.get("attachments") or [])
@@ -606,8 +617,14 @@ class TelegramCoordinator:
             self.notify(
                 "A GACA escalation for this flight is already underway or on "
                 "record. I will not submit it again.")
-            return
-        self.notify("Escalating to GACA’s official E-Services portal now…")
+            return False
+        if automatic:
+            self.notify(
+                "Seven days have passed without a substantive airline response. "
+                "I am automatically escalating this complaint through GACA's "
+                "official E-Services portal now.")
+        else:
+            self.notify("Escalating to GACA's official E-Services portal now...")
 
         def complete(result: PortalResult):
             if result.status == "submitted":
@@ -627,6 +644,45 @@ class TelegramCoordinator:
         start_portal_job(
             payload, on_complete=complete,
             on_update=self.portal_progress_handler())
+        return True
+
+    def auto_escalate_due_complaints(self, now: datetime | None = None):
+        """File one GACA escalation after seven days without a real response."""
+        now = now or datetime.now()
+        try:
+            delay_days = max(1, int(self.settings.get(
+                "gaca_auto_escalate_days", 7)))
+        except (TypeError, ValueError):
+            delay_days = 7
+        cutoff = now - timedelta(days=delay_days)
+        for complaint in db.list_complaints():
+            if (complaint.get("kind") != "airline"
+                    or complaint.get("status") != "submitted"
+                    or not complaint.get("reference")):
+                continue
+            complaint_id = complaint["id"]
+            scheduled_key = f"auto-gaca:{complaint_id}"
+            if (db.event_seen(scheduled_key)
+                    or db.event_seen(f"airline-responded:{complaint_id}")):
+                continue
+            created = parse_flight_time(complaint.get("created_at"))
+            if not created or created > cutoff:
+                continue
+            flight_id = complaint.get("flight_id")
+            flight = db.get_flight(int(flight_id)) if flight_id else None
+            if not flight:
+                continue
+            if self._launch_gaca(
+                    flight,
+                    incident_suffix=(
+                        f"Seven days have passed since the airline complaint was "
+                        f"submitted on {(complaint.get('created_at') or '')[:10]}. "
+                        "The airline did not provide a substantive response or "
+                        "resolution within that period."),
+                    automatic=True):
+                # One automatic attempt only. Any portal issue is surfaced for
+                # human attention instead of risking duplicate submissions.
+                db.mark_event_seen(scheduled_key)
 
     def _live_landed_cached(self, flight: dict) -> bool | None:
         key = flight.get("flight_key") or str(flight.get("id"))
@@ -711,6 +767,16 @@ class TelegramCoordinator:
                                        for domain in domains):
                     continue
                 blob = " ".join((event.get("subject") or "", event.get("body") or ""))
+                if not reference:
+                    captured_reference = _extract_reference(blob)
+                    if captured_reference:
+                        db.finish_complaint(
+                            complaint["id"], "submitted", captured_reference)
+                        complaint["reference"] = captured_reference
+                        reference = captured_reference.casefold()
+                        self.notify(
+                            "Captured the airline complaint reference from its "
+                            f"confirmation email: {captured_reference}.")
                 if reference and reference not in blob.casefold():
                     continue
                 analysis = None
@@ -726,6 +792,7 @@ class TelegramCoordinator:
                 elif not substantive.search(blob):
                     continue
                 db.mark_event_seen(key)
+                db.mark_event_seen(f"airline-responded:{complaint['id']}")
                 if analysis:
                     amounts = "; ".join(analysis.get("amounts_or_deadlines") or [])
                     amount_line = f"\nAmounts/deadlines: {amounts}" if amounts else ""

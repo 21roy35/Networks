@@ -226,6 +226,29 @@ def test_substantive_airline_response_offers_gaca_escalation(coordinator):
     assert buttons[0]["callback_data"].startswith("escalate:")
 
 
+def test_confirmation_email_recovers_missing_airline_reference(coordinator):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Screen complaint",
+        "submitted", details="The screen was broken.")
+    db.save_mail_event({
+        "message_id": "<confirmation@example>",
+        "subject": "Complaint reference number is CAS-44556677",
+        "sender": "customer.relations@saudia.com", "date": datetime.now(),
+        "body": "Thank you. Your complaint was received.",
+    })
+
+    bot.check_complaint_responses()
+
+    complaint = db.complaints_for_flight(flight["flight_key"])[0]
+    assert complaint["reference"] == "CAS-44556677"
+    assert any("Captured the airline complaint reference" in item["text"]
+               for item in api.messages)
+
+
 def test_ghala_interprets_matched_airline_response_before_escalation(coordinator):
     bot, api = coordinator
 
@@ -312,6 +335,63 @@ def test_gaca_callback_files_with_airline_reference(coordinator, monkeypatch):
     complaint = db.complaints_for_flight(flight["flight_key"])[-1]
     assert complaint["kind"] == "gaca"
     assert complaint["reference"] == "GACA-98765"
+
+
+def test_seven_day_no_response_auto_escalates_once(coordinator, monkeypatch):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Seat screen complaint",
+        "submitted", reference="CAS-700001",
+        details="The seat-back entertainment screen was broken.")
+    submitted_at = datetime.now() - timedelta(days=8)
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE complaints SET created_at = ? WHERE reference = ?",
+            (submitted_at.strftime("%Y-%m-%d %H:%M:%S"), "CAS-700001"))
+    airline_complaint = db.complaints_for_flight(flight["flight_key"])[0]
+    monkeypatch.setattr(telegram_bot, "missing_portal_fields", lambda _payload: [])
+    captured = []
+
+    def fake_start(payload, on_complete, on_update=None):
+        captured.append(payload)
+        on_complete(PortalResult("submitted", "ok", "GACA-700001"))
+        return "job"
+
+    monkeypatch.setattr(telegram_bot, "start_portal_job", fake_start)
+    bot.auto_escalate_due_complaints(now=datetime.now())
+    bot.auto_escalate_due_complaints(now=datetime.now())
+
+    assert len(captured) == 1
+    assert captured[0]["kind"] == "gaca"
+    assert "did not provide a substantive response" in captured[0]["incident"]
+    assert db.event_seen(f"auto-gaca:{airline_complaint['id']}")
+    complaints = db.complaints_for_flight(flight["flight_key"])
+    assert [item["kind"] for item in complaints] == ["airline", "gaca"]
+    assert complaints[-1]["reference"] == "GACA-700001"
+    assert any("automatically escalating" in item["text"] for item in api.messages)
+
+
+def test_auto_escalation_waits_and_skips_detected_response(
+        coordinator, monkeypatch):
+    bot, _api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Claim", "submitted",
+        reference="CAS-700002", details="Broken screen")
+    complaint = db.complaints_for_flight(flight["flight_key"])[0]
+    calls = []
+    monkeypatch.setattr(bot, "_launch_gaca", lambda *_args, **_kwargs: calls.append(1))
+
+    bot.auto_escalate_due_complaints(now=datetime.now() + timedelta(days=6))
+    assert calls == []
+    db.mark_event_seen(f"airline-responded:{complaint['id']}")
+    bot.auto_escalate_due_complaints(now=datetime.now() + timedelta(days=8))
+    assert calls == []
 
 
 def test_every_candidate_mail_is_kept_for_response_matching(

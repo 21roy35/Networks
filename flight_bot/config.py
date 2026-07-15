@@ -52,6 +52,7 @@ DEFAULTS = {
         "complaint_debounce_seconds": 20,
         "verification_timeout_minutes": 10,
         "mailbox_scan_minutes": 10,
+        "gaca_auto_escalate_days": 7,
     },
     "flight_status": {
         "provider": "schedule",
