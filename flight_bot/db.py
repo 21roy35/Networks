@@ -5,7 +5,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 
-from .config import DB_PATH
+from .config import DB_PATH, passenger_profile_key
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS emails (
@@ -183,6 +183,75 @@ def list_email_summaries() -> list[dict]:
         parsed["db_id"] = row["id"]
         out.append(parsed)
     return out
+
+
+def identity_suggestions(passenger_name: str) -> dict:
+    """Return conflict-free profile fields found in this passenger's tickets.
+
+    Sensitive identifiers are suggested only when every labeled occurrence
+    for the passenger agrees.  Contact fields may use the newest occurrence.
+    """
+    key = passenger_profile_key(passenger_name)
+    if not key:
+        return {"values": {}, "evidence": {}}
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT parsed, subject FROM emails ORDER BY date DESC, id DESC"
+        ).fetchall()
+    candidates: dict[str, list[tuple[str, str]]] = {}
+    national_candidates: dict[str, list[tuple[str, str]]] = {}
+    fields = {
+        "title", "nationality", "email", "phone", "country_code",
+        "alfursan_id",
+    }
+    for row in rows:
+        parsed = json.loads(row["parsed"] or "{}")
+        profiles = parsed.get("passenger_profiles") or {}
+        profile = profiles.get(key)
+        if not isinstance(profile, dict):
+            profile = next((value for value in profiles.values()
+                            if isinstance(value, dict)
+                            and passenger_profile_key(
+                                value.get("booking_name") or
+                                value.get("full_name") or "") == key), None)
+        if not profile:
+            continue
+        profile_evidence = profile.get("evidence") or {}
+        national_id = str(profile.get("national_id") or "").strip()
+        if national_id:
+            id_type = str(profile.get("national_id_type") or "national_id")
+            source = str(profile_evidence.get("national_id") or "").strip()
+            if not source or source == "linked ticket or booking email":
+                subject = str(row["subject"] or "ticket or booking email").strip()
+                source = f"Email: {subject[:100]}"
+            national_candidates.setdefault(id_type, []).append(
+                (national_id, source))
+        for field in fields:
+            value = str(profile.get(field) or "").strip()
+            if not value:
+                continue
+            source = str(profile_evidence.get(field) or "").strip()
+            if not source or source == "linked ticket or booking email":
+                subject = str(row["subject"] or "ticket or booking email").strip()
+                source = f"Email: {subject[:100]}"
+            candidates.setdefault(field, []).append((value, source))
+
+    values, evidence = {}, {}
+    for id_type in ("national_id", "iqama", "passport"):
+        occurrences = national_candidates.get(id_type) or []
+        distinct = {value.casefold(): value for value, _source in occurrences}
+        if len(distinct) == 1:
+            values["national_id"], evidence["national_id"] = occurrences[0]
+            break
+    immutable = {"alfursan_id", "title", "nationality"}
+    for field, occurrences in candidates.items():
+        distinct = {value.casefold(): value for value, _source in occurrences}
+        if field in immutable and len(distinct) != 1:
+            continue
+        value, source = occurrences[0]
+        values[field] = value
+        evidence[field] = source
+    return {"values": values, "evidence": evidence}
 
 
 def email_flight_map() -> dict[int, dict]:

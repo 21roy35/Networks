@@ -7,12 +7,15 @@ Works with Gmail (use an App Password: Google Account -> Security ->
 import email
 import email.policy
 import imaplib
+import io
 import re
 import time
 from datetime import datetime, timedelta
 from email.utils import parseaddr, parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
+
+from pypdf import PdfReader
 
 from .airlines import all_domains
 
@@ -120,6 +123,40 @@ def extract_body(msg: email.message.EmailMessage) -> str:
     return ""
 
 
+def extract_pdf_attachments(msg: email.message.EmailMessage) -> str:
+    """Extract searchable text from reasonably sized ticket PDFs.
+
+    The original attachment is never persisted.  A filename marker is kept
+    with the text so profile suggestions can explain where evidence came
+    from.  Limits protect the mailbox monitor from unusually large files.
+    """
+    extracted: list[str] = []
+    for part in msg.iter_attachments():
+        filename = str(part.get_filename() or "attachment.pdf")
+        content_type = (part.get_content_type() or "").lower()
+        if content_type != "application/pdf" and not filename.lower().endswith(".pdf"):
+            continue
+        try:
+            data = part.get_payload(decode=True) or b""
+            if not data or len(data) > 15 * 1024 * 1024:
+                continue
+            reader = PdfReader(io.BytesIO(data))
+            pages = []
+            for page in reader.pages[:25]:
+                value = page.extract_text() or ""
+                if value:
+                    pages.append(value)
+                if sum(len(item) for item in pages) >= 150_000:
+                    break
+            text = clean_email_body("\n".join(pages))[:150_000]
+        except Exception:
+            continue
+        if text:
+            safe_name = re.sub(r"[\r\n\[\]]+", " ", filename).strip()
+            extracted.append(f"[Attachment: {safe_name}]\n{text}")
+    return "\n\n".join(extracted)
+
+
 def message_to_raw(msg: email.message.EmailMessage) -> dict:
     """Normalise an EmailMessage into the dict the parser consumes."""
     sender = parseaddr(msg.get("From", ""))[1]
@@ -129,12 +166,16 @@ def message_to_raw(msg: email.message.EmailMessage) -> dict:
             date = parsedate_to_datetime(msg["Date"])
         except (TypeError, ValueError):
             date = None
+    body = extract_body(msg)
+    attachment_text = extract_pdf_attachments(msg)
+    if attachment_text:
+        body = f"{body}\n\n{attachment_text}".strip()
     return {
         "message_id": msg.get("Message-ID") or f"<no-id-{hash(str(msg))}>",
         "subject": str(msg.get("Subject", "")),
         "sender": sender,
         "date": date,
-        "body": extract_body(msg),
+        "body": body,
     }
 
 

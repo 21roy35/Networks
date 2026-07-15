@@ -6,6 +6,7 @@ FlightDeck turns airline messages into complete flight records, tracks each jour
 
 - Shows each payment method as card brand plus last four digits and filters by that exact card.
 - Filters flights by passenger name.
+- Prefills each passenger's complaint profile from labeled ticket-email and ticket-PDF evidence, including title, contact details, National ID/passport/Iqama, and Alfursan ID when available.
 - Copies or downloads every filtered result as a complete TXT report.
 - Preserves manual corrections across mailbox rescans.
 - Checks GACA, EU261/EEA, and UK261 passenger-rights coverage.

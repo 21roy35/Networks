@@ -1,10 +1,12 @@
 from copy import deepcopy
+from datetime import datetime
 
 import pytest
 
 from flight_bot import db, webapp
 from flight_bot.config import DEFAULTS
 from flight_bot.pipeline import load_demo
+from flight_bot.parser import parse_email
 from flight_bot.web_access import create_web_token
 
 
@@ -170,6 +172,26 @@ def test_family_passenger_gets_separate_profile_and_claim_is_blocked_until_saved
 
     updated = client.get(claim_url)
     assert b"saved identity profile for Muhannad Alqahtani" not in updated.data
+
+
+def test_family_profile_is_prefilled_from_matching_ticket_evidence(client):
+    parsed = parse_email(
+        "<family-identity@example>", "Your Saudia e-ticket SV1650",
+        "noreply@saudia.com", datetime(2026, 7, 15, 12, 0),
+        """Booking reference: ABC123
+        Flight SV1650 - JED to AHB
+        Mr Muhannad Alqahtani e-Ticket: 065-2200741431
+        Frequent Flyer: 30681234 National ID: 1122334455
+        """)
+    db.save_email(parsed)
+
+    page = client.get(
+        "/settings/profile?passenger=Muhannad%20Alqahtani&next=/")
+    assert page.status_code == 200
+    assert b"Auto-filled from matching travel evidence" in page.data
+    assert b'value="30681234"' in page.data
+    assert b'value="1122334455"' in page.data
+    assert b'<option value="Mr" selected' in page.data
 
 
 def test_scan_without_credentials_gives_actionable_message(client):

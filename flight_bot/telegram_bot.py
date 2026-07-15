@@ -733,10 +733,18 @@ class TelegramCoordinator:
                 self._intakes[flight_key] = intake
             if payload.get("passenger_profile_missing"):
                 passenger = payload.get("profile_passenger_name")
+                found = db.identity_suggestions(passenger).get("values") or {}
+                found_text = ""
+                if found:
+                    labels = ", ".join(sorted(
+                        field.replace("_", " ") for field in found))
+                    found_text = (f" I already found these labeled fields in "
+                                  f"matching ticket evidence: {labels}.")
                 self.notify(
                     f"This booking belongs to {passenger}, not the account "
                     "owner. I stopped before submission so I do not reuse "
-                    "Mansour's National ID or AlFursan number. Save this "
+                    "Mansour's National ID or AlFursan number." + found_text
+                    + " Save this "
                     "passenger's identity once, then tap Try filing again.",
                     buttons=self._passenger_profile_buttons(payload, flight))
             else:

@@ -3,3 +3,4 @@ python-dateutil>=2.8
 playwright>=1.53
 requests>=2.32
 pillow>=11.0
+pypdf>=5.0

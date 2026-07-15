@@ -448,17 +448,36 @@ def create_app(config: dict) -> Flask:
                     "first_name": parts[0] if parts else "",
                     "middle_name": " ".join(parts[1:-1]) if len(parts) > 2 else "",
                     "last_name": parts[-1] if len(parts) > 1 else "",
-                    # The account owner's contact can receive updates, but no
-                    # identity/loyalty field is copied to a relative.
-                    "email": config["user"].get("email") or "",
-                    "phone": config["user"].get("phone") or "",
-                    "country_code": config["user"].get("country_code") or "",
                 })
+            suggestions = db.identity_suggestions(passenger_name)
+            suggested_evidence = {}
+            for field, value in suggestions["values"].items():
+                if not profile.get(field):
+                    profile[field] = value
+                    suggested_evidence[field] = suggestions["evidence"].get(field, "")
+            # The account owner's contact can receive updates when a ticket
+            # has no labeled contact, but identity/loyalty data never falls
+            # back across passengers.
+            profile.setdefault("email", config["user"].get("email") or "")
+            profile.setdefault("phone", config["user"].get("phone") or "")
+            profile.setdefault("country_code",
+                               config["user"].get("country_code") or "")
         else:
-            profile = config["user"]
+            profile = dict(config["user"])
+            suggestions = db.identity_suggestions(
+                profile.get("full_name") or " ".join(filter(None, (
+                    profile.get("first_name"), profile.get("middle_name"),
+                    profile.get("last_name"),
+                ))))
+            suggested_evidence = {}
+            for field, value in suggestions["values"].items():
+                if not profile.get(field):
+                    profile[field] = value
+                    suggested_evidence[field] = suggestions["evidence"].get(field, "")
         return render_template(
             "profile.html", profile=profile, next_url=next_url,
-            passenger_name=passenger_name, family_mode=family_mode)
+            passenger_name=passenger_name, family_mode=family_mode,
+            suggested_evidence=suggested_evidence)
 
     @app.route("/flight/<int:flight_id>")
     def flight_detail(flight_id):

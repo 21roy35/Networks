@@ -180,6 +180,10 @@ _PASSENGER_TITLE_RE = re.compile(
 _PASSENGER_DEAR_RE = re.compile(
     r"\b(?:Dear|Hi|Hello)\s+((?:[A-Z][A-Za-z'-]*|[A-Z]{2,})(?:\s+(?:[A-Z][A-Za-z'-]*|[A-Z]{2,})){0,3})\s*[,\n]"
 )
+_IDENTITY_PERSON_RE = re.compile(
+    r"\b(?P<title>Mr|Mrs|Ms|Miss|Dr)\.?\s*"
+    r"(?P<name>[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){1,3})\b"
+)
 _NOT_NAMES = {
     "guest", "customer", "sir", "madam", "sir/madam", "traveler",
     "traveller", "passenger", "member", "valued customer", "all", "team",
@@ -190,6 +194,36 @@ _NAME_TRAILING_JUNK = re.compile(
     r"\s+(?:pas(?:senger)?s?|memb(?:er(?:ship)?)?|guest|frequent|flyer|"
     r"class|economy|business|adult|seat|e[\s-]*ticket|mr|mrs|ms)$",
     re.IGNORECASE)
+
+_ALFURSAN_ID_RE = re.compile(
+    r"(?:frequent\s*flyer|alfursan(?:\s*(?:id|number|membership))?|"
+    r"رقم\s*(?:عضوية\s*)?الفرسان)\s*[:#-]?\s*"
+    r"(?:alfursan\s*miles\s*[·:\-]?\s*)?(\d{6,12})\b",
+    re.IGNORECASE,
+)
+_NATIONAL_ID_RE = re.compile(
+    r"(?P<label>national\s*(?:id|identity)(?:\s*(?:no|number))?|"
+    r"gcc\s*/?\s*residence\s*id|iqama(?:\s*(?:no|number))?|"
+    r"passport\s*(?:no|number)|"
+    r"رقم\s*(?:الهوية(?:\s*الوطنية)?|الإقامة|الجواز))"
+    r"\s*[:#-]?\s*(?P<value>(?:\d{10}|[A-Z][A-Z0-9]{5,11}))\b",
+    re.IGNORECASE,
+)
+_NATIONALITY_RE = re.compile(
+    r"(?:nationality|الجنسية)\s*[:#-]?\s*"
+    r"([A-Za-z][A-Za-z ]{2,30}|[\u0600-\u06ff ]{3,30})",
+    re.IGNORECASE,
+)
+_CONTACT_EMAIL_RE = re.compile(
+    r"(?:contact\s*)?e-?mail(?:\s*address)?\s*[:#-]?\s*"
+    r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})",
+    re.IGNORECASE,
+)
+_CONTACT_PHONE_RE = re.compile(
+    r"(?:mobile|phone|contact\s*(?:number|no))\s*[:#-]?\s*"
+    r"(\+?\d[\d ()-]{6,19})",
+    re.IGNORECASE,
+)
 
 _PNR_STOPWORDS = {"NUMBER", "BOOKING", "TICKET", "FLIGHT", "TRAVEL",
                   "ONLINE", "PLEASE", "BELOW"}
@@ -291,6 +325,7 @@ class ParsedEmail:
     gate: str | None = None
     boarding_time: str | None = None
     passenger: str | None = None
+    passenger_profiles: dict[str, dict] = field(default_factory=dict)
     payment_method: str | None = None
     amount: str | None = None
     currency: str | None = None
@@ -522,19 +557,104 @@ def _segment_dt(seg: dict, which: str) -> str | None:
     return dep if which == "dep" else arr
 
 
+def _clean_passenger_name(value: str) -> str:
+    name = re.sub(r"\s+", " ", value or "").strip(" .,")
+    while True:
+        trimmed = _NAME_TRAILING_JUNK.sub("", name)
+        if trimmed == name:
+            break
+        name = trimmed
+    if name.isupper() or name.islower():
+        name = name.title()
+    return name
+
+
+def _identity_key(value: str) -> str:
+    value = re.sub(r"[^\w]+", " ", value or "", flags=re.UNICODE)
+    return " ".join(value.casefold().split())
+
+
+def _identity_source(text: str, position: int) -> str:
+    markers = list(re.finditer(r"\[Attachment:\s*([^\]]+)\]", text[:position],
+                               re.IGNORECASE))
+    if markers:
+        marker = markers[-1]
+        return f"PDF attachment: {marker.group(1).strip()}"
+    return "linked ticket or booking email"
+
+
+def _extract_passenger_profiles(text: str) -> dict[str, dict]:
+    """Extract identity fields within each passenger's own text block.
+
+    Saudia commonly places several travelers in one itinerary.  Scoping from
+    one titled name to the next prevents a sibling's loyalty or document
+    number from being suggested for the wrong person.
+    """
+    people = list(_IDENTITY_PERSON_RE.finditer(text))
+    profiles: dict[str, dict] = {}
+    for index, match in enumerate(people):
+        name = _clean_passenger_name(match.group("name"))
+        key = _identity_key(name)
+        if not key or name.casefold() in _NOT_NAMES:
+            continue
+        end = people[index + 1].start() if index + 1 < len(people) else len(text)
+        block = text[match.start():min(end, match.start() + 1400)]
+        source = _identity_source(text, match.start())
+        profile = profiles.setdefault(key, {
+            "booking_name": name,
+            "full_name": name,
+            "title": {"Miss": "Ms"}.get(match.group("title"),
+                                          match.group("title")),
+            "evidence": {},
+        })
+        evidence = profile.setdefault("evidence", {})
+        identity_matches = list(_NATIONAL_ID_RE.finditer(block))
+        identity_rank = {"national_id": 0, "iqama": 1, "passport": 2}
+
+        def identity_type(value_match) -> str:
+            label = value_match.group("label").casefold()
+            if "passport" in label or "الجواز" in label:
+                return "passport"
+            if ("iqama" in label or "residence" in label
+                    or "الإقامة" in label):
+                return "iqama"
+            return "national_id"
+
+        preferred_identity = min(
+            identity_matches,
+            key=lambda item: identity_rank[identity_type(item)],
+            default=None)
+        found = {
+            "alfursan_id": _ALFURSAN_ID_RE.search(block),
+            "national_id": preferred_identity,
+            "nationality": _NATIONALITY_RE.search(block),
+            "email": _CONTACT_EMAIL_RE.search(block),
+            "phone": _CONTACT_PHONE_RE.search(block),
+        }
+        for field, value_match in found.items():
+            if not value_match:
+                continue
+            value = (value_match.group("value") if field == "national_id"
+                     else value_match.group(1))
+            value = " ".join(value.split()).strip(" .,:;-")
+            if value and not profile.get(field):
+                profile[field] = value
+                evidence[field] = source
+                if field == "national_id":
+                    profile["national_id_type"] = identity_type(value_match)
+        phone = profile.get("phone") or ""
+        if phone.startswith("+") and (country := re.match(r"\+\d{1,3}", phone)):
+            profile["country_code"] = country.group(0)
+            evidence["country_code"] = evidence.get("phone", source)
+    return profiles
+
+
 def _extract_passenger(text: str) -> str | None:
     for pattern in (_PASSENGER_LABEL_RE, _PASSENGER_TITLE_RE, _PASSENGER_DEAR_RE):
         for m in pattern.finditer(text):
-            name = re.sub(r"\s+", " ", m.group(1)).strip(" .,")
-            while True:
-                trimmed = _NAME_TRAILING_JUNK.sub("", name)
-                if trimmed == name:
-                    break
-                name = trimmed
+            name = _clean_passenger_name(m.group(1))
             if name.lower() in _NOT_NAMES or len(name) < 3:
                 continue
-            if name.isupper() or name.islower():
-                name = name.title()
             return name
     return None
 
@@ -698,6 +818,7 @@ def parse_email(message_id: str, subject: str, sender: str, date: datetime | Non
     if m := _BOARDING_TIME_RE.search(text):
         parsed.boarding_time = m.group(1)
     parsed.passenger = _extract_passenger(text)
+    parsed.passenger_profiles = _extract_passenger_profiles(text)
 
     if m := _PAYMENT_RE.search(text):
         method = re.sub(r"\s+", " ", m.group(1)).title()
