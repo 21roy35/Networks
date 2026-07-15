@@ -794,6 +794,171 @@ def test_gaca_callback_files_with_airline_reference(coordinator, monkeypatch):
     assert complaint["reference"] == "GACA-98765"
 
 
+def _wait_for_ai(bot, timeout=2):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        thread = bot._ai_chat_thread
+        if thread and not thread.is_alive():
+            return
+        time.sleep(.01)
+    pytest.fail("Telegram AI worker did not finish")
+
+
+def test_plain_telegram_request_uses_ai_intent_then_exact_flight_lookup(
+        coordinator):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = db.list_flights()[0]
+    number = flight.get("flight_number") or flight.get("flight_numbers")[0]
+
+    class FakeGhala:
+        enabled = True
+        name = "Ghala"
+        last_error = ""
+
+        def interpret_telegram(self, message, catalog):
+            assert number in message
+            assert any(item["flight_number"] == number
+                       for item in catalog["flights"])
+            return {"actions": [{
+                "name": "flight_details", "flight_number": number,
+                "pnr": "", "reference": "", "passenger": "", "query": "",
+                "time_scope": "all", "latest": False, "limit": 5,
+            }], "reply": ""}
+
+    bot.ai = FakeGhala()
+    bot.handle_update({"message": {
+        "message_id": 991, "chat": {"id": 42},
+        "text": f"Can you show me everything for {number}?",
+    }})
+    _wait_for_ai(bot)
+
+    assert "checking your FlightDeck records" in api.messages[0]["text"]
+    assert api.messages[1]["text"].startswith("Flight:")
+    assert number in api.messages[1]["text"]
+    assert "Payment:" in api.messages[1]["text"]
+
+
+def test_status_command_stays_deterministic_and_does_not_call_ai(coordinator):
+    bot, api = coordinator
+
+    class FakeGhala:
+        enabled = True
+        name = "Ghala"
+        model = "claude-test"
+        last_error = ""
+        settings = {"extract_profile_evidence": True}
+
+        def interpret_telegram(self, *_args):
+            raise AssertionError("slash command must not reach AI")
+
+    bot.ai = FakeGhala()
+    bot.handle_update({"message": {
+        "message_id": 992, "chat": {"id": 42}, "text": "/status",
+    }})
+
+    assert len(api.messages) == 1
+    assert api.messages[0]["text"].startswith("FlightDeck is running.")
+    assert bot._ai_chat_thread is None
+
+
+def test_plain_telegram_request_can_return_latest_portal_screenshot(
+        coordinator):
+    bot, api = coordinator
+    folder = telegram_bot.TELEGRAM_EVIDENCE_DIR / "portal_jobs"
+    folder.mkdir(parents=True)
+    (folder / "job.png").write_bytes(b"saved-portal-image")
+
+    class FakeGhala:
+        enabled = True
+        name = "Ghala"
+        last_error = ""
+
+        def interpret_telegram(self, *_args):
+            return {"actions": [{
+                "name": "latest_screenshot", "flight_number": "", "pnr": "",
+                "reference": "", "passenger": "", "query": "",
+                "time_scope": "all", "latest": True, "limit": 1,
+            }], "reply": ""}
+
+    bot.ai = FakeGhala()
+    bot.handle_update({"message": {
+        "message_id": 993, "chat": {"id": 42},
+        "text": "Send me the latest portal screenshot",
+    }})
+    _wait_for_ai(bot)
+
+    assert len(api.photos) == 1
+    assert api.photos[0]["image"] == b"saved-portal-image"
+    assert "Saved portal screenshot" in api.photos[0]["caption"]
+
+
+def test_pending_post_flight_survey_keeps_priority_over_ai(coordinator,
+                                                            monkeypatch):
+    bot, _api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = db.list_flights()[0]
+    db.record_survey(flight["flight_key"], bot.chat_id, 700,
+                     "awaiting_details")
+    collected = []
+    monkeypatch.setattr(bot, "_collect_issue",
+                        lambda survey, message: collected.append((survey, message)))
+
+    class FakeGhala:
+        enabled = True
+        name = "Ghala"
+
+        def interpret_telegram(self, *_args):
+            raise AssertionError("survey reply must not reach AI")
+
+    bot.ai = FakeGhala()
+    message = {
+        "message_id": 994, "chat": {"id": 42},
+        "reply_to_message": {"message_id": 700},
+        "text": "The screen was broken.",
+    }
+    bot.handle_update({"message": message})
+
+    assert len(collected) == 1
+    assert collected[0][1] == message
+    assert bot._ai_chat_thread is None
+
+
+def test_short_ai_follow_up_reuses_last_exact_complaint_not_another_case(
+        coordinator, tmp_path):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flights = db.list_flights()
+    first_photo = tmp_path / "first.jpg"
+    second_photo = tmp_path / "second.jpg"
+    first_photo.write_bytes(b"first-case-photo")
+    second_photo.write_bytes(b"second-case-photo")
+    db.add_complaint(
+        flights[0]["flight_key"], "airline", None, "First", "submitted",
+        reference="C_8000001", details="First issue",
+        attachments=[str(first_photo)])
+    db.add_complaint(
+        flights[1]["flight_key"], "airline", None, "Second", "submitted",
+        reference="C_8000002", details="Second issue",
+        attachments=[str(second_photo)])
+    base = {
+        "flight_number": "", "pnr": "", "passenger": "", "query": "",
+        "time_scope": "all", "latest": False, "limit": 5,
+    }
+
+    bot._send_complaint_details({
+        **base, "name": "complaint_details", "reference": "C_8000001",
+    })
+    follow_up = bot._contextualize_ai_action({
+        **base, "name": "show_evidence", "reference": "",
+    }, "send its photos")
+    bot._execute_ai_action(follow_up)
+
+    assert follow_up["reference"] == "C_8000001"
+    assert len(api.photos) == 1
+    assert api.photos[0]["image"] == b"first-case-photo"
+
+
 def test_seven_day_no_response_auto_escalates_once(coordinator, monkeypatch):
     bot, api = coordinator
     load_demo(log=lambda *_args, **_kwargs: None)

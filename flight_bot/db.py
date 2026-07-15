@@ -232,6 +232,45 @@ def list_complaint_responses() -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def complaint_response_details(limit: int = 10) -> list[dict]:
+    """Return response links with the actual case and email facts attached."""
+    limit = max(1, min(int(limit or 10), 50))
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT cr.complaint_id, cr.mail_event_id, cr.match_method,
+                      cr.matched_at, c.reference, c.kind, c.status,
+                      c.flight_key, me.subject, me.sender, me.date, me.body
+               FROM complaint_responses cr
+               JOIN complaints c ON c.id = cr.complaint_id
+               JOIN mail_events me ON me.id = cr.mail_event_id
+               ORDER BY COALESCE(me.date, cr.matched_at) DESC,
+                        cr.mail_event_id DESC
+               LIMIT ?""", (limit,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def search_mail_events(query: str = "", limit: int = 10) -> list[dict]:
+    """Search stored airline messages without loading the whole inbox."""
+    limit = max(1, min(int(limit or 10), 50))
+    query = " ".join(str(query or "").split()).strip()
+    with connect() as conn:
+        if query:
+            pattern = f"%{query.casefold()}%"
+            rows = conn.execute(
+                """SELECT * FROM mail_events
+                   WHERE LOWER(COALESCE(subject, '')) LIKE ?
+                      OR LOWER(COALESCE(sender, '')) LIKE ?
+                      OR LOWER(COALESCE(body, '')) LIKE ?
+                   ORDER BY date DESC, id DESC LIMIT ?""",
+                (pattern, pattern, pattern, limit)).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT * FROM mail_events
+                   ORDER BY date DESC, id DESC LIMIT ?""",
+                (limit,)).fetchall()
+    return [dict(row) for row in rows]
+
+
 def initialize_fifo_response_floor() -> int:
     """Snapshot the pre-feature inbox once so old unreferenced mail is ignored."""
     key = "fifo_resolution_event_floor_v1"

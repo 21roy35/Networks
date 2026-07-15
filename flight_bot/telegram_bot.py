@@ -187,6 +187,9 @@ class TelegramCoordinator:
         self._mail_scan_thread: threading.Thread | None = None
         self._mail_scan_error = ""
         self._status_cache: dict[str, tuple[float, bool | None]] = {}
+        self._ai_chat_lock = threading.Lock()
+        self._ai_chat_thread: threading.Thread | None = None
+        self._ai_context: dict[str, object] = {}
         self._fifo_response_floor = db.initialize_fifo_response_floor()
 
     @property
@@ -390,46 +393,7 @@ class TelegramCoordinator:
                 "FlightDeck Telegram is connected. I’ll check in after flights, collect issue photos, file official complaints, relay verification steps, and report airline responses. Use /status for service status or /web for your private dashboard.")
             return
         if text == "/status":
-            counts = db.counts()
-            mailbox = db.mailbox_cursor_summary()
-            try:
-                auto_days = max(1, int(self.settings.get(
-                    "gaca_auto_escalate_days", 7)))
-            except (TypeError, ValueError):
-                auto_days = 7
-            if self.ai.enabled and self.ai.last_error:
-                ai_status = (f" {self.ai.name} is configured on {self.ai.model}, "
-                             f"but its last request failed: {self.ai.last_error}.")
-            elif self.ai.enabled:
-                ai_status = f" {self.ai.name} AI is configured on {self.ai.model}."
-                if self.ai.settings.get("extract_profile_evidence", True):
-                    ai_status += (" Guarded ticket/PDF review is enabled for "
-                                  "missing passenger-profile fields.")
-            else:
-                ai_status = " AI assistance is off."
-            captcha_status = (" 2Captcha is configured with Telegram fallback."
-                              if self.captcha.enabled
-                              else " Automatic CAPTCHA solving is off.")
-            if (self._mail_scan_thread
-                    and self._mail_scan_thread.is_alive()):
-                mailbox_status = " Gmail incremental sync is running now."
-            elif self._mail_scan_error:
-                mailbox_status = (
-                    f" Gmail's last incremental sync failed: "
-                    f"{self._mail_scan_error}.")
-            elif mailbox.get("last_success"):
-                mailbox_status = (
-                    f" Gmail last synced successfully at "
-                    f"{mailbox['last_success']} across "
-                    f"{mailbox.get('folders') or 0} folder(s).")
-            else:
-                mailbox_status = " Gmail incremental sync is waiting to start."
-            self.notify(
-                f"FlightDeck is running. {counts['flights']} flights, "
-                f"{counts['complaints']} complaints, {counts['emails']} parsed emails."
-                + mailbox_status + ai_status + captcha_status
-                + f" GACA auto-escalation is on after {auto_days} days "
-                  "without a substantive airline response.")
+            self._send_status()
             return
         if text and text.split(maxsplit=1)[0].lower() == "/web":
             self._send_web_link()
@@ -450,7 +414,16 @@ class TelegramCoordinator:
         if not survey:
             survey = db.pending_survey(self.chat_id)
         if not survey:
-            self.notify("Reply to a post-flight question, or use /status.")
+            if pasted and self.ai.enabled:
+                self._dispatch_ai_message(pasted)
+            elif not pasted and message.get("photo"):
+                self.notify(
+                    "Add a caption telling me which flight or complaint this "
+                    "photo belongs to.")
+            else:
+                self.notify(
+                    "Reply to a post-flight question, use /status, or ask me "
+                    "about a flight, passenger, complaint, email, or screenshot.")
             return
         positive = re.fullmatch(
             r"(?:good|great|fine|perfect|all good|no issues?|it was good|"
@@ -462,13 +435,663 @@ class TelegramCoordinator:
             return
         self._collect_issue(survey, message)
 
+    def _status_text(self) -> str:
+        counts = db.counts()
+        mailbox = db.mailbox_cursor_summary()
+        try:
+            auto_days = max(1, int(self.settings.get(
+                "gaca_auto_escalate_days", 7)))
+        except (TypeError, ValueError):
+            auto_days = 7
+        if self.ai.enabled and self.ai.last_error:
+            ai_status = (f" {self.ai.name} is configured on {self.ai.model}, "
+                         f"but its last request failed: {self.ai.last_error}.")
+        elif self.ai.enabled:
+            ai_status = f" {self.ai.name} AI is configured on {self.ai.model}."
+            if self.ai.settings.get("extract_profile_evidence", True):
+                ai_status += (" Guarded ticket/PDF review is enabled for "
+                              "missing passenger-profile fields.")
+        else:
+            ai_status = " AI assistance is off."
+        captcha_status = (" 2Captcha is configured with Telegram fallback."
+                          if self.captcha.enabled
+                          else " Automatic CAPTCHA solving is off.")
+        if self._mail_scan_thread and self._mail_scan_thread.is_alive():
+            mailbox_status = " Gmail incremental sync is running now."
+        elif self._mail_scan_error:
+            mailbox_status = (
+                f" Gmail's last incremental sync failed: "
+                f"{self._mail_scan_error}.")
+        elif mailbox.get("last_success"):
+            mailbox_status = (
+                f" Gmail last synced successfully at "
+                f"{mailbox['last_success']} across "
+                f"{mailbox.get('folders') or 0} folder(s).")
+        else:
+            mailbox_status = " Gmail incremental sync is waiting to start."
+        return (
+            f"FlightDeck is running. {counts['flights']} flights, "
+            f"{counts['complaints']} complaints, {counts['emails']} parsed emails."
+            + mailbox_status + ai_status + captcha_status
+            + f" GACA auto-escalation is on after {auto_days} days "
+              "without a substantive airline response.")
+
+    def _send_status(self):
+        self.notify(self._status_text())
+
+    @staticmethod
+    def _search_key(value: object) -> str:
+        return "".join(character.casefold() for character in str(value or "")
+                       if character.isalnum())
+
+    @staticmethod
+    def _effective_flight_value(flight: dict, field: str):
+        overrides = flight.get("overrides") or {}
+        return overrides.get(field) if overrides.get(field) not in {
+            None, ""} else flight.get(field)
+
+    def _flight_passenger(self, flight: dict) -> str:
+        value = self._effective_flight_value(flight, "passenger") or ""
+        return re.sub(r"\s+e[\s-]*ticket\b.*$", "", str(value),
+                      flags=re.IGNORECASE).strip()
+
+    def _profiles(self) -> list[dict]:
+        profiles, seen = [], set()
+        owner = dict(self.config.get("user") or {})
+        owner_name = (owner.get("full_name") or " ".join(filter(None, (
+            owner.get("first_name"), owner.get("middle_name"),
+            owner.get("last_name")))))
+        if owner_name:
+            owner["booking_name"] = owner_name
+            key = passenger_profile_key(owner_name)
+            profiles.append(owner)
+            seen.add(key)
+        for raw_key, value in (self.config.get("passengers") or {}).items():
+            if not isinstance(value, dict):
+                continue
+            item = dict(value)
+            name = (item.get("booking_name") or item.get("full_name")
+                    or str(raw_key))
+            key = passenger_profile_key(name)
+            if not key:
+                continue
+            item["booking_name"] = name
+            if key in seen:
+                owner_index = next((index for index, profile in enumerate(profiles)
+                                    if passenger_profile_key(
+                                        profile.get("booking_name")) == key), None)
+                if owner_index is not None:
+                    profiles[owner_index] = {
+                        **profiles[owner_index],
+                        **{field: content for field, content in item.items()
+                           if content not in {None, ""}},
+                    }
+                continue
+            profiles.append(item)
+            seen.add(key)
+        return profiles
+
+    def _profile_for_flight(self, flight: dict) -> dict:
+        passenger_key = passenger_profile_key(self._flight_passenger(flight))
+        profiles = self._profiles()
+        exact = next((profile for profile in profiles
+                      if passenger_profile_key(profile.get("booking_name"))
+                      == passenger_key), None)
+        return exact or (profiles[0] if profiles and not passenger_key else {})
+
+    def _remember_ai_context(self, *, flight: dict | None = None,
+                             complaint: dict | None = None,
+                             passenger: str = ""):
+        if complaint:
+            flight = complaint.get("flight_data") or flight
+            self._ai_context["reference"] = complaint.get("reference") or ""
+        elif flight:
+            self._ai_context["reference"] = ""
+        if flight:
+            self._ai_context.update({
+                "flight_number": self._effective_flight_value(
+                    flight, "flight_number") or "",
+                "pnr": self._effective_flight_value(flight, "pnr") or "",
+                "passenger": self._flight_passenger(flight),
+            })
+        if passenger:
+            self._ai_context["passenger"] = passenger
+        self._ai_context["updated"] = time.monotonic()
+
+    def _contextualize_ai_action(self, action: dict, message: str) -> dict:
+        """Resolve short follow-ups from the last exact result, never by AI guess."""
+        result = dict(action)
+        updated = float(self._ai_context.get("updated") or 0)
+        if not updated or time.monotonic() - updated > 30 * 60:
+            return result
+        has_selector = any(result.get(field) for field in (
+            "flight_number", "pnr", "reference", "passenger"))
+        short_follow_up = len(message.split()) <= 7
+        pronoun = re.search(
+            r"\b(?:it|its|that|this|same|those|them|there)\b",
+            message, re.IGNORECASE)
+        if has_selector or not (short_follow_up or pronoun):
+            return result
+        name = result.get("name")
+        complaint_actions = {
+            "complaint_details", "complaint_responses", "show_evidence",
+            "search_email",
+        }
+        flight_actions = {"flight_details", "list_flights"}
+        if name in complaint_actions and self._ai_context.get("reference"):
+            result["reference"] = self._ai_context["reference"]
+        elif name in complaint_actions:
+            result["flight_number"] = self._ai_context.get(
+                "flight_number") or ""
+            result["pnr"] = self._ai_context.get("pnr") or ""
+        elif name in flight_actions:
+            result["flight_number"] = self._ai_context.get(
+                "flight_number") or ""
+            result["pnr"] = self._ai_context.get("pnr") or ""
+        elif name == "profile_details":
+            result["passenger"] = self._ai_context.get("passenger") or ""
+        return result
+
+    def _ai_catalog(self) -> dict:
+        flights = []
+        for flight in db.list_flights()[:20]:
+            flights.append({
+                "flight_number": self._effective_flight_value(
+                    flight, "flight_number") or ", ".join(
+                        flight.get("flight_numbers") or []),
+                "date": self._effective_flight_value(flight, "flight_date") or "",
+                "origin": self._effective_flight_value(flight, "origin") or "",
+                "destination": self._effective_flight_value(
+                    flight, "destination") or "",
+                "pnr": self._effective_flight_value(flight, "pnr") or "",
+                "passenger": self._flight_passenger(flight),
+            })
+        all_complaints = db.list_complaints()
+        complaints = []
+        for complaint in all_complaints[:20]:
+            flight = complaint.get("flight_data") or {}
+            complaints.append({
+                "reference": complaint.get("reference") or "",
+                "kind": complaint.get("kind") or "",
+                "status": complaint.get("status") or "",
+                "created_at": complaint.get("created_at") or "",
+                "flight_number": self._effective_flight_value(
+                    flight, "flight_number") or ", ".join(
+                        flight.get("flight_numbers") or []),
+                "passenger": self._flight_passenger(flight),
+                "has_evidence": bool(complaint.get("attachments")),
+            })
+        screenshots = TELEGRAM_EVIDENCE_DIR / "portal_jobs"
+        return {
+            "counts": db.counts(),
+            "mailbox": db.mailbox_cursor_summary(),
+            "flights": flights,
+            "complaints": complaints,
+            "passengers": [{
+                "name": profile.get("booking_name") or "",
+                "role": "owner" if index == 0 else "family",
+            } for index, profile in enumerate(self._profiles())],
+            "available_images": {
+                "complaint_evidence": sum(
+                    len(item.get("attachments") or [])
+                    for item in all_complaints),
+                "portal_screenshots": len(list(screenshots.glob("*.png")))
+                if screenshots.exists() else 0,
+            },
+            "context": {
+                key: value for key, value in self._ai_context.items()
+                if key != "updated"
+            },
+        }
+
+    def _dispatch_ai_message(self, text: str):
+        self.notify(f"{self.ai.name} is checking your FlightDeck recordsâ€¦")
+        thread = threading.Thread(
+            target=self._run_ai_message, args=(text,),
+            name="telegram-ai-request", daemon=True)
+        self._ai_chat_thread = thread
+        thread.start()
+
+    def _run_ai_message(self, text: str):
+        with self._ai_chat_lock:
+            try:
+                intent = self.ai.interpret_telegram(text, self._ai_catalog())
+                if not isinstance(intent, dict):
+                    error = getattr(self.ai, "last_error", "")
+                    suffix = f" ({error})" if error else ""
+                    self.notify(
+                        f"{self.ai.name} could not interpret that request right "
+                        f"now{suffix}. /status and /web still work normally.")
+                    return
+                sent = False
+                for action in (intent.get("actions") or [])[:3]:
+                    if isinstance(action, dict):
+                        action = self._contextualize_ai_action(action, text)
+                        sent = self._execute_ai_action(action) or sent
+                reply = _clean_excerpt(str(intent.get("reply") or ""), 3000)
+                if reply:
+                    self.notify(reply)
+                    sent = True
+                if not sent:
+                    self.notify(
+                        "I could not map that to a FlightDeck lookup. Try naming "
+                        "a flight number, PNR, passenger, or complaint reference.")
+            except Exception:
+                logger.exception("Telegram AI request failed")
+                self.notify(
+                    "I could not finish that lookup. No complaint or stored record "
+                    "was changed; /status and /web still work normally.")
+
+    def _matching_flights(self, action: dict) -> list[dict]:
+        flights = db.list_flights()
+        number = self._search_key(action.get("flight_number"))
+        pnr = self._search_key(action.get("pnr"))
+        passenger = passenger_profile_key(action.get("passenger") or "")
+        if number:
+            flights = [flight for flight in flights if number in {
+                self._search_key(self._effective_flight_value(
+                    flight, "flight_number")),
+                *(self._search_key(value)
+                  for value in (flight.get("flight_numbers") or [])),
+            }]
+        if pnr:
+            flights = [flight for flight in flights
+                       if self._search_key(self._effective_flight_value(
+                           flight, "pnr")) == pnr]
+        if passenger:
+            selected = []
+            for flight in flights:
+                flight_passenger = passenger_profile_key(
+                    self._flight_passenger(flight))
+                if (passenger in flight_passenger
+                        or (flight_passenger and flight_passenger in passenger)):
+                    selected.append(flight)
+            flights = selected
+        scope = action.get("time_scope") or "all"
+        now = datetime.now()
+        if scope in {"upcoming", "past"}:
+            selected = []
+            for flight in flights:
+                when = (parse_flight_time(self._effective_flight_value(
+                    flight, "departure")) or parse_flight_time(
+                        self._effective_flight_value(flight, "flight_date")))
+                if when and ((scope == "upcoming" and when >= now)
+                             or (scope == "past" and when < now)):
+                    selected.append(flight)
+            flights = selected
+            flights.sort(key=lambda flight: (
+                parse_flight_time(self._effective_flight_value(
+                    flight, "departure")) or parse_flight_time(
+                        self._effective_flight_value(flight, "flight_date"))
+                or datetime.max), reverse=scope == "past")
+        query = " ".join(str(action.get("query") or "").casefold().split())
+        generic = {"", "flight", "flights", "details", "flight details",
+                   "info", "information", "next", "upcoming", "past",
+                   "previous", "latest", "last"}
+        if query not in generic:
+            matches = []
+            for flight in flights:
+                haystack = " ".join(str(value or "") for value in (
+                    self._effective_flight_value(flight, "flight_number"),
+                    *(flight.get("flight_numbers") or []),
+                    self._effective_flight_value(flight, "flight_date"),
+                    self._effective_flight_value(flight, "origin"),
+                    self._effective_flight_value(flight, "destination"),
+                    self._effective_flight_value(flight, "pnr"),
+                    self._flight_passenger(flight),
+                    flight.get("airline_name"),
+                )).casefold()
+                if query in haystack:
+                    matches.append(flight)
+            flights = matches
+        return flights
+
+    def _matching_complaints(self, action: dict) -> list[dict]:
+        complaints = db.list_complaints()
+        reference = self._search_key(action.get("reference"))
+        if reference:
+            complaints = [item for item in complaints
+                          if self._search_key(item.get("reference")) == reference]
+        number = self._search_key(action.get("flight_number")).upper()
+        pnr = self._search_key(action.get("pnr"))
+        passenger = passenger_profile_key(action.get("passenger") or "")
+        if number:
+            complaints = [item for item in complaints
+                          if number in self._complaint_flight_numbers(item)]
+        if pnr:
+            complaints = [item for item in complaints
+                          if self._search_key(self._effective_flight_value(
+                              item.get("flight_data") or {}, "pnr")) == pnr]
+        if passenger:
+            complaints = [item for item in complaints
+                          if passenger in passenger_profile_key(
+                              self._flight_passenger(
+                                  item.get("flight_data") or {}))]
+        query = " ".join(str(action.get("query") or "").casefold().split())
+        generic = {"", "complaint", "complaints", "case", "cases", "details",
+                   "latest", "last", "response", "responses", "evidence",
+                   "photo", "photos", "pictures"}
+        if query not in generic:
+            complaints = [item for item in complaints if query in " ".join(
+                str(value or "") for value in (
+                    item.get("reference"), item.get("kind"), item.get("status"),
+                    item.get("subject"), item.get("details"),
+                    self._flight_label(item.get("flight_data") or {}),
+                    self._flight_passenger(item.get("flight_data") or {}),
+                )).casefold()]
+        return complaints
+
+    def _flight_summary(self, flight: dict) -> str:
+        number = (self._effective_flight_value(flight, "flight_number")
+                  or ", ".join(flight.get("flight_numbers") or [])
+                  or "Flight unknown")
+        date = self._effective_flight_value(flight, "flight_date") or "date unknown"
+        origin = self._effective_flight_value(flight, "origin") or "?"
+        destination = self._effective_flight_value(flight, "destination") or "?"
+        passenger = self._flight_passenger(flight) or "passenger unknown"
+        pnr = self._effective_flight_value(flight, "pnr") or "PNR unknown"
+        return f"{number} | {date} | {origin} â†’ {destination} | {passenger} | {pnr}"
+
+    def _complaint_summary(self, complaint: dict) -> str:
+        reference = complaint.get("reference") or "reference pending"
+        return (f"{reference} | {complaint.get('kind') or 'case'} | "
+                f"{complaint.get('status') or 'unknown'} | "
+                f"{self._flight_label(complaint.get('flight_data') or {})} | "
+                f"{(complaint.get('created_at') or '')[:16]}")
+
+    def _send_flight_details(self, action: dict) -> bool:
+        flights = self._matching_flights(action)
+        if action.get("latest") and flights:
+            flights = flights[:1]
+        if not flights:
+            self.notify("I found no stored flight matching those exact details.")
+            return True
+        if len(flights) > 1:
+            lines = ["I found several flights. Name the flight number or PNR:"]
+            lines.extend(f"â€¢ {self._flight_summary(item)}" for item in flights[:8])
+            self.notify("\n".join(lines))
+            return True
+        flight = db.get_flight(flights[0]["id"]) or flights[0]
+        self._remember_ai_context(flight=flight)
+        payment = self._effective_flight_value(flight, "payment_method") or "not found"
+        text = "\n".join((
+            f"Flight: {self._flight_summary(flight)}",
+            f"Airline: {flight.get('airline_name') or flight.get('airline_code') or 'unknown'}",
+            f"Departure: {self._effective_flight_value(flight, 'departure') or 'unknown'}",
+            f"Arrival: {self._effective_flight_value(flight, 'arrival') or 'unknown'}",
+            f"Ticket: {self._effective_flight_value(flight, 'ticket_number') or 'not found'}",
+            f"Payment: {payment}",
+            f"Linked emails: {len(flight.get('emails') or [])}",
+            f"Complaints: {len(flight.get('complaints') or [])}",
+        ))
+        self.notify(text)
+        return True
+
+    def _send_complaint_details(self, action: dict) -> bool:
+        complaints = self._matching_complaints(action)
+        if action.get("latest") and complaints:
+            complaints = complaints[:1]
+        if not complaints:
+            self.notify("I found no complaint matching those exact details.")
+            return True
+        if len(complaints) > 1:
+            lines = ["I found several complaints. Name the reference or flight:"]
+            lines.extend(f"â€¢ {self._complaint_summary(item)}"
+                         for item in complaints[:8])
+            self.notify("\n".join(lines))
+            return True
+        complaint = complaints[0]
+        flight = complaint.get("flight_data") or {}
+        self._remember_ai_context(complaint=complaint)
+        profile = self._profile_for_flight(flight)
+        responses = [item for item in db.complaint_response_details(50)
+                     if item["complaint_id"] == complaint["id"]]
+        due_text = "not applicable"
+        if complaint.get("kind") == "airline":
+            created = parse_flight_time(complaint.get("created_at"))
+            try:
+                days = max(1, int(self.settings.get(
+                    "gaca_auto_escalate_days", 7)))
+            except (TypeError, ValueError):
+                days = 7
+            due_text = ((created + timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
+                        if created else "unknown")
+        self.notify("\n".join((
+            f"Complaint: {complaint.get('reference') or 'reference pending'}",
+            f"Type/status: {complaint.get('kind') or 'unknown'} / {complaint.get('status') or 'unknown'}",
+            f"Flight: {self._flight_summary(flight)}",
+            f"Created: {complaint.get('created_at') or 'unknown'}",
+            f"Issue: {_clean_excerpt(complaint.get('details') or 'not recorded', 900)}",
+            f"Evidence files: {len(complaint.get('attachments') or [])}",
+            f"Matched airline responses: {len(responses)}",
+            f"GACA auto-escalation due: {due_text}",
+            "Current configured passenger email: "
+            f"{profile.get('email') or 'not found'}",
+        )))
+        return True
+
+    def _send_response_details(self, action: dict) -> bool:
+        selected = self._matching_complaints(action)
+        has_selector = any(action.get(field) for field in (
+            "reference", "flight_number", "pnr", "passenger", "query"))
+        selected_ids = {item["id"] for item in selected}
+        rows = db.complaint_response_details(50)
+        if has_selector:
+            rows = [row for row in rows if row["complaint_id"] in selected_ids]
+        if action.get("latest") and rows:
+            rows = rows[:1]
+        limit = max(1, min(int(action.get("limit") or 5), 10))
+        rows = rows[:limit]
+        if not rows:
+            self.notify("No matched airline response was found for that complaint.")
+            return True
+        complaint_map = {item["id"]: item for item in db.list_complaints()}
+        first_complaint = complaint_map.get(rows[0]["complaint_id"])
+        if first_complaint:
+            self._remember_ai_context(complaint=first_complaint)
+        for row in rows:
+            self.notify("\n".join((
+                f"Airline response for {row.get('reference') or 'case'}",
+                f"Date: {row.get('date') or 'unknown'}",
+                f"From: {row.get('sender') or 'unknown'}",
+                f"Subject: {row.get('subject') or '(no subject)'}",
+                f"Matched by: {str(row.get('match_method') or '').replace('_', ' ')}",
+                f"Message: {_clean_excerpt(row.get('body') or '', 1200)}",
+            )))
+        return True
+
+    def _send_email_search(self, action: dict) -> bool:
+        query = (action.get("query") or action.get("reference")
+                 or action.get("flight_number") or action.get("pnr") or "")
+        limit = max(1, min(int(action.get("limit") or 5), 10))
+        rows = db.search_mail_events(query, limit)
+        if not rows:
+            self.notify(f"No stored airline email matched {query!r}.")
+            return True
+        lines = [f"Stored airline emails matching {query!r}:"
+                 if query else "Latest stored airline emails:"]
+        for row in rows:
+            lines.append(
+                f"â€¢ {(row.get('date') or '')[:16]} | "
+                f"{row.get('sender') or 'unknown sender'} | "
+                f"{row.get('subject') or '(no subject)'}\n  "
+                f"{_clean_excerpt(row.get('body') or '', 300)}")
+        self.notify("\n".join(lines))
+        return True
+
+    def _send_evidence(self, action: dict) -> bool:
+        complaints = self._matching_complaints(action)
+        if action.get("latest") and complaints:
+            complaints = complaints[:1]
+        paths = []
+        for complaint in complaints:
+            for value in complaint.get("attachments") or []:
+                path = Path(value)
+                if (path.suffix.casefold() in {".png", ".jpg", ".jpeg", ".webp"}
+                        and path.is_file()):
+                    paths.append((path, complaint))
+        limit = max(1, min(int(action.get("limit") or 5), 10))
+        if not paths:
+            self.notify("No saved complaint photos matched that request.")
+            return True
+        self._remember_ai_context(complaint=paths[0][1])
+        for path, complaint in paths[:limit]:
+            try:
+                self.api.send_photo(
+                    self.chat_id, path.read_bytes(),
+                    f"Evidence for {complaint.get('reference') or self._flight_label(complaint.get('flight_data') or {})}")
+            except OSError:
+                logger.exception("Could not read Telegram evidence %s", path)
+        return True
+
+    def _send_latest_screenshots(self, action: dict) -> bool:
+        folder = TELEGRAM_EVIDENCE_DIR / "portal_jobs"
+        paths = sorted(folder.glob("*.png"),
+                       key=lambda path: path.stat().st_mtime, reverse=True)
+        limit = max(1, min(int(action.get("limit") or 1), 5))
+        if not paths:
+            self.notify("No saved portal screenshot is available yet.")
+            return True
+        sent = 0
+        for path in paths[:limit]:
+            try:
+                stamp = datetime.fromtimestamp(path.stat().st_mtime).strftime(
+                    "%Y-%m-%d %H:%M:%S")
+                self.api.send_photo(
+                    self.chat_id, path.read_bytes(),
+                    f"Saved portal screenshot from {stamp}")
+                sent += 1
+            except OSError:
+                logger.exception("Could not read portal screenshot %s", path)
+        if not sent:
+            self.notify("The saved portal screenshot could not be read.")
+        return True
+
+    def _send_profile(self, action: dict) -> bool:
+        profiles = self._profiles()
+        selector = passenger_profile_key(action.get("passenger") or "")
+        if selector:
+            profiles = [profile for profile in profiles
+                        if selector in passenger_profile_key(
+                            profile.get("booking_name") or "")]
+        elif profiles:
+            # profile_details without a named passenger means the configured
+            # owner. list_passengers remains the explicit family-wide action.
+            profiles = profiles[:1]
+        if action.get("latest") and profiles:
+            profiles = profiles[:1]
+        if not profiles:
+            self.notify("No stored passenger profile matched that name.")
+            return True
+        if len(profiles) > 1:
+            self.notify("Stored passengers:\n" + "\n".join(
+                f"â€¢ {profile.get('booking_name') or 'Unnamed passenger'}"
+                for profile in profiles))
+            return True
+        profile = profiles[0]
+        self._remember_ai_context(
+            passenger=profile.get("booking_name") or "")
+        full_name = profile.get("full_name") or " ".join(filter(None, (
+            profile.get("first_name"), profile.get("middle_name"),
+            profile.get("last_name")))) or profile.get("booking_name")
+        self.notify("\n".join((
+            f"Passenger: {full_name or 'unknown'}",
+            f"Booking name: {profile.get('booking_name') or 'unknown'}",
+            f"Title: {profile.get('title') or 'not found'}",
+            f"Email: {profile.get('email') or 'not found'}",
+            f"Phone: {(profile.get('country_code') or '')} {profile.get('phone') or 'not found'}".strip(),
+            f"Nationality: {profile.get('nationality') or 'not found'}",
+            f"National ID/passport/Iqama: {profile.get('national_id') or 'not found'}",
+            f"Alfursan ID: {profile.get('alfursan_id') or 'not found'}",
+        )))
+        return True
+
+    def _execute_ai_action(self, action: dict) -> bool:
+        name = action.get("name")
+        if name == "status":
+            self._send_status()
+            return True
+        if name == "web_link":
+            self._send_web_link()
+            return True
+        if name == "scan_mailbox":
+            result = self._maybe_scan_mailbox(force=True, notify_when_done=True)
+            messages = {
+                "started": "Gmail incremental sync started. I will tell you when it finishes.",
+                "running": "Gmail incremental sync is already running.",
+                "not_configured": "Gmail sync is not configured on this server.",
+            }
+            self.notify(messages.get(result, "Gmail sync did not need to start."))
+            return True
+        if name in {"list_flights", "flight_details"}:
+            if name == "flight_details":
+                return self._send_flight_details(action)
+            flights = self._matching_flights(action)
+            if action.get("latest") and flights:
+                flights = flights[:1]
+            limit = max(1, min(int(action.get("limit") or 8), 10))
+            if not flights:
+                self.notify("No stored flight matched that request.")
+            else:
+                if len(flights[:limit]) == 1:
+                    self._remember_ai_context(flight=flights[0])
+                self.notify("Flights:\n" + "\n".join(
+                    f"â€¢ {self._flight_summary(item)}"
+                    for item in flights[:limit]))
+            return True
+        if name in {"list_complaints", "complaint_details"}:
+            if name == "complaint_details":
+                return self._send_complaint_details(action)
+            complaints = self._matching_complaints(action)
+            if action.get("latest") and complaints:
+                complaints = complaints[:1]
+            limit = max(1, min(int(action.get("limit") or 8), 10))
+            if not complaints:
+                self.notify("No stored complaint matched that request.")
+            else:
+                if len(complaints[:limit]) == 1:
+                    self._remember_ai_context(complaint=complaints[0])
+                self.notify("Complaints:\n" + "\n".join(
+                    f"â€¢ {self._complaint_summary(item)}"
+                    for item in complaints[:limit]))
+            return True
+        if name == "complaint_responses":
+            return self._send_response_details(action)
+        if name == "search_email":
+            return self._send_email_search(action)
+        if name == "show_evidence":
+            return self._send_evidence(action)
+        if name == "latest_screenshot":
+            return self._send_latest_screenshots(action)
+        if name == "profile_details":
+            return self._send_profile(action)
+        if name == "list_passengers":
+            profiles = self._profiles()
+            names = [profile.get("booking_name") or "Unnamed passenger"
+                     for profile in profiles]
+            self.notify("Stored passengers:\n" + ("\n".join(
+                f"â€¢ {name}" for name in names) if names else "None found."))
+            return True
+        if name == "help":
+            self.notify(
+                "Ask naturally about flights, PNRs, passengers, complaint "
+                "references, airline responses, stored email, evidence photos, "
+                "portal screenshots, status, or a fresh Gmail sync. Existing "
+                "/status, /web, /cancel, post-flight, verification, and complaint "
+                "flows keep priority.")
+            return True
+        return False
+
     @staticmethod
     def _complaint_flight_numbers(complaint: dict) -> set[str]:
         flight = complaint.get("flight_data") or {}
         values = list(flight.get("flight_numbers") or [])
+        override = (flight.get("overrides") or {}).get("flight_number")
+        if override:
+            values.append(override)
         if flight.get("flight_number"):
             values.append(flight["flight_number"])
-        return {re.sub(r"\s+", "", str(value)).upper()
+        return {re.sub(r"[^A-Z0-9]", "", str(value).upper())
                 for value in values if value}
 
     def _capture_telegram_reference(self, reference: str, pasted: str,
@@ -992,16 +1615,19 @@ class TelegramCoordinator:
             db.record_survey(flight["flight_key"], self.chat_id,
                              message["message_id"], "asked")
 
-    def _maybe_scan_mailbox(self):
+    def _maybe_scan_mailbox(self, force: bool = False,
+                            notify_when_done: bool = False) -> str:
         minutes = int(self.settings.get("mailbox_scan_minutes", 10))
-        if minutes <= 0 or not (self.config.get("imap", {}).get("user")
-                                and self.config.get("imap", {}).get("password")):
-            return
-        if time.monotonic() - self._last_mail_scan < minutes * 60:
-            return
+        if ((minutes <= 0 and not force)
+                or not (self.config.get("imap", {}).get("user")
+                        and self.config.get("imap", {}).get("password"))):
+            return "not_configured"
+        if (not force
+                and time.monotonic() - self._last_mail_scan < minutes * 60):
+            return "throttled"
         if (self._mail_scan_thread
                 and self._mail_scan_thread.is_alive()):
-            return
+            return "running"
         self._last_mail_scan = time.monotonic()
         scan_config = json.loads(json.dumps(self.config))
         scan_config["imap"]["since_days"] = min(
@@ -1012,13 +1638,24 @@ class TelegramCoordinator:
                 scan_mailbox(
                     scan_config, log=lambda *_args, **_kwargs: None)
                 self._mail_scan_error = ""
+                if notify_when_done:
+                    counts = db.counts()
+                    self.notify(
+                        "Gmail incremental sync finished. FlightDeck now has "
+                        f"{counts['emails']} parsed emails and "
+                        f"{counts['flights']} flights.")
             except Exception as exc:
                 self._mail_scan_error = type(exc).__name__
                 logger.exception("Background incremental mailbox scan failed")
+                if notify_when_done:
+                    self.notify(
+                        "Gmail incremental sync failed. The existing flights, "
+                        "complaints, and email records were left unchanged.")
 
         self._mail_scan_thread = threading.Thread(
             target=run_scan, name="gmail-incremental-scan", daemon=True)
         self._mail_scan_thread.start()
+        return "started"
 
     def check_complaint_responses(self):
         events = db.list_mail_events()

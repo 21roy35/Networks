@@ -166,3 +166,37 @@ def test_profile_extraction_accepts_only_labeled_verbatim_evidence():
     prompt = session.calls[0][1]["json"]["messages"][0]["content"][-1]["text"]
     assert "exactly the named passenger" in prompt
     assert "Lujain Alasais" in prompt
+
+
+def test_telegram_intent_selects_tools_without_answering_from_catalog():
+    result = {
+        "actions": [{
+            "name": "flight_details", "flight_number": "SV1671",
+            "pnr": "", "reference": "", "passenger": "Mansour",
+            "query": "", "time_scope": "past", "latest": False,
+            "limit": 5,
+        }],
+        "reply": "",
+    }
+    session = FakeSession({
+        "content": [{"type": "text", "text": json.dumps(result)}],
+    })
+    assistant = ClaudeAssistant(enabled_config(), session=session)
+
+    actual = assistant.interpret_telegram(
+        "Show me Mansour's SV1671 details", {
+            "counts": {"flights": 3},
+            "flights": [{
+                "flight_number": "SV1671", "passenger": "Mansour Alasais",
+            }],
+        })
+
+    assert actual == result
+    request = session.calls[0][1]["json"]
+    schema = request["output_config"]["format"]["schema"]
+    names = schema["properties"]["actions"]["items"]["properties"]["name"]["enum"]
+    assert "show_evidence" in names
+    assert "scan_mailbox" in names
+    prompt = request["messages"][0]["content"][-1]["text"]
+    assert "intent router, not a data reasoning task" in prompt
+    assert "never claim that a lookup succeeded" in prompt
