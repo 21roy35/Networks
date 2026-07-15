@@ -1782,7 +1782,15 @@ def _submission_reference(body) -> str:
                           r"^(?:reference|case|complaint|request)$", str(key), re.I)
                     and isinstance(value, (str, int))):
                 candidate = str(value).strip()
-                if re.fullmatch(r"[A-Z0-9][A-Z0-9-]{4,}", candidate, re.I):
+                # JSON response objects often expose internal request/database
+                # ids under names such as requestId.  A bare integer is not
+                # proof of a public case reference (Saudia's customer-facing
+                # references, for example, include a C_ prefix).  Numeric-only
+                # references may still be recovered from a clearly contextual
+                # confirmation URL, email, SMS, or page message.
+                if (re.fullmatch(r"[A-Z0-9][A-Z0-9_-]{4,}", candidate, re.I)
+                        and re.search(r"[A-Z]", candidate, re.I)
+                        and re.search(r"\d", candidate)):
                     return candidate
             reference = _submission_reference(value)
             if reference:

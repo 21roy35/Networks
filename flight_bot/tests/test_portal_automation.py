@@ -1191,6 +1191,23 @@ def test_saudia_backend_acceptance_requires_a_real_reference():
     assert pending.status == "accepted_pending_reference"
     assert pending.reference == ""
 
+    internal_id = portal_automation._saudia_submission_result({
+        "seen": True, "status": 200,
+        "json": {"data": {"requestId": 1752497514}},
+    })
+    assert internal_id.status == "accepted_pending_reference"
+    assert internal_id.reference == ""
+
+
+def test_submission_reference_rejects_bare_backend_numbers():
+    assert portal_automation._submission_reference({
+        "data": {"requestId": 1752497514,
+                 "complaintNumber": 1752497514},
+    }) == ""
+    assert portal_automation._submission_reference({
+        "data": {"complaintNumber": "C_2761389"},
+    }) == "C_2761389"
+
 
 def test_saudia_backend_rejection_and_unconfirmed_timeout_are_failures():
     rejected = portal_automation._saudia_submission_result({
