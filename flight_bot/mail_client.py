@@ -6,6 +6,7 @@ Works with Gmail (use an App Password: Google Account -> Security ->
 
 import email
 import email.policy
+import hashlib
 import imaplib
 import io
 import re
@@ -17,6 +18,7 @@ from html.parser import HTMLParser
 
 from pypdf import PdfReader
 
+from . import db
 from .airlines import all_domains
 
 _SUBJECT_KEYWORDS = [
@@ -157,7 +159,8 @@ def extract_pdf_attachments(msg: email.message.EmailMessage) -> str:
     return "\n\n".join(extracted)
 
 
-def message_to_raw(msg: email.message.EmailMessage) -> dict:
+def message_to_raw(msg: email.message.EmailMessage,
+                   raw_bytes: bytes | None = None) -> dict:
     """Normalise an EmailMessage into the dict the parser consumes."""
     sender = parseaddr(msg.get("From", ""))[1]
     date = None
@@ -170,8 +173,12 @@ def message_to_raw(msg: email.message.EmailMessage) -> dict:
     attachment_text = extract_pdf_attachments(msg)
     if attachment_text:
         body = f"{body}\n\n{attachment_text}".strip()
+    if raw_bytes is None:
+        raw_bytes = msg.as_bytes(policy=email.policy.default)
+    fallback_id = hashlib.sha256(raw_bytes).hexdigest()
     return {
-        "message_id": msg.get("Message-ID") or f"<no-id-{hash(str(msg))}>",
+        "message_id": (msg.get("Message-ID")
+                       or f"<sha256-{fallback_id}@flightdeck.local>"),
         "subject": str(msg.get("Subject", "")),
         "sender": sender,
         "date": date,
@@ -179,11 +186,27 @@ def message_to_raw(msg: email.message.EmailMessage) -> dict:
     }
 
 
-def _search_queries(since: str) -> list[str]:
+def _search_queries(since: str, first_uid: int | None = None) -> list[str]:
     """IMAP SEARCH criteria: airline sender domains + subject keywords."""
-    queries = [f'(SINCE {since} FROM "{domain}")' for domain in all_domains()]
-    queries += [f'(SINCE {since} SUBJECT "{kw}")' for kw in _SUBJECT_KEYWORDS]
+    scope = f"UID {int(first_uid)}:*" if first_uid else f"SINCE {since}"
+    queries = [f'({scope} FROM "{domain}")' for domain in all_domains()]
+    queries += [f'({scope} SUBJECT "{kw}")' for kw in _SUBJECT_KEYWORDS]
     return queries
+
+
+def _selected_mailbox_value(conn, name: str) -> str:
+    """Return an integer SELECT response such as UIDVALIDITY or UIDNEXT."""
+    try:
+        _code, values = conn.response(name)
+    except (AttributeError, imaplib.IMAP4.error):
+        return ""
+    if not values:
+        return ""
+    value = values[-1]
+    if isinstance(value, bytes):
+        value = value.decode("ascii", errors="ignore")
+    match = re.search(r"\d+", str(value))
+    return match.group(0) if match else ""
 
 
 def fetch_airline_emails(config: dict, log=print, progress: dict | None = None):
@@ -214,44 +237,79 @@ def fetch_airline_emails(config: dict, log=print, progress: dict | None = None):
         conn.login(imap_cfg["user"], imap_cfg["password"])
 
         # Phase 1: search every folder first so the total (and therefore an
-        # ETA) is known before fetching starts.
+        # ETA) is known before fetching starts. Once a folder has a cursor,
+        # only UIDs newer than its last successful scan are considered.
         progress["phase"] = "searching"
-        todo: list[tuple[str, bytes]] = []
+        batches: list[dict] = []
         for folder in imap_cfg.get("folders", ["INBOX"]):
             status, _ = conn.select(folder, readonly=True)
             if status != "OK":
                 log(f"  ! cannot open folder {folder}, skipping")
                 continue
+            uidvalidity = _selected_mailbox_value(
+                conn, "UIDVALIDITY") or "unknown"
+            uidnext_text = _selected_mailbox_value(conn, "UIDNEXT")
+            cursor = db.get_mailbox_cursor(folder)
+            incremental = bool(
+                cursor and cursor.get("uidvalidity") == uidvalidity)
+            first_uid = int(cursor["last_uid"]) + 1 if incremental else None
+            high_uid = (max(0, int(uidnext_text) - 1)
+                        if uidnext_text else int(cursor["last_uid"])
+                        if incremental else 0)
             uids: set[bytes] = set()
-            for query in _search_queries(since):
-                try:
-                    status, data = conn.uid("SEARCH", None, query)
-                except imaplib.IMAP4.error:
-                    continue
-                if status == "OK" and data and data[0]:
-                    uids.update(data[0].split())
-            log(f"  {folder}: {len(uids)} candidate emails since {since}")
-            todo.extend((folder, uid) for uid in
-                        sorted(uids, key=lambda u: int(u)))
+            search_ok = True
+            if not (incremental and uidnext_text
+                    and high_uid < int(first_uid or 1)):
+                for query in _search_queries(since, first_uid):
+                    try:
+                        status, data = conn.uid("SEARCH", None, query)
+                    except imaplib.IMAP4.error:
+                        search_ok = False
+                        continue
+                    if status != "OK":
+                        search_ok = False
+                        continue
+                    if data and data[0]:
+                        uids.update(data[0].split())
+            if uids:
+                high_uid = max(high_uid, max(int(uid) for uid in uids))
+            scope = (f"UID {first_uid}+" if incremental
+                     else f"since {since}")
+            log(f"  {folder}: {len(uids)} new candidate emails ({scope})")
+            batches.append({
+                "folder": folder,
+                "uidvalidity": uidvalidity,
+                "high_uid": high_uid,
+                "uids": sorted(uids, key=lambda value: int(value)),
+                "search_ok": search_ok,
+            })
 
         # Phase 2: fetch, updating progress as we go.
-        progress.update(phase="fetching", total=len(todo),
+        total = sum(len(batch["uids"]) for batch in batches)
+        progress.update(phase="fetching", total=total,
                         fetch_started=time.time())
-        current_folder = None
-        for folder, uid in todo:
-            if folder != current_folder:
-                conn.select(folder, readonly=True)
-                current_folder = folder
-            status, data = conn.uid("FETCH", uid, "(RFC822)")
-            progress["processed"] += 1
-            if progress["processed"] % 25 == 0:
-                log(f"  fetched {progress['processed']}/{progress['total']} "
-                    f"emails (ETA {eta_text(progress) or '...'})")
-            if status != "OK" or not data or data[0] is None:
-                continue
-            msg = email.message_from_bytes(
-                data[0][1], policy=email.policy.default)
-            yield message_to_raw(msg)
+        for batch in batches:
+            folder = batch["folder"]
+            status, _ = conn.select(folder, readonly=True)
+            folder_ok = batch["search_ok"] and status == "OK"
+            for uid in batch["uids"]:
+                status, data = conn.uid("FETCH", uid, "(RFC822)")
+                progress["processed"] += 1
+                if progress["processed"] % 25 == 0:
+                    log(f"  fetched {progress['processed']}/{progress['total']} "
+                        f"emails (ETA {eta_text(progress) or '...'})")
+                if (status != "OK" or not data or data[0] is None
+                        or not isinstance(data[0], tuple)
+                        or len(data[0]) < 2):
+                    folder_ok = False
+                    continue
+                raw_bytes = data[0][1]
+                msg = email.message_from_bytes(
+                    raw_bytes, policy=email.policy.default)
+                yield message_to_raw(msg, raw_bytes=raw_bytes)
+            if folder_ok:
+                db.save_mailbox_cursor(
+                    folder, batch["uidvalidity"], batch["high_uid"])
     finally:
         try:
             conn.logout()

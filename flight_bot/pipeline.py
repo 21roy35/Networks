@@ -76,9 +76,15 @@ def scan_mailbox(config: dict, log=print, progress: dict | None = None) -> int:
         progress.setdefault("started", time.time())
         kept = ingest(fetch_airline_emails(config, log=log, progress=progress),
                       log=log, progress=progress)
-        log(f"Stored {kept} flight-related email(s).")
-        progress["phase"] = "linking"
-        flights = rebuild_flights(log=log)
+        log(f"Stored {kept} new flight-related email(s).")
+        if kept:
+            progress["phase"] = "linking"
+            flights = rebuild_flights(log=log)
+        else:
+            # Incremental IMAP scans commonly have no new mail. Avoid loading,
+            # linking, deleting, and rewriting the entire flights table.
+            flights = db.counts()["flights"]
+            log("No new flight email; existing flight links were left unchanged.")
         progress.update(phase="done", flights=flights, finished=time.time())
         return flights
 

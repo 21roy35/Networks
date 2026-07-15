@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 from copy import deepcopy
@@ -104,6 +105,31 @@ def test_start_registers_telegram_command_menu(coordinator, monkeypatch):
         "telegram-commands", "telegram-updates", "telegram-monitor"}
     bot._register_commands()
     assert api.commands_registered is True
+
+
+def test_mailbox_scan_runs_off_the_monitor_thread(coordinator, monkeypatch):
+    bot, _api = coordinator
+    bot.settings["mailbox_scan_minutes"] = 1
+    bot.config["imap"].update({
+        "user": "passenger@example.com", "password": "app-password",
+    })
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_scan(*_args, **_kwargs):
+        started.set()
+        release.wait(2)
+
+    monkeypatch.setattr(telegram_bot, "scan_mailbox", fake_scan)
+
+    bot._maybe_scan_mailbox()
+
+    assert started.wait(1)
+    assert bot._mail_scan_thread is not None
+    assert bot._mail_scan_thread.is_alive()
+    release.set()
+    bot._mail_scan_thread.join(2)
+    assert bot._mail_scan_error == ""
 
 
 def test_complaint_reservation_blocks_duplicates_but_allows_failed_retry(
@@ -303,6 +329,55 @@ def test_reference_less_resolutions_are_persistently_matched_fifo(coordinator):
     bot.check_complaint_responses()
     assert len(db.list_complaint_responses()) == 2
     assert len(api.messages) == 2
+
+
+def test_reference_less_resolution_uses_booking_facts_before_fifo(coordinator):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    older_flight = next(item for item in db.list_flights()
+                        if item.get("airline_code") == "SV")
+    newer_data = dict(older_flight)
+    newer_data.update({
+        "flight_key": "NEW999|SV1999|2026-07-09",
+        "pnr": "NEW999", "flight_number": "SV1999",
+        "flight_numbers": ["SV1999"], "flight_date": "2026-07-09",
+        "passenger": "Fatimah Example", "email_ids": [],
+    })
+    newer_data.pop("id", None)
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO flights (flight_key, data, overrides) VALUES (?, ?, '{}')",
+            (newer_data["flight_key"], json.dumps(newer_data)))
+    db.add_complaint(
+        older_flight["flight_key"], "airline", None, "Older claim", "submitted",
+        reference="C_7050001", details="Older issue.")
+    db.add_complaint(
+        newer_data["flight_key"], "airline", None, "Newer claim", "submitted",
+        reference="C_7050002", details="Newer issue.")
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE complaints SET created_at = datetime('now', '-2 days') "
+            "WHERE reference = 'C_7050001'")
+        conn.execute(
+            "UPDATE complaints SET created_at = datetime('now', '-1 day') "
+            "WHERE reference = 'C_7050002'")
+    event_id = db.save_mail_event({
+        "message_id": "<fact-resolution@example>",
+        "subject": "Complaint resolution for flight SV1999",
+        "sender": "customer.relations@saudia.com", "date": datetime.now(),
+        "body": ("For Fatimah Example, booking NEW999 on 2026-07-09: "
+                 "our review is complete and compensation was declined."),
+    })
+
+    bot.check_complaint_responses()
+
+    links = db.list_complaint_responses()
+    newer = next(item for item in db.list_complaints()
+                 if item.get("reference") == "C_7050002")
+    assert [(item["complaint_id"], item["mail_event_id"], item["match_method"])
+            for item in links] == [(newer["id"], event_id, "case_facts")]
+    assert len(api.messages) == 1
+    assert "booking facts" in api.messages[0]["text"]
 
 
 def test_reference_match_wins_even_when_resolutions_arrive_out_of_order(
@@ -623,6 +698,48 @@ def test_ghala_interprets_matched_airline_response_before_escalation(coordinator
     assert len(api.messages) == 1
     assert "declined compensation" in api.messages[0]["text"]
     assert "Ghala-200 recommends: escalate" in api.messages[0]["text"]
+
+
+def test_non_substantive_ai_response_analysis_is_cached(coordinator):
+    bot, api = coordinator
+
+    class FakeGhala:
+        enabled = True
+        name = "Ghala"
+        model = "claude-test"
+        settings = {"analyze_responses": True}
+
+        def __init__(self):
+            self.calls = 0
+
+        def analyze_response(self, *_args):
+            self.calls += 1
+            return {
+                "summary": "The airline only acknowledged the case.",
+                "outcome": "pending", "amounts_or_deadlines": [],
+                "recommendation": "wait", "rationale": "No decision yet.",
+                "substantive": False,
+            }
+
+    bot.ai = FakeGhala()
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Claim", "submitted",
+        reference="C_7300001", details="Broken screen")
+    db.save_mail_event({
+        "message_id": "<cached-ai-ack@example>",
+        "subject": "Case C_7300001 update",
+        "sender": "customer.relations@saudia.com", "date": datetime.now(),
+        "body": "We are reviewing C_7300001 and will contact you later.",
+    })
+
+    bot.check_complaint_responses()
+    bot.check_complaint_responses()
+
+    assert bot.ai.calls == 1
+    assert api.messages == []
 
 
 def test_closed_case_ignores_later_airline_messages(coordinator):

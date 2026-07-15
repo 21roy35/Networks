@@ -184,6 +184,8 @@ class TelegramCoordinator:
         self._verification: VerificationWaiter | None = None
         self._intakes: dict[str, PendingIntake] = {}
         self._last_mail_scan = 0.0
+        self._mail_scan_thread: threading.Thread | None = None
+        self._mail_scan_error = ""
         self._status_cache: dict[str, tuple[float, bool | None]] = {}
         self._fifo_response_floor = db.initialize_fifo_response_floor()
 
@@ -389,6 +391,7 @@ class TelegramCoordinator:
             return
         if text == "/status":
             counts = db.counts()
+            mailbox = db.mailbox_cursor_summary()
             try:
                 auto_days = max(1, int(self.settings.get(
                     "gaca_auto_escalate_days", 7)))
@@ -407,10 +410,24 @@ class TelegramCoordinator:
             captcha_status = (" 2Captcha is configured with Telegram fallback."
                               if self.captcha.enabled
                               else " Automatic CAPTCHA solving is off.")
+            if (self._mail_scan_thread
+                    and self._mail_scan_thread.is_alive()):
+                mailbox_status = " Gmail incremental sync is running now."
+            elif self._mail_scan_error:
+                mailbox_status = (
+                    f" Gmail's last incremental sync failed: "
+                    f"{self._mail_scan_error}.")
+            elif mailbox.get("last_success"):
+                mailbox_status = (
+                    f" Gmail last synced successfully at "
+                    f"{mailbox['last_success']} across "
+                    f"{mailbox.get('folders') or 0} folder(s).")
+            else:
+                mailbox_status = " Gmail incremental sync is waiting to start."
             self.notify(
                 f"FlightDeck is running. {counts['flights']} flights, "
                 f"{counts['complaints']} complaints, {counts['emails']} parsed emails."
-                + ai_status + captcha_status
+                + mailbox_status + ai_status + captcha_status
                 + f" GACA auto-escalation is on after {auto_days} days "
                   "without a substantive airline response.")
             return
@@ -982,17 +999,38 @@ class TelegramCoordinator:
             return
         if time.monotonic() - self._last_mail_scan < minutes * 60:
             return
+        if (self._mail_scan_thread
+                and self._mail_scan_thread.is_alive()):
+            return
         self._last_mail_scan = time.monotonic()
         scan_config = json.loads(json.dumps(self.config))
         scan_config["imap"]["since_days"] = min(
             int(scan_config["imap"].get("since_days", 730)), 14)
-        scan_mailbox(scan_config, log=lambda *_args, **_kwargs: None)
+
+        def run_scan():
+            try:
+                scan_mailbox(
+                    scan_config, log=lambda *_args, **_kwargs: None)
+                self._mail_scan_error = ""
+            except Exception as exc:
+                self._mail_scan_error = type(exc).__name__
+                logger.exception("Background incremental mailbox scan failed")
+
+        self._mail_scan_thread = threading.Thread(
+            target=run_scan, name="gmail-incremental-scan", daemon=True)
+        self._mail_scan_thread.start()
 
     def check_complaint_responses(self):
         events = db.list_mail_events()
         substantive = re.compile(
             r"resolved|resolution|decision|outcome|approved|declined|denied|"
             r"refund|compensation|reimburse|closed|تعويض|استرداد|مرفوض|إغلاق|حل",
+            re.I)
+        response_candidate = re.compile(
+            r"review|regarding|with regard|update|decision|response|reply|"
+            r"feedback|comment|request|ticket|case|complaint|claim|contacting|"
+            r"inform|advise|resolved|resolution|approved|declined|refund|"
+            r"compensation|closed|تعويض|استرداد|شكوى|طلب|رد|قرار",
             re.I)
         complaints = [
             complaint for complaint in db.list_complaints()
@@ -1049,21 +1087,76 @@ class TelegramCoordinator:
                 for domain in domains))
             return valid, info
 
+        def case_fact_score(blob: str, complaint: dict) -> int:
+            """Score deterministic booking facts; AI is not needed here."""
+            flight = complaint.get("flight_data") or {}
+            compact_blob = re.sub(r"[^a-z0-9]", "", blob.casefold())
+
+            def compact(value) -> str:
+                return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+            score = 0
+            pnr = compact(flight.get("pnr"))
+            if len(pnr) >= 5 and pnr in compact_blob:
+                score += 100
+            for ticket in flight.get("ticket_numbers") or []:
+                token = compact(ticket)
+                if len(token) >= 8 and token in compact_blob:
+                    score += 100
+                    break
+            numbers = list(flight.get("flight_numbers") or [])
+            if flight.get("flight_number"):
+                numbers.append(flight["flight_number"])
+            if any(len(compact(number)) >= 4
+                   and compact(number) in compact_blob for number in numbers):
+                score += 45
+            passenger = passenger_profile_key(
+                (flight.get("overrides") or {}).get("passenger")
+                or flight.get("passenger") or "")
+            name_parts = [part for part in passenger.split() if len(part) >= 3]
+            blob_words = set(re.findall(r"[a-z0-9]+", blob.casefold()))
+            if len(name_parts) >= 2 and all(
+                    part in blob_words for part in name_parts):
+                score += 60
+            flight_date = compact(flight.get("flight_date"))
+            if len(flight_date) == 8 and flight_date in compact_blob:
+                score += 10
+            return score
+
         def response_analysis(event: dict, complaint: dict,
                               info: dict) -> tuple[bool, dict | None]:
             blob = " ".join((event.get("subject") or "",
                              event.get("body") or ""))
+            deterministic = bool(substantive.search(blob))
             analysis = None
             if (self.ai.enabled
-                    and self.ai.settings.get("analyze_responses", True)):
+                    and self.ai.settings.get("analyze_responses", True)
+                    and (deterministic or response_candidate.search(blob))):
                 flight = complaint.get("flight_data") or {}
-                analysis = self.ai.analyze_response(
-                    event.get("subject") or "", event.get("body") or "",
-                    complaint.get("reference") or "",
-                    info.get("name") or flight.get("airline_name") or "Airline")
+                model = str(getattr(self.ai, "model", "") or "configured")
+                cache_material = json.dumps({
+                    "event_id": event.get("id"),
+                    "complaint_id": complaint.get("id"),
+                    "reference": complaint.get("reference") or "",
+                    "airline": (info.get("name")
+                                or flight.get("airline_name") or "Airline"),
+                    "subject": event.get("subject") or "",
+                    "body": event.get("body") or "",
+                }, ensure_ascii=False, sort_keys=True)
+                cache_key = "response-v1:" + hashlib.sha256(
+                    cache_material.encode("utf-8")).hexdigest()
+                analysis = db.get_ai_analysis_cache(cache_key, model)
+                if analysis is None:
+                    analysis = self.ai.analyze_response(
+                        event.get("subject") or "", event.get("body") or "",
+                        complaint.get("reference") or "",
+                        info.get("name") or flight.get("airline_name") or "Airline")
+                    if analysis is not None:
+                        db.save_ai_analysis_cache(
+                            cache_key, "airline_response", model, analysis)
             if analysis is not None:
                 return bool(analysis.get("substantive")), analysis
-            return bool(substantive.search(blob)), None
+            return deterministic, None
 
         def notify_response(complaint: dict, info: dict, event: dict,
                             analysis: dict | None, match_method: str) -> None:
@@ -1082,6 +1175,10 @@ class TelegramCoordinator:
                     event.get("body") or event.get("subject") or "")
             if match_method == "exact_reference":
                 matched_by = "Matched by the complaint reference in the email."
+            elif match_method == "case_facts":
+                matched_by = (
+                    "The email omitted the reference; I matched its booking facts "
+                    "(such as PNR, ticket, flight, date, or passenger) in code.")
             else:
                 matched_by = (
                     "The email omitted the reference, so I matched it to the "
@@ -1158,6 +1255,41 @@ class TelegramCoordinator:
             if _airline_confirmation_reference(
                     event.get("subject") or "", event.get("body") or ""):
                 continue
+
+            # Prefer a unique deterministic booking-fact match over filing
+            # order. This handles family passengers and multiple flights
+            # without spending an AI call or trusting a probabilistic answer.
+            fact_matches = []
+            for complaint in ordered_complaints:
+                if (db.event_seen(f"airline-responded:{complaint['id']}")
+                        or db.event_seen(f"closed:{complaint['flight_key']}")):
+                    continue
+                created = parse_flight_time(complaint.get("created_at"))
+                event_date = parse_flight_time(event.get("date"))
+                if created and event_date and event_date < created:
+                    continue
+                valid_sender, info = event_is_from_airline(event, complaint)
+                if not valid_sender:
+                    continue
+                score = case_fact_score(blob, complaint)
+                if score >= 45:
+                    fact_matches.append((score, complaint, info))
+            fact_matches.sort(key=lambda item: item[0], reverse=True)
+            if (fact_matches and (len(fact_matches) == 1
+                                  or fact_matches[0][0] > fact_matches[1][0])):
+                _score, complaint, info = fact_matches[0]
+                is_substantive, analysis = response_analysis(
+                    event, complaint, info)
+                if is_substantive and db.link_complaint_response(
+                        complaint["id"], event["id"], "case_facts"):
+                    db.mark_event_seen(
+                        f"complaint-response:{complaint['id']}:{event['id']}")
+                    db.mark_event_seen(
+                        f"airline-responded:{complaint['id']}")
+                    notify_response(
+                        complaint, info, event, analysis, "case_facts")
+                continue
+
             for complaint in ordered_complaints:
                 if (db.event_seen(f"airline-responded:{complaint['id']}")
                         or db.event_seen(f"closed:{complaint['flight_key']}")):

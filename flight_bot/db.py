@@ -28,6 +28,13 @@ CREATE TABLE IF NOT EXISTS mail_events (
     body TEXT
 );
 
+CREATE TABLE IF NOT EXISTS mailbox_cursors (
+    folder TEXT PRIMARY KEY,
+    uidvalidity TEXT NOT NULL,
+    last_uid INTEGER NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now', 'localtime'))
+);
+
 CREATE TABLE IF NOT EXISTS flights (
     id INTEGER PRIMARY KEY,
     flight_key TEXT UNIQUE NOT NULL,
@@ -58,7 +65,7 @@ CREATE TABLE IF NOT EXISTS complaint_responses (
     complaint_id INTEGER NOT NULL REFERENCES complaints(id) ON DELETE CASCADE,
     mail_event_id INTEGER NOT NULL UNIQUE
         REFERENCES mail_events(id) ON DELETE CASCADE,
-    match_method TEXT NOT NULL,  -- 'exact_reference' | 'fifo_airline'
+    match_method TEXT NOT NULL,  -- exact_reference | case_facts | fifo_airline
     matched_at TEXT DEFAULT (datetime('now', 'localtime')),
     PRIMARY KEY (complaint_id, mail_event_id)
 );
@@ -89,6 +96,25 @@ CREATE TABLE IF NOT EXISTS ai_profile_cache (
     result TEXT NOT NULL,
     updated_at TEXT DEFAULT (datetime('now', 'localtime'))
 );
+
+CREATE TABLE IF NOT EXISTS ai_analysis_cache (
+    cache_key TEXT PRIMARY KEY,
+    task TEXT NOT NULL,
+    model TEXT NOT NULL,
+    result TEXT NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now', 'localtime'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_mail_events_date
+    ON mail_events(date, id);
+CREATE INDEX IF NOT EXISTS idx_emails_date
+    ON emails(date, id);
+CREATE INDEX IF NOT EXISTS idx_complaints_open
+    ON complaints(kind, status, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_complaint_responses_complaint
+    ON complaint_responses(complaint_id, matched_at);
+CREATE INDEX IF NOT EXISTS idx_telegram_surveys_status
+    ON telegram_surveys(status, updated_at);
 """
 
 
@@ -97,6 +123,7 @@ def connect():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
     try:
         yield conn
         conn.commit()
@@ -155,6 +182,36 @@ def list_mail_events() -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def get_mailbox_cursor(folder: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM mailbox_cursors WHERE folder = ?",
+            (folder,)).fetchone()
+    return dict(row) if row else None
+
+
+def save_mailbox_cursor(folder: str, uidvalidity: str,
+                        last_uid: int) -> None:
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO mailbox_cursors
+                   (folder, uidvalidity, last_uid, updated_at)
+               VALUES (?, ?, ?, datetime('now', 'localtime'))
+               ON CONFLICT(folder) DO UPDATE SET
+                   uidvalidity=excluded.uidvalidity,
+                   last_uid=excluded.last_uid,
+                   updated_at=excluded.updated_at""",
+            (folder, str(uidvalidity), int(last_uid)))
+
+
+def mailbox_cursor_summary() -> dict:
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT COUNT(*) AS folders, MAX(updated_at) AS last_success
+               FROM mailbox_cursors""").fetchone()
+    return dict(row)
+
+
 def link_complaint_response(complaint_id: int, mail_event_id: int,
                             match_method: str) -> bool:
     """Persist one resolution email's complaint assignment exactly once."""
@@ -191,6 +248,35 @@ def initialize_fifo_response_floor() -> int:
             "INSERT INTO complaint_response_state (state_key, state_value) "
             "VALUES (?, ?)", (key, str(latest)))
         return latest
+
+
+def get_ai_analysis_cache(cache_key: str, model: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT result FROM ai_analysis_cache
+               WHERE cache_key = ? AND model = ?""",
+            (cache_key, model)).fetchone()
+    if not row:
+        return None
+    try:
+        result = json.loads(row["result"])
+    except (TypeError, ValueError):
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def save_ai_analysis_cache(cache_key: str, task: str, model: str,
+                           result: dict) -> None:
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO ai_analysis_cache
+                   (cache_key, task, model, result, updated_at)
+               VALUES (?, ?, ?, ?, datetime('now', 'localtime'))
+               ON CONFLICT(cache_key) DO UPDATE SET
+                   task=excluded.task, model=excluded.model,
+                   result=excluded.result, updated_at=excluded.updated_at""",
+            (cache_key, task, model,
+             json.dumps(result, ensure_ascii=False)))
 
 
 def save_email(parsed) -> int:
@@ -582,7 +668,8 @@ def complaints_for_flight(flight_key: str) -> list[dict]:
 def list_complaints() -> list[dict]:
     with connect() as conn:
         rows = conn.execute(
-            """SELECT c.*, f.id AS flight_id, f.data AS flight_data
+            """SELECT c.*, f.id AS flight_id, f.data AS flight_data,
+                      f.overrides AS flight_overrides
                FROM complaints c
                LEFT JOIN flights f ON f.flight_key = c.flight_key
                ORDER BY c.created_at DESC, c.id DESC""").fetchall()
@@ -592,6 +679,9 @@ def list_complaints() -> list[dict]:
         item["attachments"] = json.loads(item.get("attachments") or "[]")
         item["flight_data"] = (json.loads(item["flight_data"])
                                if item.get("flight_data") else {})
+        item["flight_data"]["overrides"] = (
+            json.loads(item.get("flight_overrides") or "{}"))
+        item.pop("flight_overrides", None)
         results.append(item)
     return results
 
@@ -689,11 +779,15 @@ def set_overrides(flight_id: int, values: dict):
 
 def reset():
     with connect() as conn:
+        conn.execute("DELETE FROM complaint_responses")
+        conn.execute("DELETE FROM complaint_response_state")
         conn.execute("DELETE FROM flight_emails")
         conn.execute("DELETE FROM flights")
         conn.execute("DELETE FROM emails")
         conn.execute("DELETE FROM mail_events")
+        conn.execute("DELETE FROM mailbox_cursors")
         conn.execute("DELETE FROM complaints")
         conn.execute("DELETE FROM telegram_surveys")
         conn.execute("DELETE FROM telegram_events")
         conn.execute("DELETE FROM ai_profile_cache")
+        conn.execute("DELETE FROM ai_analysis_cache")
