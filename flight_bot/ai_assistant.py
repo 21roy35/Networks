@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ class ClaudeAssistant:
         self.api_key = str(self.settings.get("api_key") or "")
         self.session = session or requests.Session()
         self.last_error = ""
+        self._retry_after = 0.0
 
     @property
     def enabled(self) -> bool:
@@ -51,6 +53,8 @@ class ClaudeAssistant:
                     images: list[tuple[str, bytes]] | None = None,
                     max_tokens: int = 1200) -> dict[str, Any] | None:
         if not self.enabled:
+            return None
+        if time.monotonic() < self._retry_after:
             return None
         content: list[dict] = []
         image_items = list(images or [])
@@ -95,6 +99,12 @@ class ClaudeAssistant:
             )
             if response.status_code >= 400:
                 self.last_error = self._safe_http_error(response)
+                cooldown = (1800 if self.last_error in {
+                    "Anthropic credit balance is too low",
+                    "Anthropic API key was rejected",
+                    "Configured Anthropic model is unavailable",
+                } else 60)
+                self._retry_after = time.monotonic() + cooldown
                 return None
             result = response.json()
             blocks = result.get("content") or []
@@ -104,6 +114,7 @@ class ClaudeAssistant:
             if not isinstance(parsed, dict):
                 raise ValueError("Claude output was not an object")
             self.last_error = ""
+            self._retry_after = 0.0
             return parsed
         except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
             # Do not log prompts, responses, or credentials: they may contain PII.

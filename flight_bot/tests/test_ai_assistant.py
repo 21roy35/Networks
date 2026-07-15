@@ -100,8 +100,11 @@ def test_low_credit_error_is_actionable_without_copying_api_response():
         "type": "invalid_request_error",
         "message": "Your credit balance is too low. purchase credits. secret detail",
     }}
-    assistant = ClaudeAssistant(
-        enabled_config(), session=FakeSession(response, status=400))
+    session = FakeSession(response, status=400)
+    assistant = ClaudeAssistant(enabled_config(), session=session)
     assert assistant.analyze_response("subject", "body", "CASE-1", "Airline") is None
     assert assistant.last_error == "Anthropic credit balance is too low"
     assert "secret detail" not in assistant.last_error
+    assert assistant.analyze_response(
+        "subject", "body", "CASE-1", "Airline") is None
+    assert len(session.calls) == 1
