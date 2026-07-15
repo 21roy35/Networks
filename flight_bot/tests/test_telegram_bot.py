@@ -233,7 +233,7 @@ def test_confirmation_email_recovers_missing_airline_reference(coordinator):
                   if item.get("airline_code") == "SV")
     db.add_complaint(
         flight["flight_key"], "airline", None, "Screen complaint",
-        "submitted", details="The screen was broken.")
+        "confirmation_unknown", details="The screen was broken.")
     db.save_mail_event({
         "message_id": "<confirmation@example>",
         "subject": "Complaint reference number is CAS-44556677",
@@ -245,6 +245,7 @@ def test_confirmation_email_recovers_missing_airline_reference(coordinator):
 
     complaint = db.complaints_for_flight(flight["flight_key"])[0]
     assert complaint["reference"] == "CAS-44556677"
+    assert complaint["status"] == "submitted"
     assert any("Captured the airline complaint reference" in item["text"]
                for item in api.messages)
 

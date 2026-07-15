@@ -746,7 +746,9 @@ class TelegramCoordinator:
             r"refund|compensation|reimburse|closed|تعويض|استرداد|مرفوض|إغلاق|حل",
             re.I)
         for complaint in db.list_complaints():
-            if complaint.get("kind") != "airline" or complaint.get("status") != "submitted":
+            if (complaint.get("kind") != "airline"
+                    or complaint.get("status") not in {
+                        "submitted", "confirmation_unknown"}):
                 continue
             if db.event_seen(f"closed:{complaint['flight_key']}"):
                 continue
