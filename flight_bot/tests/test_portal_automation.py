@@ -609,9 +609,11 @@ def test_2captcha_extracts_site_key_and_applies_token(monkeypatch):
     assert portal_automation._solve_recaptcha_automatically(
         page, lambda *args: updates.append(args)) is True
     assert captured == {
+        "kind": "recaptcha",
         "website_url": page.url,
         "site_key": "saudia-site-key",
         "is_invisible": False,
+        "is_enterprise": False,
         "user_agent": "Modern Browser",
         "api_domain": "recaptcha.net",
     }
@@ -619,6 +621,72 @@ def test_2captcha_extracts_site_key_and_applies_token(monkeypatch):
     assert page.waits == [1500]
     assert updates[0][0] == "verification"
     assert updates[-1][0] == "filling"
+
+
+def test_nested_hcaptcha_is_detected_and_sent_to_automatic_solver(monkeypatch):
+    class Empty:
+        first = None
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class Checkbox:
+        def count(self):
+            return 1
+
+        def get_attribute(self, name):
+            assert name == "aria-checked"
+            return "false"
+
+    class Frame:
+        url = ("https://newassets.hcaptcha.com/captcha/v1/widget.html#"
+               "frame=checkbox&sitekey=saudia-hcaptcha-key&size=normal")
+
+        def locator(self, selector):
+            return Checkbox() if selector == "#checkbox" else Empty()
+
+    class Page:
+        url = "https://www.saudia.com/en/forms/complaint-form"
+
+        def __init__(self):
+            self.frames = [Frame()]
+            self.waits = []
+
+        def locator(self, _selector):
+            return Empty()
+
+        def evaluate(self, script):
+            assert script == "navigator.userAgent"
+            return "Modern Browser"
+
+        def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    captured = {}
+
+    def solve(challenge):
+        captured.update(challenge)
+        return {"token": "hcaptcha-token"}
+
+    monkeypatch.setattr(portal_automation, "_CAPTCHA_SOLVER", solve)
+    monkeypatch.setattr(portal_automation, "_inject_hcaptcha_token",
+                        lambda _page, token: token == "hcaptcha-token")
+    page = Page()
+    assert portal_automation._needs_human_step(
+        page) == "Solve the CAPTCHA challenge."
+    assert portal_automation._solve_hcaptcha_automatically(
+        page, lambda *_args: None) is True
+    assert captured == {
+        "kind": "hcaptcha",
+        "website_url": page.url,
+        "site_key": "saudia-hcaptcha-key",
+        "is_invisible": False,
+        "user_agent": "Modern Browser",
+    }
+    assert page.waits == [1500]
 
 
 def test_2captcha_failure_falls_back_to_telegram_grid(monkeypatch):

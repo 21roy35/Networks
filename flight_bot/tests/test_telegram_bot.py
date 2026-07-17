@@ -5,12 +5,13 @@ from copy import deepcopy
 from datetime import datetime, timedelta
 
 import pytest
+import requests
 
 from flight_bot import db
 from flight_bot.config import DEFAULTS
 from flight_bot.pipeline import ingest, load_demo
 from flight_bot.portal_automation import PortalResult, _annotate_grid, _parse_cells
-from flight_bot.telegram_bot import TelegramCoordinator
+from flight_bot.telegram_bot import TelegramAPI, TelegramCoordinator
 from flight_bot import telegram_bot
 from flight_bot.web_access import verify_web_token
 
@@ -52,6 +53,19 @@ class FakeAPI:
     def download(self, file_id, destination):
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(b"telegram-photo")
+
+
+def test_telegram_transport_errors_never_echo_bot_token():
+    class FailedSession:
+        def post(self, *_args, **_kwargs):
+            raise requests.Timeout(
+                "https://api.telegram.org/botvery-secret-token/getUpdates")
+
+    api = TelegramAPI("very-secret-token", session=FailedSession())
+    with pytest.raises(RuntimeError) as error:
+        api.call("getUpdates")
+    assert "very-secret-token" not in str(error.value)
+    assert "getUpdates" in str(error.value)
 
 
 @pytest.fixture()
@@ -189,12 +203,34 @@ def test_due_flight_gets_one_telegram_survey(coordinator):
     assert load_demo(log=lambda *_args, **_kwargs: None) == 3
     flight = db.list_flights()[0]
     arrival = (datetime.now() - timedelta(minutes=45)).strftime("%Y-%m-%d %H:%M")
-    db.set_overrides(flight["id"], {"arrival": arrival})
+    db.set_overrides(flight["id"], {
+        "arrival": arrival, "cancelled": False})
     bot.send_due_surveys(now=datetime.now())
     assert len(api.messages) == 1
     assert "How was" in api.messages[0]["text"]
     assert " from " in api.messages[0]["text"]
     assert " to " in api.messages[0]["text"]
+    assert db.survey_for_flight(flight["flight_key"])["status"] == "asked"
+    bot.send_due_surveys(now=datetime.now())
+    assert len(api.messages) == 1
+
+
+def test_cancelled_flight_gets_cancellation_specific_checkin(coordinator):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = db.list_flights()[0]
+    arrival = (datetime.now() - timedelta(minutes=15)).strftime(
+        "%Y-%m-%d %H:%M")
+    db.set_overrides(flight["id"], {
+        "arrival": arrival, "cancelled": True})
+
+    bot.send_due_surveys(now=datetime.now())
+
+    assert len(api.messages) == 1
+    assert "was cancelled" in api.messages[0]["text"]
+    buttons = api.messages[0]["reply_markup"]["inline_keyboard"]
+    assert buttons[0][0]["callback_data"].startswith("flight_no_issue:")
+    assert buttons[1][0]["callback_data"].startswith("flight_issue:")
     assert db.survey_for_flight(flight["flight_key"])["status"] == "asked"
     bot.send_due_surveys(now=datetime.now())
     assert len(api.messages) == 1
@@ -922,6 +958,56 @@ def test_pending_post_flight_survey_keeps_priority_over_ai(coordinator,
     assert len(collected) == 1
     assert collected[0][1] == message
     assert bot._ai_chat_thread is None
+
+
+def test_portal_question_bypasses_unrelated_pending_intake_and_gets_job_context(
+        coordinator, monkeypatch):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = db.list_flights()[0]
+    db.record_survey(flight["flight_key"], bot.chat_id, 703,
+                     "awaiting_details")
+    screenshot = telegram_bot.TELEGRAM_EVIDENCE_DIR / "portal_jobs" / "job.png"
+    screenshot.parent.mkdir(parents=True)
+    screenshot.write_bytes(b"portal-error")
+    db.save_portal_job({
+        "id": "job-1", "kind": "airline", "airline_code": "SV",
+        "flight_number": "SV1650", "status": "error",
+        "message": "Submission rejected", "reference": "",
+        "screenshot_file": str(screenshot), "terminal": True,
+    })
+    collected = []
+    monkeypatch.setattr(bot, "_collect_issue",
+                        lambda *_args: collected.append(True))
+
+    class FakeGhala:
+        enabled = True
+        name = "Ghala"
+        last_error = ""
+
+        def interpret_telegram(self, message, catalog):
+            assert message == "Why did the portal fail? I can see the captcha."
+            assert catalog["recent_portal_jobs"][0]["status"] == "error"
+            assert any(
+                item["direction"] == "incoming"
+                and "captcha" in item["text"]
+                for item in catalog["recent_conversation"])
+            return {"actions": [{
+                "name": "portal_status", "flight_number": "", "pnr": "",
+                "reference": "", "passenger": "", "query": message,
+                "time_scope": "all", "latest": True, "limit": 1,
+            }], "reply": ""}
+
+    bot.ai = FakeGhala()
+    bot.handle_update({"message": {
+        "message_id": 997, "chat": {"id": 42},
+        "text": "Why did the portal fail? I can see the captcha.",
+    }})
+    _wait_for_ai(bot)
+
+    assert collected == []
+    assert any("Stage: error" in message["text"] for message in api.messages)
+    assert api.photos[-1]["image"] == b"portal-error"
 
 
 def test_unanswered_checkin_does_not_swallow_unrelated_ai_question(coordinator):

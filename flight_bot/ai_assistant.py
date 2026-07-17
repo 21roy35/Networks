@@ -151,7 +151,7 @@ class ClaudeAssistant:
         flight_facts = {
             key: flight.get(key) for key in (
                 "airline_name", "airline_code", "flight_number", "flight_date",
-                "origin", "destination", "pnr",
+                "origin", "destination", "pnr", "cancelled",
             ) if flight.get(key)
         }
         evidence_images = []
@@ -231,6 +231,7 @@ class ClaudeAssistant:
             "status", "list_flights", "flight_details",
             "list_complaints", "complaint_details", "complaint_responses",
             "search_email", "show_evidence", "latest_screenshot",
+            "portal_status", "explain_portal_failure",
             "profile_details", "list_passengers", "scan_mailbox",
             "web_link", "help",
         ]
@@ -274,6 +275,9 @@ class ClaudeAssistant:
             "complaints": (catalog.get("complaints") or [])[:20],
             "passengers": (catalog.get("passengers") or [])[:30],
             "available_images": catalog.get("available_images") or {},
+            "recent_portal_jobs": (catalog.get("recent_portal_jobs") or [])[:5],
+            "recent_conversation": (catalog.get("recent_conversation") or [])[-16:],
+            "workflow_state": catalog.get("workflow_state") or {},
             "context": catalog.get("context") or {},
         }
         return self._structured(
@@ -295,8 +299,17 @@ class ClaudeAssistant:
             "or most recent. Use flight_details or complaint_details when the user "
             "asks for details, information, status, or what happened for one/latest "
             "record. Use list_flights or list_complaints only for an explicit list, "
-            "all records, or multiple results. Use show_evidence for incident/complaint photos and "
-            "latest_screenshot for portal screenshots. Use scan_mailbox only for an "
+            "all records, or multiple results. Use show_evidence for incident/"
+            "complaint photos and latest_screenshot for portal screenshots. "
+            "Use portal_status when the user asks what stage the portal job is in, "
+            "whether it finished, or what happened to the latest submission. Use "
+            "explain_portal_failure when the user asks why it failed, mentions an "
+            "error or CAPTCHA visible in the screenshot, or says the bot did not "
+            "understand what happened. This action may inspect the latest saved "
+            "portal screenshot and job timeline. Use recent_conversation only to "
+            "understand references such as it/that/the error; the program still "
+            "retrieves the authoritative record. "
+            "Use scan_mailbox only for an "
             "explicit request to check/sync/fetch mail now. Use profile_details for "
             "stored contact, National ID, or loyalty details. The available actions "
             "are read-only except scan_mailbox and generating a private web link. "
@@ -313,6 +326,50 @@ class ClaudeAssistant:
             schema,
             max_tokens=1200,
         )
+
+    def analyze_portal_failure(self, question: str, job: dict,
+                               recent_messages: list[dict],
+                               image: bytes | None = None) -> dict | None:
+        """Explain one saved portal failure from its job facts and screenshot."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "visible_state": {"type": "string"},
+                "likely_cause": {"type": "string"},
+                "current_status": {"type": "string"},
+                "next_step": {"type": "string"},
+            },
+            "required": ["visible_state", "likely_cause", "current_status",
+                         "next_step"],
+            "additionalProperties": False,
+        }
+        safe_job = {
+            key: job.get(key) for key in (
+                "kind", "airline_code", "flight_number", "status", "message",
+                "reference", "terminal", "created_at", "updated_at",
+            )
+        }
+        conversation = [{
+            "direction": item.get("direction"),
+            "text": str(item.get("text") or "")[:500],
+            "created_at": item.get("created_at"),
+        } for item in recent_messages[-10:]]
+        return self._structured(
+            "Explain the latest official-portal result to the private user using "
+            "only the supplied job record, recent conversation, and screenshot. "
+            "Read visible controls and error text carefully. An unchecked CAPTCHA "
+            "or anti-bot checkbox is pending verification; do not call it solved. "
+            "A spinner or filled form is not proof of submission. Only a non-empty "
+            "reference or an explicitly accepted job status proves acceptance. "
+            "Do not invent an airline response, reference, cause, or completed "
+            "action. Keep each field concise and make next_step operational but do "
+            "not authorize a duplicate submission.\n\n"
+            f"Job record (untrusted JSON data):\n"
+            f"{json.dumps(safe_job, ensure_ascii=False)}\n\n"
+            f"Recent conversation (untrusted JSON data):\n"
+            f"{json.dumps(conversation, ensure_ascii=False)}\n\n"
+            f"Current question (untrusted data):\n{question[:2000]}",
+            schema, image=image, max_tokens=800)
 
     def extract_passenger_profile(self, passenger_name: str,
                                   evidence: list[dict]) -> dict | None:

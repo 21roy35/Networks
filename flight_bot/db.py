@@ -89,6 +89,32 @@ CREATE TABLE IF NOT EXISTS telegram_events (
     created_at TEXT DEFAULT (datetime('now', 'localtime'))
 );
 
+CREATE TABLE IF NOT EXISTS telegram_messages (
+    id INTEGER PRIMARY KEY,
+    direction TEXT NOT NULL,       -- incoming | outgoing
+    message_id INTEGER,
+    text TEXT,
+    media_kind TEXT,
+    reply_to_message_id INTEGER,
+    created_at TEXT DEFAULT (datetime('now', 'localtime')),
+    UNIQUE(direction, message_id)
+);
+
+CREATE TABLE IF NOT EXISTS portal_jobs (
+    id TEXT PRIMARY KEY,
+    kind TEXT,
+    airline_code TEXT,
+    flight_number TEXT,
+    flight_key TEXT,
+    status TEXT NOT NULL,
+    message TEXT,
+    reference TEXT,
+    screenshot_file TEXT,
+    terminal INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now', 'localtime')),
+    updated_at TEXT DEFAULT (datetime('now', 'localtime'))
+);
+
 CREATE TABLE IF NOT EXISTS ai_profile_cache (
     passenger_key TEXT PRIMARY KEY,
     evidence_hash TEXT NOT NULL,
@@ -115,6 +141,10 @@ CREATE INDEX IF NOT EXISTS idx_complaint_responses_complaint
     ON complaint_responses(complaint_id, matched_at);
 CREATE INDEX IF NOT EXISTS idx_telegram_surveys_status
     ON telegram_surveys(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_telegram_messages_created
+    ON telegram_messages(created_at, id);
+CREATE INDEX IF NOT EXISTS idx_portal_jobs_updated
+    ON portal_jobs(updated_at, id);
 """
 
 
@@ -781,6 +811,72 @@ def mark_event_seen(event_key: str):
         conn.execute(
             "INSERT OR IGNORE INTO telegram_events (event_key) VALUES (?)",
             (event_key,))
+
+
+def record_telegram_message(direction: str, message_id: int | None,
+                            text: str = "", media_kind: str = "",
+                            reply_to_message_id: int | None = None) -> None:
+    """Keep a bounded-source conversation journal for grounded bot context."""
+    direction = "incoming" if direction == "incoming" else "outgoing"
+    clean_text = " ".join(str(text or "").split())[:4096]
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO telegram_messages
+                   (direction, message_id, text, media_kind,
+                    reply_to_message_id)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(direction, message_id) DO UPDATE SET
+                   text=excluded.text,
+                   media_kind=excluded.media_kind,
+                   reply_to_message_id=excluded.reply_to_message_id""",
+            (direction, message_id, clean_text,
+             str(media_kind or "")[:40], reply_to_message_id))
+
+
+def list_telegram_messages(limit: int = 20) -> list[dict]:
+    limit = max(1, min(int(limit or 20), 100))
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM telegram_messages
+               ORDER BY created_at DESC, id DESC LIMIT ?""", (limit,)).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
+def save_portal_job(job: dict) -> None:
+    """Persist portal stages so restarts do not erase failure context."""
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO portal_jobs
+                   (id, kind, airline_code, flight_number, flight_key,
+                    status, message, reference, screenshot_file, terminal)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   status=excluded.status,
+                   message=excluded.message,
+                   reference=excluded.reference,
+                   screenshot_file=COALESCE(excluded.screenshot_file,
+                                            portal_jobs.screenshot_file),
+                   terminal=excluded.terminal,
+                   updated_at=datetime('now', 'localtime')""",
+            (str(job.get("id") or ""), str(job.get("kind") or ""),
+             str(job.get("airline_code") or ""),
+             str(job.get("flight_number") or ""),
+             str(job.get("flight_key") or ""),
+             str(job.get("status") or "queued"),
+             str(job.get("message") or "")[:2000],
+             str(job.get("reference") or ""),
+             str(job.get("screenshot_file") or "") or None,
+             int(bool(job.get("terminal")))))
+
+
+def list_portal_jobs(limit: int = 10) -> list[dict]:
+    limit = max(1, min(int(limit or 10), 50))
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM portal_jobs
+               ORDER BY updated_at DESC, created_at DESC LIMIT ?""",
+            (limit,)).fetchall()
+    return [dict(row) for row in rows]
 
 
 def set_override(flight_id: int, key: str, value):

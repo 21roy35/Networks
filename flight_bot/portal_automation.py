@@ -22,6 +22,7 @@ from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
 from .airlines import AIRLINES, GACA
+from . import db
 from .config import TELEGRAM_EVIDENCE_DIR
 
 
@@ -94,6 +95,10 @@ def start_portal_job(payload: dict,
     job_id = uuid.uuid4().hex
     job = {
         "id": job_id,
+        "kind": payload.get("kind") or "",
+        "airline_code": payload.get("airline_code") or "",
+        "flight_number": payload.get("flight_number") or "",
+        "flight_key": payload.get("flight_key") or "",
         "status": "queued",
         "message": "Preparing the official complaint portal…",
         "reference": "",
@@ -102,6 +107,10 @@ def start_portal_job(payload: dict,
     }
     with _JOBS_LOCK:
         _JOBS[job_id] = job
+    try:
+        db.save_portal_job(job)
+    except Exception:
+        logger.exception("Could not persist queued portal job %s", job_id)
 
     def update(status: str, message: str, image: bytes | None = None):
         screenshot_file = None
@@ -124,6 +133,16 @@ def start_portal_job(payload: dict,
                 if screenshot_file:
                     current.update(screenshot_available=True,
                                    screenshot_file=str(screenshot_file))
+                snapshot = dict(current)
+            else:
+                snapshot = None
+        if snapshot:
+            try:
+                db.save_portal_job(snapshot)
+            except Exception:
+                logger.exception("Could not persist portal job %s", job_id)
+        logger.info("Portal job %s stage=%s terminal=%s", job_id, status,
+                    status in _TERMINAL)
         if on_update:
             try:
                 on_update(status, message, image)
@@ -147,6 +166,14 @@ def start_portal_job(payload: dict,
             if current:
                 current.update(reference=result.reference)
                 current.pop("payload", None)
+                snapshot = dict(current)
+            else:
+                snapshot = None
+        if snapshot:
+            try:
+                db.save_portal_job(snapshot)
+            except Exception:
+                logger.exception("Could not persist final portal job %s", job_id)
         if on_complete:
             try:
                 on_complete(result)
@@ -452,16 +479,19 @@ def _captcha_completed(page) -> bool:
                 return True
         except Exception:
             continue
-    try:
-        tokens = page.locator(
-            "textarea[name='g-recaptcha-response'], "
-            "textarea[name='h-captcha-response'], "
-            "input[name='cf-turnstile-response']")
-        for index in range(min(tokens.count(), 5)):
-            if tokens.nth(index).input_value():
-                return True
-    except Exception:
-        pass
+    for frame in getattr(page, "frames", []):
+        try:
+            tokens = frame.locator(
+                "textarea[name='g-recaptcha-response'], "
+                "textarea[name='h-captcha-response'], "
+                "input[name='g-recaptcha-response'], "
+                "input[name='h-captcha-response'], "
+                "input[name='cf-turnstile-response']")
+            for index in range(min(tokens.count(), 8)):
+                if tokens.nth(index).input_value():
+                    return True
+        except Exception:
+            continue
     return False
 
 
@@ -480,15 +510,81 @@ def _recaptcha_challenge(page) -> dict | None:
         except Exception:
             user_agent = _CHROME_USER_AGENT
         return {
+            "kind": "recaptcha",
             "website_url": page.url,
             "site_key": site_key,
             "is_invisible": (params.get("size") or [""])[0] == "invisible",
+            "is_enterprise": "/enterprise/" in parsed.path,
             "user_agent": user_agent,
             "api_domain": ("recaptcha.net"
                            if (parsed.hostname or "").endswith("recaptcha.net")
                            else "google.com"),
         }
     return None
+
+
+def _hcaptcha_challenge(page) -> dict | None:
+    """Describe hCaptcha even when the site nests it inside component frames."""
+    for frame in getattr(page, "frames", []):
+        raw_url = str(getattr(frame, "url", ""))
+        parsed = urlparse(raw_url)
+        if "hcaptcha.com" not in (parsed.hostname or ""):
+            continue
+        params = parse_qs(parsed.query)
+        fragment = parse_qs(parsed.fragment)
+        site_key = ((params.get("sitekey") or fragment.get("sitekey")
+                     or params.get("site_key") or fragment.get("site_key")
+                     or [""])[0].strip())
+        if not site_key:
+            continue
+        try:
+            user_agent = str(page.evaluate("navigator.userAgent") or "")
+        except Exception:
+            user_agent = _CHROME_USER_AGENT
+        rqdata = ((params.get("rqdata") or fragment.get("rqdata")
+                   or [""])[0].strip())
+        challenge = {
+            "kind": "hcaptcha",
+            "website_url": page.url,
+            "site_key": site_key,
+            "is_invisible": ((params.get("size") or fragment.get("size")
+                              or [""])[0] == "invisible"),
+            "user_agent": user_agent,
+        }
+        if rqdata:
+            challenge["enterprise_payload"] = {"rqdata": rqdata}
+        return challenge
+    return None
+
+
+def _pending_captcha_kind(page) -> str:
+    """Return the pending widget type, including widgets in nested frames."""
+    if _captcha_completed(page):
+        return ""
+    for frame in getattr(page, "frames", []):
+        raw_url = str(getattr(frame, "url", ""))
+        try:
+            if ("recaptcha" in raw_url and "anchor" in raw_url
+                    and frame.locator("#recaptcha-anchor").count()):
+                return "recaptcha"
+            if ("hcaptcha.com" in raw_url and "checkbox" in raw_url
+                    and frame.locator("#checkbox").count()):
+                return "hcaptcha"
+        except Exception:
+            continue
+    try:
+        if _visible(page.locator(
+                "iframe[src*='recaptcha'], .g-recaptcha")):
+            return "recaptcha"
+        if _visible(page.locator(
+                "iframe[src*='hcaptcha'], .h-captcha")):
+            return "hcaptcha"
+        if _visible(page.locator(
+                "iframe[src*='captcha'], iframe[title*='captcha' i]")):
+            return "captcha"
+    except Exception:
+        pass
+    return ""
 
 
 def _inject_recaptcha_token(page, token: str) -> bool:
@@ -540,6 +636,76 @@ def _inject_recaptcha_token(page, token: str) -> bool:
     return bool((applied or {}).get("fields") or (applied or {}).get("callbacks"))
 
 
+def _inject_hcaptcha_token(page, token: str) -> bool:
+    """Apply an hCaptcha token to response fields and registered callbacks."""
+    applied_fields = 0
+    called_callbacks = 0
+    script = """token => {
+        const roots = [document];
+        for (let i = 0; i < roots.length; i += 1) {
+            for (const element of roots[i].querySelectorAll("*")) {
+                if (element.shadowRoot) roots.push(element.shadowRoot);
+            }
+        }
+        const fields = [];
+        for (const root of roots) {
+            fields.push(...root.querySelectorAll(
+                "textarea[name='h-captcha-response'], " +
+                "textarea[name='g-recaptcha-response'], " +
+                "input[name='h-captcha-response'], " +
+                "input[name='g-recaptcha-response']"));
+        }
+        for (const field of fields) {
+            const proto = field instanceof HTMLTextAreaElement
+                ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+            if (setter) setter.call(field, token); else field.value = token;
+            field.textContent = token;
+            field.dispatchEvent(new Event("input", {bubbles: true}));
+            field.dispatchEvent(new Event("change", {bubbles: true}));
+        }
+
+        const callbacks = new Set();
+        for (const root of roots) {
+            for (const element of root.querySelectorAll("[data-callback]")) {
+                const path = (element.getAttribute("data-callback") || "").split(".");
+                let value = window;
+                for (const part of path) value = value?.[part];
+                if (typeof value === "function") callbacks.add(value);
+            }
+        }
+        const seen = new WeakSet();
+        const visit = (value, depth = 0) => {
+            if (!value || depth > 6 ||
+                    !["object", "function"].includes(typeof value)) return;
+            if (seen.has(value)) return;
+            seen.add(value);
+            for (const key of Object.keys(value)) {
+                let child;
+                try { child = value[key]; } catch (_) { continue; }
+                if (key.toLowerCase() === "callback" &&
+                        typeof child === "function") callbacks.add(child);
+                else visit(child, depth + 1);
+            }
+        };
+        visit(window.___hcaptcha_cfg || {});
+        visit(window.___grecaptcha_cfg?.clients || {});
+        let called = 0;
+        for (const callback of callbacks) {
+            try { callback(token); called += 1; } catch (_) {}
+        }
+        return {fields: fields.length, callbacks: called};
+    }"""
+    for frame in getattr(page, "frames", []):
+        try:
+            result = frame.evaluate(script, token) or {}
+            applied_fields += int(result.get("fields") or 0)
+            called_callbacks += int(result.get("callbacks") or 0)
+        except Exception:
+            continue
+    return bool(applied_fields or called_callbacks)
+
+
 def _solve_recaptcha_automatically(page, update) -> bool:
     if not _CAPTCHA_SOLVER:
         return False
@@ -559,12 +725,32 @@ def _solve_recaptcha_automatically(page, update) -> bool:
     return True
 
 
+def _solve_hcaptcha_automatically(page, update) -> bool:
+    if not _CAPTCHA_SOLVER:
+        return False
+    challenge = _hcaptcha_challenge(page)
+    if not challenge:
+        return False
+    update("verification", "2Captcha is solving the hCaptcha automaticallyâ€¦")
+    try:
+        result = _CAPTCHA_SOLVER(challenge) or {}
+    except Exception:
+        logger.exception("Automatic hCaptcha solving failed")
+        return False
+    token = str(result.get("token") or "").strip()
+    if not token or not _inject_hcaptcha_token(page, token):
+        return False
+    page.wait_for_timeout(1500)
+    update("filling", "2Captcha verification applied. Continuing automaticallyâ€¦")
+    return True
+
+
 def _needs_human_step(page) -> str:
+    if _pending_captcha_kind(page):
+        return "Solve the CAPTCHA challenge."
     checks = (
         ("input[name*='otp' i], input[id*='otp' i], input[autocomplete='one-time-code']",
          "Enter the OTP sent by the official portal."),
-        ("iframe[src*='captcha'], iframe[title*='captcha' i], .g-recaptcha, .h-captcha",
-         "Solve the CAPTCHA challenge."),
         ("iframe[src*='challenges.cloudflare.com']",
          "Approve the anti-bot verification challenge."),
         ("input[type='checkbox'][required]:not(:checked)",
@@ -1059,12 +1245,12 @@ def _wait_for_human_step(page, update, timeout_seconds: int = 600) -> bool:
     if not message:
         return True
     update("verification", message)
-    recaptcha = _visible(page.locator("iframe[src*='recaptcha']"))
+    captcha_kind = _pending_captcha_kind(page)
     if _VERIFICATION_HANDLER and _solve_otp(page, update):
         pass
     elif _VERIFICATION_HANDLER and _solve_text_captcha(page, update):
         pass
-    elif recaptcha:
+    elif captcha_kind == "recaptcha":
         if _CAPTCHA_SOLVER and _solve_recaptcha_automatically(page, update):
             pass
         elif _VERIFICATION_HANDLER:
@@ -1076,11 +1262,20 @@ def _wait_for_human_step(page, update, timeout_seconds: int = 600) -> bool:
                 return False
         else:
             return False
-    elif _VERIFICATION_HANDLER:
-        if _visible(page.locator("iframe[src*='hcaptcha']")):
+    elif captcha_kind == "hcaptcha":
+        if _CAPTCHA_SOLVER and _solve_hcaptcha_automatically(page, update):
+            pass
+        elif _VERIFICATION_HANDLER:
+            if _CAPTCHA_SOLVER:
+                update(
+                    "verification",
+                    "2Captcha could not complete this challenge. Falling back to Telegramâ€¦")
             if not _solve_hcaptcha(page, update):
                 return False
-        elif _visible(page.locator("iframe[src*='challenges.cloudflare.com']")):
+        else:
+            return False
+    elif _VERIFICATION_HANDLER:
+        if _visible(page.locator("iframe[src*='challenges.cloudflare.com']")):
             if not _solve_turnstile(page, update):
                 return False
         elif _approve_declaration(page, update):
@@ -2009,6 +2204,16 @@ def submit_portal_claim(payload: dict, update: Callable[..., None]) -> PortalRes
             if cancelled:
                 return PortalResult(
                     "needs_attention", "Portal input was cancelled in Telegram.")
+            # Resolving a required field can mount or refresh the final CAPTCHA.
+            # Re-check the rendered frames immediately before the one authorized
+            # submit click so an unchecked widget can never be mistaken for a
+            # completed form.
+            page.wait_for_timeout(1200)
+            if not _wait_for_human_step(page, update):
+                return PortalResult(
+                    "needs_attention",
+                    "The final CAPTCHA or verification was not completed, so "
+                    "the complaint was not submitted.")
             update(
                 "submitting",
                 "Finished the form checks. Submitting to the official website now…",

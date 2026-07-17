@@ -92,12 +92,25 @@ class TelegramAPI:
 
     def call(self, method: str, data: dict | None = None, files=None,
              timeout: int = 35):
-        response = self.session.post(
-            self.base + method, data=data or {}, files=files, timeout=timeout)
-        response.raise_for_status()
-        result = response.json()
+        try:
+            response = self.session.post(
+                self.base + method, data=data or {}, files=files,
+                timeout=timeout)
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Telegram API {method} is unavailable ({type(exc).__name__})."
+            ) from None
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Telegram API {method} returned HTTP {response.status_code}.")
+        try:
+            result = response.json()
+        except ValueError:
+            raise RuntimeError(
+                f"Telegram API {method} returned invalid data.") from None
         if not result.get("ok"):
-            raise RuntimeError(result.get("description") or method)
+            description = str(result.get("description") or "request failed")
+            raise RuntimeError(f"Telegram API {method}: {description[:300]}")
         return result.get("result")
 
     def updates(self, offset: int, timeout: int) -> list[dict]:
@@ -149,7 +162,9 @@ class TelegramAPI:
         record = self.call("getFile", {"file_id": file_id})
         response = self.session.get(
             self.file_base + record["file_path"], timeout=30)
-        response.raise_for_status()
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Telegram file download returned HTTP {response.status_code}.")
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(response.content)
 
@@ -207,7 +222,7 @@ class TelegramCoordinator:
             self.ai.portal_decision if self.ai.enabled else None,
             int(self.ai.settings.get("max_portal_attempts", 3)))
         set_captcha_solver(
-            self.captcha.solve_recaptcha if self.captcha.enabled else None)
+            self.captcha.solve if self.captcha.enabled else None)
         threading.Thread(
             target=self._register_commands, name="telegram-commands",
             daemon=True).start()
@@ -233,8 +248,27 @@ class TelegramCoordinator:
         set_captcha_solver(None)
 
     def notify(self, text: str, buttons=None, force_reply: bool = False) -> dict:
-        return self.api.send_message(
+        result = self.api.send_message(
             self.chat_id, text, reply_markup=buttons, force_reply=force_reply)
+        try:
+            db.record_telegram_message(
+                "outgoing", result.get("message_id") if result else None,
+                text, "text")
+        except Exception:
+            logger.exception("Could not journal outgoing Telegram message")
+        return result
+
+    def _send_photo(self, image: bytes, caption: str,
+                    buttons: dict | None = None) -> dict:
+        result = self.api.send_photo(
+            self.chat_id, image, caption, reply_markup=buttons)
+        try:
+            db.record_telegram_message(
+                "outgoing", result.get("message_id") if result else None,
+                caption, "photo")
+        except Exception:
+            logger.exception("Could not journal outgoing Telegram photo")
+        return result
 
     def portal_progress_handler(self):
         """Return a per-job Telegram relay with readable stage transitions."""
@@ -264,9 +298,9 @@ class TelegramCoordinator:
                 status, text, image = deliveries.get()
                 try:
                     if image:
-                        self.api.send_photo(self.chat_id, image, text)
+                        self._send_photo(image, text)
                     else:
-                        self.api.send_message(self.chat_id, text)
+                        self.notify(text)
                 except Exception:
                     logger.exception("Telegram portal progress delivery failed")
                 finally:
@@ -318,7 +352,7 @@ class TelegramCoordinator:
         prompt = "🔐 FlightDeck verification\n\n" + challenge.get("message", "")
         image = challenge.get("image") or b""
         if image:
-            self.api.send_photo(self.chat_id, image, prompt, reply_markup=markup)
+            self._send_photo(image, prompt, buttons=markup)
         else:
             self.notify(prompt, buttons=markup, force_reply=not choices)
         timeout = int(self.settings.get("verification_timeout_minutes", 10)) * 60
@@ -403,10 +437,35 @@ class TelegramCoordinator:
             r"(?:مكسور|تالف|تعطل|تأخر|ضاعت|حقيبة|شنطة|مشكلة)",
             value, re.IGNORECASE))
 
+    @staticmethod
+    def _looks_like_bot_or_portal_query(value: str) -> bool:
+        """Keep operational questions out of an unrelated flight intake."""
+        value = " ".join(str(value or "").split()).strip()
+        if not value:
+            return False
+        return bool(re.search(
+            r"\b(?:captcha|2captcha|portal|screenshot|screen\s*shot|bot|"
+            r"telegram|submission|submit\s+button|job|stage|logs?|"
+            r"automation)\b|\b(?:why|how|what)\b.{0,80}\b(?:fail|error|"
+            r"work|happen|understand)\w*\b|\b(?:fail|error)\w*\b.{0,80}"
+            r"\b(?:complaint|submit|portal|bot)\b",
+            value, re.IGNORECASE))
+
     def _handle_message(self, message: dict):
         if self._handle_verification_message(message):
             return
         text = (message.get("text") or "").strip()
+        pasted = (message.get("text") or message.get("caption") or "").strip()
+        reference_for_journal = _telegram_sms_reference(pasted)
+        journal_text = (f"[Airline reference received: {reference_for_journal}]"
+                        if reference_for_journal else pasted)
+        try:
+            db.record_telegram_message(
+                "incoming", message.get("message_id"), journal_text,
+                "photo" if message.get("photo") else "text",
+                (message.get("reply_to_message") or {}).get("message_id"))
+        except Exception:
+            logger.exception("Could not journal incoming Telegram message")
         if text == "/start":
             self.notify(
                 "FlightDeck Telegram is connected. I’ll check in after flights, collect issue photos, file official complaints, relay verification steps, and report airline responses. Use /status for service status or /web for your private dashboard.")
@@ -422,7 +481,6 @@ class TelegramCoordinator:
             self.notify("Cancelled the pending complaint intake.")
             return
 
-        pasted = (message.get("text") or message.get("caption") or "").strip()
         reference = _telegram_sms_reference(pasted)
         if reference and self._capture_telegram_reference(
                 reference, pasted, message):
@@ -434,6 +492,10 @@ class TelegramCoordinator:
         reply_id = (message.get("reply_to_message") or {}).get("message_id")
         survey = (db.pending_survey(self.chat_id, reply_id)
                   if reply_id is not None else None)
+        if (not survey and pasted and self.ai.enabled
+                and self._looks_like_bot_or_portal_query(pasted)):
+            self._dispatch_ai_message(pasted)
+            return
         if not survey:
             pending = db.pending_survey(self.chat_id)
             if (pending and (
@@ -456,7 +518,13 @@ class TelegramCoordinator:
         if (survey.get("status") == "asked" and positive
                 and not message.get("photo")):
             db.update_survey_status(survey["flight_key"], "good")
-            self.notify("Glad the flight went well ✈️")
+            flight = db.get_flight_by_key(survey["flight_key"])
+            if flight and bool(self._effective_flight_value(
+                    flight, "cancelled")):
+                self.notify(
+                    "Understood—I will not open a complaint for this cancellation.")
+            else:
+                self.notify("Glad the flight went well ✈️")
             return
         self._collect_issue(survey, message)
 
@@ -654,6 +722,20 @@ class TelegramCoordinator:
                 "has_evidence": bool(complaint.get("attachments")),
             })
         screenshots = TELEGRAM_EVIDENCE_DIR / "portal_jobs"
+        portal_jobs = []
+        for job in db.list_portal_jobs(5):
+            portal_jobs.append({
+                key: job.get(key) for key in (
+                    "id", "kind", "airline_code", "flight_number", "status",
+                    "message", "reference", "terminal", "created_at",
+                    "updated_at",
+                )
+            } | {"has_screenshot": bool(job.get("screenshot_file"))})
+        with self._lock:
+            verification_kind = (self._verification.kind
+                                 if self._verification else "")
+            intake_keys = list(self._intakes)[:5]
+        pending_survey = db.pending_survey(self.chat_id)
         return {
             "counts": db.counts(),
             "mailbox": db.mailbox_cursor_summary(),
@@ -669,6 +751,20 @@ class TelegramCoordinator:
                     for item in all_complaints),
                 "portal_screenshots": len(list(screenshots.glob("*.png")))
                 if screenshots.exists() else 0,
+            },
+            "recent_portal_jobs": portal_jobs,
+            "recent_conversation": db.list_telegram_messages(16),
+            "workflow_state": {
+                "pending_survey": ({
+                    "flight_key": pending_survey.get("flight_key"),
+                    "status": pending_survey.get("status"),
+                    "updated_at": pending_survey.get("updated_at"),
+                } if pending_survey else None),
+                "active_intake_flight_keys": intake_keys,
+                "verification_kind": verification_kind,
+                "mail_scan_running": bool(
+                    self._mail_scan_thread
+                    and self._mail_scan_thread.is_alive()),
             },
             "context": {
                 key: value for key, value in self._ai_context.items()
@@ -969,8 +1065,8 @@ class TelegramCoordinator:
         self._remember_ai_context(complaint=paths[0][1])
         for path, complaint in paths[:limit]:
             try:
-                self.api.send_photo(
-                    self.chat_id, path.read_bytes(),
+                self._send_photo(
+                    path.read_bytes(),
                     f"Evidence for {complaint.get('reference') or self._flight_label(complaint.get('flight_data') or {})}")
             except OSError:
                 logger.exception("Could not read Telegram evidence %s", path)
@@ -989,8 +1085,8 @@ class TelegramCoordinator:
             try:
                 stamp = datetime.fromtimestamp(path.stat().st_mtime).strftime(
                     "%Y-%m-%d %H:%M:%S")
-                self.api.send_photo(
-                    self.chat_id, path.read_bytes(),
+                self._send_photo(
+                    path.read_bytes(),
                     f"Saved portal screenshot from {stamp}")
                 sent += 1
             except OSError:
@@ -1095,6 +1191,9 @@ class TelegramCoordinator:
             return self._send_evidence(action)
         if name == "latest_screenshot":
             return self._send_latest_screenshots(action)
+        if name in {"portal_status", "explain_portal_failure"}:
+            return self._send_portal_job(
+                action, explain=name == "explain_portal_failure")
         if name == "profile_details":
             return self._send_profile(action)
         if name == "list_passengers":
@@ -1113,6 +1212,44 @@ class TelegramCoordinator:
                 "flows keep priority.")
             return True
         return False
+
+    def _send_portal_job(self, action: dict, explain: bool = False) -> bool:
+        jobs = db.list_portal_jobs(1)
+        if not jobs:
+            self.notify(
+                "No persisted portal-job timeline is available yet. I can still "
+                "send the latest saved screenshot if one exists.")
+            return self._send_latest_screenshots({"limit": 1})
+        job = jobs[0]
+        reference = str(job.get("reference") or "").strip()
+        lines = [
+            f"Latest portal job: {job.get('flight_number') or job.get('airline_code') or job.get('kind') or 'complaint'}",
+            f"Stage: {job.get('status') or 'unknown'}",
+            f"Result: {job.get('message') or 'No result message was saved.'}",
+            f"Reference: {reference or 'none returned'}",
+            f"Updated: {job.get('updated_at') or 'unknown'}",
+        ]
+        path = Path(str(job.get("screenshot_file") or ""))
+        image = None
+        if path.is_file():
+            try:
+                image = path.read_bytes()
+            except OSError:
+                logger.exception("Could not read portal screenshot %s", path)
+        if explain and self.ai.enabled:
+            analysis = self.ai.analyze_portal_failure(
+                str(action.get("query") or "Why did the portal job fail?"),
+                job, db.list_telegram_messages(12), image=image)
+            if analysis:
+                lines.extend((
+                    f"Visible state: {analysis.get('visible_state') or 'not clear'}",
+                    f"Likely cause: {analysis.get('likely_cause') or 'not established'}",
+                    f"Next step: {analysis.get('next_step') or 'Review before retrying.'}",
+                ))
+        self.notify("\n".join(lines))
+        if image:
+            self._send_photo(image, "Screenshot saved for this portal job")
+        return True
 
     @staticmethod
     def _complaint_flight_numbers(complaint: dict) -> set[str]:
@@ -1241,6 +1378,10 @@ class TelegramCoordinator:
         if action == "flight_good":
             db.update_survey_status(flight["flight_key"], "good")
             self.notify(f"Glad {self._flight_label(flight)} went well ✈️")
+        elif action == "flight_no_issue":
+            db.update_survey_status(flight["flight_key"], "no_issue")
+            self.notify(
+                "Understood—I will not open a complaint for this cancellation.")
         elif action == "flight_issue":
             prompt = self.notify(
                 f"What went wrong on {self._flight_label(flight)}? Send a message, photos with a caption, or both. I’ll automatically file after the last message.",
@@ -1628,22 +1769,44 @@ class TelegramCoordinator:
             if db.survey_for_flight(summary["flight_key"]):
                 continue
             flight = db.get_flight(summary["id"])
+            cancelled = bool(self._effective_flight_value(
+                flight, "cancelled"))
             arrival = (parse_flight_time((flight.get("overrides") or {}).get("actual_arrival"))
                        or parse_flight_time(flight.get("new_arrival"))
                        or parse_flight_time((flight.get("overrides") or {}).get("arrival"))
                        or parse_flight_time(flight.get("arrival")))
-            if not arrival or arrival < now - lookback:
-                continue
-            landed = self._live_landed_cached(flight)
-            if landed is not True and not schedule_has_finished(
-                    flight, delay_minutes=delay, now=now):
-                continue
-            message = self.notify(
-                f"How was {self._post_flight_label(flight)}? If anything was broken, delayed, unavailable, or handled badly, tell me and send photos—I can file it automatically.",
-                buttons=_buttons([
-                    [("Everything was good", f"flight_good:{flight['id']}")],
-                    [("Report an issue", f"flight_issue:{flight['id']}")],
-                ]))
+            if cancelled:
+                scheduled = (arrival
+                    or parse_flight_time(
+                        (flight.get("overrides") or {}).get("departure"))
+                    or parse_flight_time(flight.get("departure"))
+                )
+                if scheduled and scheduled < now - lookback:
+                    continue
+                message = self.notify(
+                    f"I see {self._post_flight_label(flight)} was cancelled. "
+                    "Were you rebooked or refunded? Tell me what happened and "
+                    "send any screenshots or receipts—I can file the cancellation "
+                    "complaint automatically.",
+                    buttons=_buttons([
+                        [("No complaint needed",
+                          f"flight_no_issue:{flight['id']}")],
+                        [("Report cancellation",
+                          f"flight_issue:{flight['id']}")],
+                    ]))
+            else:
+                if not arrival or arrival < now - lookback:
+                    continue
+                landed = self._live_landed_cached(flight)
+                if landed is not True and not schedule_has_finished(
+                        flight, delay_minutes=delay, now=now):
+                    continue
+                message = self.notify(
+                    f"How was {self._post_flight_label(flight)}? If anything was broken, delayed, unavailable, or handled badly, tell me and send photos—I can file it automatically.",
+                    buttons=_buttons([
+                        [("Everything was good", f"flight_good:{flight['id']}")],
+                        [("Report an issue", f"flight_issue:{flight['id']}")],
+                    ]))
             db.record_survey(flight["flight_key"], self.chat_id,
                              message["message_id"], "asked")
 

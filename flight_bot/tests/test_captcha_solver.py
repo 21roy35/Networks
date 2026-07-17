@@ -67,3 +67,38 @@ def test_2captcha_creates_polls_and_returns_recaptcha_token():
         "apiDomain": "recaptcha.net",
     }
     assert session.requests[1][1]["taskId"] == 12345
+
+
+def test_2captcha_dispatches_hcaptcha_with_current_task_type():
+    config = deepcopy(DEFAULTS)
+    config["captcha"].update({
+        "enabled": True,
+        "api_key": "test-key",
+        "poll_interval_seconds": 5,
+        "timeout_seconds": 60,
+    })
+    session = Session([
+        {"errorId": 0, "taskId": 987},
+        {
+            "errorId": 0,
+            "status": "ready",
+            "solution": {"gRecaptchaResponse": "hcaptcha-token"},
+        },
+    ])
+    solver = TwoCaptchaSolver(config, session=session, sleeper=lambda _n: None)
+    result = solver.solve({
+        "kind": "hcaptcha",
+        "website_url": "https://www.saudia.com/en/forms/complaint-form",
+        "site_key": "site-key",
+        "user_agent": "Modern Browser",
+        "is_invisible": False,
+    })
+
+    assert result["token"] == "hcaptcha-token"
+    assert session.requests[0][1]["task"] == {
+        "type": "HCaptchaTaskProxyless",
+        "websiteURL": "https://www.saudia.com/en/forms/complaint-form",
+        "websiteKey": "site-key",
+        "isInvisible": False,
+        "userAgent": "Modern Browser",
+    }
