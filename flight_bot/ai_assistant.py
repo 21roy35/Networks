@@ -347,6 +347,7 @@ class ClaudeAssistant:
             key: job.get(key) for key in (
                 "kind", "airline_code", "flight_number", "status", "message",
                 "reference", "terminal", "created_at", "updated_at",
+                "automatic_captcha_enabled", "telegram_fallback_enabled",
             )
         }
         conversation = [{
@@ -361,6 +362,11 @@ class ClaudeAssistant:
             "or anti-bot checkbox is pending verification; do not call it solved. "
             "A spinner or filled form is not proof of submission. Only a non-empty "
             "reference or an explicitly accepted job status proves acceptance. "
+            "When automatic_captcha_enabled is true, do not tell the user that "
+            "they must solve the CAPTCHA manually: state that a future authorized "
+            "safe retry can use configured automatic solving, with Telegram as "
+            "fallback when telegram_fallback_enabled is true. Do not trigger or "
+            "claim that retry occurred. "
             "Do not invent an airline response, reference, cause, or completed "
             "action. Keep each field concise and make next_step operational but do "
             "not authorize a duplicate submission.\n\n"

@@ -1237,9 +1237,15 @@ class TelegramCoordinator:
             except OSError:
                 logger.exception("Could not read portal screenshot %s", path)
         if explain and self.ai.enabled:
+            ai_job = {
+                **job,
+                "automatic_captcha_enabled": self.captcha.enabled,
+                "telegram_fallback_enabled": bool(
+                    self.captcha.settings.get("telegram_fallback", True)),
+            }
             analysis = self.ai.analyze_portal_failure(
                 str(action.get("query") or "Why did the portal job fail?"),
-                job, db.list_telegram_messages(12), image=image)
+                ai_job, db.list_telegram_messages(12), image=image)
             if analysis:
                 lines.extend((
                     f"Visible state: {analysis.get('visible_state') or 'not clear'}",

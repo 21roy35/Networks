@@ -104,6 +104,8 @@ def test_portal_failure_explanation_is_grounded_in_job_and_screenshot():
         "Why did it fail?", {
             "status": "error", "message": "Submission rejected",
             "reference": "", "airline_code": "SV",
+            "automatic_captcha_enabled": True,
+            "telegram_fallback_enabled": True,
         }, [{"direction": "incoming", "text": "I see the captcha"}],
         image=b"png-bytes")
 
@@ -111,6 +113,7 @@ def test_portal_failure_explanation_is_grounded_in_job_and_screenshot():
     content = session.calls[0][1]["json"]["messages"][0]["content"]
     assert [block["type"] for block in content] == ["image", "text"]
     assert "Only a non-empty reference" in content[-1]["text"]
+    assert "do not tell the user that they must solve" in content[-1]["text"]
 
 
 def test_structured_output_accepts_thinking_before_the_json_text():
