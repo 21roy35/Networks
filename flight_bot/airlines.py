@@ -3,6 +3,7 @@
 AIRLINES = {
     "SV": {
         "name": "Saudia",
+        "icao": "SVA",
         "domains": ["saudia.com", "saudiairlines.com", "alfursan.saudia.com"],
         # Open the official production complaint route directly instead of
         # depending on the generic contact page's cascading redirect fields.
@@ -10,86 +11,103 @@ AIRLINES = {
     },
     "XY": {
         "name": "flynas",
+        "icao": "KNE",
         "domains": ["flynas.com"],
         "complaint_url": "https://help.flynas.com/en",
     },
     "F3": {
         "name": "flyadeal",
+        "icao": "FAD",
         "domains": ["flyadeal.com"],
         "complaint_url": "https://help.flyadeal.com/hc/en-us/requests/new",
     },
     "EK": {
         "name": "Emirates",
+        "icao": "UAE",
         "domains": ["emirates.com"],
         "complaint_url": "https://www.emirates.com/english/help/",
     },
     "EY": {
         "name": "Etihad Airways",
+        "icao": "ETD",
         "domains": ["etihad.com", "etihad.ae"],
         "complaint_url": "https://www.etihad.com/en/help",
     },
     "QR": {
         "name": "Qatar Airways",
+        "icao": "QTR",
         "domains": ["qatarairways.com", "qatarairways.com.qa"],
         "complaint_url": "https://www.qatarairways.com/en/contact-us.html",
     },
     "GF": {
         "name": "Gulf Air",
+        "icao": "GFA",
         "domains": ["gulfair.com"],
         "complaint_url": "https://www.gulfair.com/contact-us",
     },
     "KU": {
         "name": "Kuwait Airways",
+        "icao": "KAC",
         "domains": ["kuwaitairways.com"],
         "complaint_url": "https://www.kuwaitairways.com/en/contact-us",
     },
     "MS": {
         "name": "EgyptAir",
+        "icao": "MSR",
         "domains": ["egyptair.com"],
         "complaint_url": "https://www.egyptair.com/en/about-egyptair/Pages/contact-us.aspx",
     },
     "RJ": {
         "name": "Royal Jordanian",
+        "icao": "RJA",
         "domains": ["rj.com", "royaljordanian.com"],
         "complaint_url": "https://www.rj.com/en/contact-us",
     },
     "TK": {
         "name": "Turkish Airlines",
+        "icao": "THY",
         "domains": ["turkishairlines.com", "thy.com"],
         "complaint_url": "https://www.turkishairlines.com/en-int/any-questions/customer-relations/",
     },
     "BA": {
         "name": "British Airways",
+        "icao": "BAW",
         "domains": ["britishairways.com", "email.ba.com", "ba.com"],
         "complaint_url": "https://www.britishairways.com/travel/customer-relations-int/public/en_gb",
     },
     "LH": {
         "name": "Lufthansa",
+        "icao": "DLH",
         "domains": ["lufthansa.com", "milesandmore.com"],
         "complaint_url": "https://www.lufthansa.com/de/en/help-and-contact",
     },
     "AF": {
         "name": "Air France",
+        "icao": "AFR",
         "domains": ["airfrance.com", "airfrance.fr"],
         "complaint_url": "https://wwws.airfrance.fr/en/contact",
     },
     "KL": {
         "name": "KLM",
+        "icao": "KLM",
         "domains": ["klm.com", "klm.nl"],
         "complaint_url": "https://www.klm.com/help",
     },
     "PC": {
         "name": "Pegasus Airlines",
+        "icao": "PGT",
         "domains": ["flypgs.com", "pegasusairlines.com"],
         "complaint_url": "https://www.flypgs.com/en/contact-us",
     },
     "WY": {
         "name": "Oman Air",
+        "icao": "OMA",
         "domains": ["omanair.com"],
         "complaint_url": "https://www.omanair.com/en/contact-us",
     },
     "FZ": {
         "name": "flydubai",
+        "icao": "FDB",
         "domains": ["flydubai.com"],
         "complaint_url": "https://www.flydubai.com/en/contact-us",
     },

@@ -131,6 +131,26 @@ CREATE TABLE IF NOT EXISTS ai_analysis_cache (
     updated_at TEXT DEFAULT (datetime('now', 'localtime'))
 );
 
+CREATE TABLE IF NOT EXISTS flight_status_observations (
+    id INTEGER PRIMARY KEY,
+    flight_key TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    provider_flight_id TEXT,
+    status TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    observed_at TEXT NOT NULL,
+    source_timestamp TEXT,
+    raw_hash TEXT NOT NULL,
+    data TEXT NOT NULL,
+    UNIQUE (flight_key, provider, raw_hash)
+);
+
+CREATE TABLE IF NOT EXISTS flight_status_current (
+    flight_key TEXT PRIMARY KEY,
+    snapshot TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_mail_events_date
     ON mail_events(date, id);
 CREATE INDEX IF NOT EXISTS idx_emails_date
@@ -145,6 +165,8 @@ CREATE INDEX IF NOT EXISTS idx_telegram_messages_created
     ON telegram_messages(created_at, id);
 CREATE INDEX IF NOT EXISTS idx_portal_jobs_updated
     ON portal_jobs(updated_at, id);
+CREATE INDEX IF NOT EXISTS idx_flight_status_observations_lookup
+    ON flight_status_observations(flight_key, observed_at DESC, id DESC);
 """
 
 
@@ -613,6 +635,78 @@ def list_flights() -> list[dict]:
     return flights
 
 
+def save_flight_status_observation(observation: dict) -> int:
+    """Persist one normalized provider result without duplicating retries."""
+    payload = dict(observation.get("data") or {})
+    raw_hash = str(observation.get("raw_hash") or "").strip()
+    if not raw_hash:
+        raise ValueError("A flight-status observation requires raw_hash.")
+    with connect() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO flight_status_observations
+               (flight_key, provider, provider_flight_id, status, confidence,
+                observed_at, source_timestamp, raw_hash, data)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (observation["flight_key"], observation["provider"],
+             observation.get("provider_flight_id"), observation["status"],
+             float(observation.get("confidence") or 0),
+             observation["observed_at"], observation.get("source_timestamp"),
+             raw_hash, json.dumps(payload, default=str, sort_keys=True)))
+        row = conn.execute(
+            """SELECT id FROM flight_status_observations
+               WHERE flight_key = ? AND provider = ? AND raw_hash = ?""",
+            (observation["flight_key"], observation["provider"], raw_hash),
+        ).fetchone()
+    return int(row["id"])
+
+
+def list_flight_status_observations(flight_key: str,
+                                    limit: int = 50) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM flight_status_observations
+               WHERE flight_key = ? ORDER BY observed_at DESC, id DESC LIMIT ?""",
+            (flight_key, max(1, min(int(limit), 500))),
+        ).fetchall()
+    results = []
+    for row in rows:
+        item = dict(row)
+        item["data"] = json.loads(item.get("data") or "{}")
+        results.append(item)
+    return results
+
+
+def save_flight_status_snapshot(flight_key: str, snapshot: dict) -> None:
+    updated_at = str(snapshot.get("updated_at") or datetime.now().isoformat())
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO flight_status_current (flight_key, snapshot, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(flight_key) DO UPDATE SET
+                 snapshot=excluded.snapshot, updated_at=excluded.updated_at""",
+            (flight_key, json.dumps(snapshot, default=str, sort_keys=True),
+             updated_at))
+
+
+def get_flight_status_snapshot(flight_key: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT snapshot FROM flight_status_current WHERE flight_key = ?",
+            (flight_key,),
+        ).fetchone()
+    return json.loads(row["snapshot"]) if row else None
+
+
+def flight_status_counts() -> dict[str, int]:
+    with connect() as conn:
+        return {
+            "snapshots": conn.execute(
+                "SELECT COUNT(*) FROM flight_status_current").fetchone()[0],
+            "observations": conn.execute(
+                "SELECT COUNT(*) FROM flight_status_observations").fetchone()[0],
+        }
+
+
 def get_flight(flight_id: int) -> dict | None:
     with connect() as conn:
         row = conn.execute("SELECT * FROM flights WHERE id = ?",
@@ -922,6 +1016,8 @@ def set_overrides(flight_id: int, values: dict):
 
 def reset():
     with connect() as conn:
+        conn.execute("DELETE FROM flight_status_current")
+        conn.execute("DELETE FROM flight_status_observations")
         conn.execute("DELETE FROM complaint_responses")
         conn.execute("DELETE FROM complaint_response_state")
         conn.execute("DELETE FROM flight_emails")

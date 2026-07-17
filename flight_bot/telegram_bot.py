@@ -23,9 +23,11 @@ from . import db
 from .ai_assistant import ClaudeAssistant
 from .airlines import AIRLINES
 from .captcha_solver import TwoCaptchaSolver
+from .case_strategy import recommend_case
 from .complaints import complaint_payload, missing_portal_fields
 from .config import TELEGRAM_EVIDENCE_DIR, passenger_profile_key
-from .flight_status import live_landed, parse_flight_time, schedule_has_finished
+from .flight_status import (get_flight_status, live_landed, parse_flight_time,
+                            refresh_flight_status, schedule_has_finished)
 from .pipeline import scan_mailbox
 from .portal_automation import (PortalResult, _extract_reference, set_ai_handler,
                                 set_captcha_solver, set_verification_handler,
@@ -147,6 +149,8 @@ class TelegramAPI:
     def set_commands(self):
         commands = [
             {"command": "status", "description": "Show FlightDeck status"},
+            {"command": "flightstatus", "description": "Refresh a flight status"},
+            {"command": "recommend", "description": "Best complaint next step"},
             {"command": "web", "description": "Open the private dashboard"},
             {"command": "cancel", "description": "Cancel pending issue intake"},
         ]
@@ -382,6 +386,7 @@ class TelegramCoordinator:
         while not self.stop_event.is_set():
             try:
                 self._maybe_scan_mailbox()
+                self.refresh_watched_flights()
                 self.send_due_surveys()
                 self.check_complaint_responses()
                 self.ask_for_pending_references()
@@ -474,6 +479,15 @@ class TelegramCoordinator:
         if text == "/status":
             self._send_status()
             return
+        if text and text.split(maxsplit=1)[0].lower() == "/flightstatus":
+            query = text.partition(" ")[2].strip()
+            self._send_live_status({"query": query, "latest": not query}, force=True)
+            return
+        if text and text.split(maxsplit=1)[0].lower() == "/recommend":
+            query = text.partition(" ")[2].strip()
+            self._send_case_recommendation(
+                {"query": query, "latest": not query}, question=text)
+            return
         if text and text.split(maxsplit=1)[0].lower() == "/web":
             self._send_web_link()
             return
@@ -563,10 +577,27 @@ class TelegramCoordinator:
                 f"{mailbox.get('folders') or 0} folder(s).")
         else:
             mailbox_status = " Gmail incremental sync is waiting to start."
+        status_settings = self.config.get("flight_status") or {}
+        status_sources = []
+        if status_settings.get("flightaware_api_key"):
+            status_sources.append("FlightAware")
+        if status_settings.get("airplanes_live_enabled", True):
+            status_sources.append("Airplanes.live")
+        if status_settings.get("adsb_lol_enabled", True):
+            status_sources.append("adsb.lol")
+        if status_settings.get("weather_enabled", True):
+            status_sources.append("aviation weather")
+        status_counts = db.flight_status_counts()
+        tracking_status = (
+            f" Live flight evidence is on through {', '.join(status_sources)}; "
+            f"{status_counts['snapshots']} flight status snapshot(s) and "
+            f"{status_counts['observations']} source observation(s) are persisted."
+            if status_sources else
+            " Live flight evidence is using booking and schedule data only.")
         return (
             f"FlightDeck is running. {counts['flights']} flights, "
             f"{counts['complaints']} complaints, {counts['emails']} parsed emails."
-            + mailbox_status + ai_status + captcha_status
+            + mailbox_status + tracking_status + ai_status + captcha_status
             + f" GACA auto-escalation is on after {auto_days} days "
               "without a substantive airline response.")
 
@@ -678,7 +709,10 @@ class TelegramCoordinator:
             "complaint_details", "complaint_responses", "show_evidence",
             "search_email",
         }
-        flight_actions = {"flight_details", "list_flights"}
+        flight_actions = {
+            "flight_details", "list_flights", "flight_status",
+            "case_recommendation", "complaint_readiness",
+        }
         if name in complaint_actions and self._ai_context.get("reference"):
             result["reference"] = self._ai_context["reference"]
         elif name in complaint_actions:
@@ -694,8 +728,16 @@ class TelegramCoordinator:
         return result
 
     def _ai_catalog(self) -> dict:
+        all_complaints = db.list_complaints()
+        complaints_by_flight: dict[str, list[dict]] = {}
+        for item in reversed(all_complaints):
+            complaints_by_flight.setdefault(item.get("flight_key") or "", []).append(item)
         flights = []
         for flight in db.list_flights()[:20]:
+            snapshot = db.get_flight_status_snapshot(flight.get("flight_key") or "") or {}
+            strategy = recommend_case(
+                flight, snapshot, complaints_by_flight.get(
+                    flight.get("flight_key") or "", []))
             flights.append({
                 "flight_number": self._effective_flight_value(
                     flight, "flight_number") or ", ".join(
@@ -706,8 +748,13 @@ class TelegramCoordinator:
                     flight, "destination") or "",
                 "pnr": self._effective_flight_value(flight, "pnr") or "",
                 "passenger": self._flight_passenger(flight),
+                "live_status": snapshot.get("status") or "not checked",
+                "status_confidence": snapshot.get("confidence"),
+                "status_provider": snapshot.get("provider") or "",
+                "status_updated_at": snapshot.get("updated_at") or "",
+                "recommended_action": strategy.get("recommended_action"),
+                "complaint_readiness": strategy.get("readiness_score"),
             })
-        all_complaints = db.list_complaints()
         complaints = []
         for complaint in all_complaints[:20]:
             flight = complaint.get("flight_data") or {}
@@ -956,6 +1003,118 @@ class TelegramCoordinator:
         self.notify(text)
         return True
 
+    def _selected_flight(self, action: dict) -> dict | None:
+        flights = self._matching_flights(action)
+        if action.get("latest") and flights:
+            flights = flights[:1]
+        if not flights:
+            self.notify("I found no stored flight matching those exact details.")
+            return None
+        if len(flights) > 1:
+            self.notify("I found several flights. Name the flight number or PNR:\n" +
+                        "\n".join(f"• {self._flight_summary(item)}"
+                                  for item in flights[:8]))
+            return None
+        return db.get_flight(flights[0]["id"]) or flights[0]
+
+    def _send_live_status(self, action: dict, force: bool = True) -> bool:
+        flight = self._selected_flight(action)
+        if not flight:
+            return True
+        self.notify(f"Checking live sources for {self._flight_label(flight)}…")
+        snapshot = refresh_flight_status(
+            self.config, flight, force=force, now=self._flight_status_now())
+        self._remember_ai_context(flight=flight)
+        sources = snapshot.get("sources") or []
+        source_text = ", ".join(
+            f"{item.get('provider')} ({item.get('status')})" for item in sources[:5])
+        lines = [
+            f"Flight status: {self._flight_summary(flight)}",
+            f"Current state: {snapshot.get('label') or 'Unknown'}",
+            f"Confidence/source: {int(float(snapshot.get('confidence') or 0) * 100)}% / "
+            f"{snapshot.get('provider') or 'none'}",
+            f"Last checked: {snapshot.get('updated_at') or 'unknown'}",
+        ]
+        for label, key in (("Estimated departure", "estimated_departure"),
+                           ("Actual departure", "actual_departure"),
+                           ("Estimated arrival", "estimated_arrival"),
+                           ("Actual arrival", "actual_arrival")):
+            if snapshot.get(key):
+                lines.append(f"{label}: {snapshot[key]}")
+        position = snapshot.get("position") or {}
+        if position:
+            lines.append("Position: " + ", ".join(
+                f"{key}={value}" for key, value in position.items()))
+        if source_text:
+            lines.append(f"Evidence: {source_text}")
+        if snapshot.get("contradictions"):
+            lines.append("Warning: " + " ".join(snapshot["contradictions"]))
+        if snapshot.get("errors"):
+            lines.append("Unavailable sources: " + "; ".join(snapshot["errors"]))
+        if snapshot.get("provider") == "schedule":
+            lines.append("Schedule-only means the bot has not independently verified movement or arrival.")
+        self.notify("\n".join(lines))
+        return True
+
+    def _strategy_for_flight(self, flight: dict, *, refresh: bool = False) -> dict:
+        snapshot = get_flight_status(
+            self.config, flight, refresh=refresh, now=self._flight_status_now())
+        complaints = db.complaints_for_flight(flight.get("flight_key") or "")
+        complaint_ids = {item["id"] for item in complaints}
+        responses = [item for item in db.complaint_response_details(50)
+                     if item.get("complaint_id") in complaint_ids]
+        return recommend_case(
+            flight, snapshot, complaints, responses,
+            now=self._flight_local_now(),
+            gaca_days=max(1, int(self.settings.get("gaca_auto_escalate_days", 7))))
+
+    def _send_case_recommendation(self, action: dict, *, readiness: bool = False,
+                                  question: str = "") -> bool:
+        flight = self._selected_flight(action)
+        if not flight:
+            return True
+        strategy = self._strategy_for_flight(flight, refresh=True)
+        self._remember_ai_context(flight=flight)
+        if readiness:
+            lines = [
+                f"Complaint readiness for {self._flight_label(flight)}: "
+                f"{strategy['readiness_score']}%",
+            ]
+            if strategy.get("missing_facts"):
+                lines.append("Missing facts:\n• " + "\n• ".join(strategy["missing_facts"]))
+            lines.append("Evidence checklist:\n• " +
+                         "\n• ".join(strategy["evidence_checklist"]))
+            self.notify("\n".join(lines))
+            return True
+
+        explanation = None
+        if self.ai.enabled:
+            explanation = self.ai.explain_case_recommendation(
+                question or str(action.get("query") or "What should I do?"),
+                flight, strategy)
+        lines = [
+            f"Best course for {self._flight_label(flight)}: "
+            f"{strategy['label']}",
+            f"Status evidence: {(strategy.get('status') or {}).get('label') or 'Unknown'} "
+            f"via {(strategy.get('status') or {}).get('provider') or 'none'}",
+        ]
+        if explanation:
+            lines.append(explanation.get("summary") or "")
+            lines.extend(f"• {reason}" for reason in explanation.get("why") or [])
+            if explanation.get("next_question"):
+                lines.append("Question: " + explanation["next_question"])
+        else:
+            lines.extend(f"• {reason}" for reason in strategy.get("reasons") or [])
+            if strategy.get("missing_facts"):
+                lines.append("Most important missing fact: " + strategy["missing_facts"][0])
+        lines.append("Recommended remedy: " + strategy["requested_remedy"])
+        if strategy.get("next_review_at"):
+            lines.append("Next review: " + strategy["next_review_at"])
+        if strategy.get("filing_deadline"):
+            lines.append("GACA incident filing deadline: " + strategy["filing_deadline"])
+        self.notify("\n".join(line for line in lines if line))
+        return True
+
     def _send_complaint_details(self, action: dict) -> bool:
         complaints = self._matching_complaints(action)
         if action.get("latest") and complaints:
@@ -1168,6 +1327,13 @@ class TelegramCoordinator:
                     f"â€¢ {self._flight_summary(item)}"
                     for item in flights[:limit]))
             return True
+        if name == "flight_status":
+            return self._send_live_status(action, force=True)
+        if name == "case_recommendation":
+            return self._send_case_recommendation(
+                action, question=str(action.get("query") or ""))
+        if name == "complaint_readiness":
+            return self._send_case_recommendation(action, readiness=True)
         if name in {"list_complaints", "complaint_details"}:
             if name == "complaint_details":
                 return self._send_complaint_details(action)
@@ -1208,7 +1374,8 @@ class TelegramCoordinator:
             self.notify(
                 "Ask naturally about flights, PNRs, passengers, complaint "
                 "references, airline responses, stored email, evidence photos, "
-                "portal screenshots, status, or a fresh Gmail sync. Existing "
+                "portal screenshots, live flight status, complaint readiness, the "
+                "best next action, or a fresh Gmail sync. Existing "
                 "/status, /web, /cancel, post-flight, verification, and complaint "
                 "flows keep priority.")
             return True
@@ -1539,12 +1706,27 @@ class TelegramCoordinator:
                 self._intakes[flight_key] = intake
             db.update_survey_status(flight_key, "awaiting_details")
             return
+        strategy = self._strategy_for_flight(flight)
+        status_context = strategy.get("status") or {}
+        rights_context = strategy.get("rights") or {}
+        case_context = {
+            "status": status_context.get("status"),
+            "status_confidence": status_context.get("confidence"),
+            "status_provider": status_context.get("provider"),
+            "actual_arrival": status_context.get("actual_arrival"),
+            "rights_verdict": rights_context.get("verdict"),
+            "rights_reasons": rights_context.get("reasons"),
+            "recommended_action": strategy.get("recommended_action"),
+            "missing_facts": strategy.get("missing_facts"),
+            "requested_remedy": strategy.get("requested_remedy"),
+        }
         ai_analysis = None
         if (self.ai.enabled
                 and self.ai.settings.get("analyze_incidents", True)):
             self.notify(f"{self.ai.name} is organizing the issue and checking the safest next stepâ€¦")
             ai_analysis = self.ai.analyze_incident(
-                intake.incident, flight, intake.attachments)
+                intake.incident, flight, intake.attachments,
+                case_context=case_context)
             if ai_analysis is None:
                 reason = self.ai.last_error or "AI request unavailable"
                 self.notify(
@@ -1656,10 +1838,24 @@ class TelegramCoordinator:
         if incident_suffix:
             incident = incident.rstrip() + "\n\n" + incident_suffix.strip()
         ai_analysis = None
+        strategy = self._strategy_for_flight(flight)
+        status_context = strategy.get("status") or {}
+        rights_context = strategy.get("rights") or {}
         if (self.ai.enabled
                 and self.ai.settings.get("analyze_incidents", True)):
             ai_analysis = self.ai.analyze_incident(
-                incident, flight, prior.get("attachments") or [])
+                incident, flight, prior.get("attachments") or [],
+                case_context={
+                    "status": status_context.get("status"),
+                    "status_confidence": status_context.get("confidence"),
+                    "status_provider": status_context.get("provider"),
+                    "actual_arrival": status_context.get("actual_arrival"),
+                    "rights_verdict": rights_context.get("verdict"),
+                    "rights_reasons": rights_context.get("reasons"),
+                    "recommended_action": strategy.get("recommended_action"),
+                    "missing_facts": strategy.get("missing_facts"),
+                    "requested_remedy": strategy.get("requested_remedy"),
+                })
         try:
             payload = complaint_payload(
                 flight, self.config["user"], "gaca", incident,
@@ -1776,6 +1972,42 @@ class TelegramCoordinator:
         self._status_cache[key] = (now, value)
         return value
 
+    def refresh_watched_flights(self) -> None:
+        """Refresh only near-term flights and announce exact-flight disruptions."""
+        now = self._flight_local_now()
+        for summary in db.list_flights():
+            flight = db.get_flight(summary["id"]) or summary
+            marker = (parse_flight_time(self._effective_flight_value(
+                flight, "departure")) or parse_flight_time(
+                    self._effective_flight_value(flight, "flight_date")))
+            if not marker or not (now - timedelta(hours=18)
+                                  <= marker <= now + timedelta(days=2)):
+                continue
+            key = flight.get("flight_key") or ""
+            previous = db.get_flight_status_snapshot(key) or {}
+            try:
+                current = refresh_flight_status(
+                    self.config, flight, now=self._flight_status_now(), force=False)
+            except Exception:
+                logger.exception("Flight status refresh failed for %s", key)
+                continue
+            status = current.get("status")
+            if (status not in {"cancelled", "delayed", "diverted"}
+                    or previous.get("status") == status):
+                continue
+            event_key = f"flight-status-alert:{key}:{status}"
+            if db.event_seen(event_key):
+                continue
+            strategy = self._strategy_for_flight(flight)
+            reason = (strategy.get("reasons") or [""])[0]
+            self.notify(
+                f"Flight update for {self._post_flight_label(flight)}: "
+                f"{current.get('label') or status}. "
+                f"Source: {current.get('provider') or 'unknown'} "
+                f"({int(float(current.get('confidence') or 0) * 100)}% confidence).\n"
+                f"Recommended next step: {strategy.get('label')}. {reason}")
+            db.mark_event_seen(event_key)
+
     def _flight_local_now(self) -> datetime:
         """Return naive local wall time matching stored itinerary timestamps."""
         timezone_name = str(self.settings.get("timezone") or "Asia/Riyadh")
@@ -1786,6 +2018,14 @@ class TelegramCoordinator:
                 "Unknown Telegram flight timezone %s; using server time",
                 timezone_name)
             return datetime.now()
+
+    def _flight_status_now(self) -> datetime:
+        """Return an aware clock so provider timestamps remain genuine UTC."""
+        timezone_name = str(self.settings.get("timezone") or "Asia/Riyadh")
+        try:
+            return datetime.now(ZoneInfo(timezone_name))
+        except ZoneInfoNotFoundError:
+            return datetime.now().astimezone()
 
     def send_due_surveys(self, now: datetime | None = None):
         now = now or self._flight_local_now()

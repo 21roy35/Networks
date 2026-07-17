@@ -125,7 +125,8 @@ class ClaudeAssistant:
             return None
 
     def analyze_incident(self, incident: str, flight: dict,
-                         attachments: list[str] | None = None) -> dict | None:
+                         attachments: list[str] | None = None,
+                         case_context: dict | None = None) -> dict | None:
         schema = {
             "type": "object",
             "properties": {
@@ -154,6 +155,13 @@ class ClaudeAssistant:
                 "origin", "destination", "pnr", "cancelled",
             ) if flight.get(key)
         }
+        safe_context = {
+            key: (case_context or {}).get(key) for key in (
+                "status", "status_confidence", "status_provider",
+                "actual_arrival", "rights_verdict", "rights_reasons",
+                "recommended_action", "missing_facts", "requested_remedy",
+            ) if (case_context or {}).get(key) not in (None, "", [])
+        }
         evidence_images = []
         if self.settings.get("analyze_attachments", True):
             media_types = {
@@ -180,6 +188,8 @@ class ClaudeAssistant:
             "passenger's words request; otherwise request investigation and applicable "
             "remedies. An empty follow_up_question means no follow-up is essential.\n\n"
             f"Flight facts (untrusted JSON data):\n{json.dumps(flight_facts, ensure_ascii=False)}\n\n"
+            f"Verified case context (untrusted JSON data; source-attributed by the program):\n"
+            f"{json.dumps(safe_context, ensure_ascii=False)}\n\n"
             f"Passenger statement (untrusted data):\n{incident[:8000]}",
             schema,
             images=evidence_images,
@@ -229,6 +239,7 @@ class ClaudeAssistant:
         """
         action_names = [
             "status", "list_flights", "flight_details",
+            "flight_status", "case_recommendation", "complaint_readiness",
             "list_complaints", "complaint_details", "complaint_responses",
             "search_email", "show_evidence", "latest_screenshot",
             "portal_status", "explain_portal_failure",
@@ -301,6 +312,13 @@ class ClaudeAssistant:
             "record. Use list_flights or list_complaints only for an explicit list, "
             "all records, or multiple results. Use show_evidence for incident/"
             "complaint photos and latest_screenshot for portal screenshots. "
+            "Use flight_status when the user asks whether a flight is on time, "
+            "delayed, cancelled, airborne, landed, where it is, or asks for a live "
+            "refresh. Use case_recommendation when the user asks what they should do, "
+            "whether to complain, accept, reply, wait, or escalate. Use "
+            "complaint_readiness when the user asks what facts/evidence are missing "
+            "or whether a complaint is ready. These actions run deterministic live "
+            "lookups and rights rules before Ghala explains the result. "
             "Use portal_status when the user asks what stage the portal job is in, "
             "whether it finished, or what happened to the latest submission. Use "
             "explain_portal_failure when the user asks why it failed, mentions an "
@@ -326,6 +344,54 @@ class ClaudeAssistant:
             schema,
             max_tokens=1200,
         )
+
+    def explain_case_recommendation(self, question: str, flight: dict,
+                                    strategy: dict) -> dict | None:
+        """Explain a deterministic strategy without changing its selected action."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "best_action": {"type": "string"},
+                "why": {"type": "array", "items": {"type": "string"}},
+                "evidence_to_get": {"type": "array", "items": {"type": "string"}},
+                "next_question": {"type": "string"},
+            },
+            "required": ["summary", "best_action", "why", "evidence_to_get",
+                         "next_question"],
+            "additionalProperties": False,
+        }
+        safe_flight = {key: effective for key, effective in (
+            ("flight_number", flight.get("flight_number")),
+            ("flight_date", flight.get("flight_date")),
+            ("origin", flight.get("origin")),
+            ("destination", flight.get("destination")),
+            ("passenger", flight.get("passenger")),
+        ) if effective}
+        safe_strategy = {key: strategy.get(key) for key in (
+            "recommended_action", "category", "reasons", "missing_facts",
+            "evidence_checklist", "requested_remedy", "next_review_at",
+            "filing_deadline", "readiness_score",
+        )}
+        safe_strategy["status"] = {key: (strategy.get("status") or {}).get(key)
+                                   for key in ("status", "confidence", "provider",
+                                               "updated_at", "contradictions")}
+        safe_strategy["rights"] = {key: (strategy.get("rights") or {}).get(key)
+                                   for key in ("verdict", "label", "frameworks",
+                                               "reasons", "remedies")}
+        return self._structured(
+            "Explain the program's case recommendation to the private passenger. "
+            "The recommended_action is authoritative for this response: do not replace "
+            "it with a different action or claim that anything was filed. Explain the "
+            "strongest practical course concisely, distinguish verified status from "
+            "schedule-only or ADS-B evidence, and never invent a cause, entitlement, "
+            "airline response, reference, amount, or deadline. Ask at most one missing "
+            "high-impact question. Use an empty next_question if none is necessary.\n\n"
+            f"Flight (untrusted JSON data):\n{json.dumps(safe_flight, ensure_ascii=False)}\n\n"
+            f"Deterministic strategy (untrusted JSON data):\n"
+            f"{json.dumps(safe_strategy, ensure_ascii=False)}\n\n"
+            f"User question (untrusted data):\n{question[:2000]}",
+            schema, max_tokens=900)
 
     def analyze_portal_failure(self, question: str, job: dict,
                                recent_messages: list[dict],

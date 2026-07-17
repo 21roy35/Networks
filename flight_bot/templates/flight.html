@@ -86,6 +86,18 @@
 .history-item { display:flex; align-items:center; justify-content:space-between; gap:12px;
   padding:12px 14px; border:1px solid var(--line); border-radius:11px; }
 .history-item p { margin:0; }
+.live-status { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:0;
+  overflow:hidden; margin-bottom:22px; }
+.live-status > div { padding:22px 24px; }
+.live-status > div + div { border-left:1px solid var(--line); background:#f8fbfb; }
+.status-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+.status-heading h2 { margin:2px 0 5px; }
+.status-facts { display:flex; flex-wrap:wrap; gap:7px 16px; margin:13px 0 0;
+  color:var(--navy-500); font-size:12px; }
+.status-sources { display:grid; gap:6px; margin-top:13px; }
+.status-source { display:flex; justify-content:space-between; gap:12px; padding:7px 9px;
+  border-radius:8px; background:#fff; font-size:12px; }
+.missing-list { margin:10px 0 0; padding-left:18px; color:var(--navy-700); font-size:13px; }
 @media (max-width:980px) {
   .detail-layout { grid-template-columns:1fr; }
   .assessment { position:static; grid-row:1; }
@@ -101,6 +113,8 @@
   .data-label { grid-column:1/3; }
   .email-details summary { grid-template-columns:1fr; }
   .email-details summary .muted { display:none; }
+  .live-status { grid-template-columns:1fr; }
+  .live-status > div + div { border-left:0; border-top:1px solid var(--line); }
 }
 </style>
 {% endblock %}
@@ -130,6 +144,35 @@
       <div class="quality-bar"><i style="width:{{ flight.quality.score }}%"></i></div>
       <span class="small muted">{{ flight.quality.label }}{% if flight.quality.missing %} · missing {{ flight.quality.missing|join(', ') }}{% endif %}</span>
     </div>
+  </div>
+</section>
+
+<section class="live-status card">
+  <div>
+    <div class="status-heading">
+      <div><p class="eyebrow">Live evidence</p><h2>{{ live_status.label }}</h2>
+        <p class="small muted">{{ (live_status.confidence * 100)|round|int }}% confidence · {{ live_status.provider|replace('_', ' ')|title }}{% if live_status.updated_at %} · checked {{ live_status.updated_at[:16]|replace('T', ' ') }} UTC{% endif %}</p>
+      </div>
+      <form method="post" action="{{ url_for('flight_status_refresh', flight_id=flight.id) }}"><button class="btn">Refresh now</button></form>
+    </div>
+    <div class="status-facts">
+      {% if live_status.estimated_departure %}<span>Estimated departure: {{ live_status.estimated_departure }}</span>{% endif %}
+      {% if live_status.actual_departure %}<span>Actual departure: {{ live_status.actual_departure }}</span>{% endif %}
+      {% if live_status.estimated_arrival %}<span>Estimated arrival: {{ live_status.estimated_arrival }}</span>{% endif %}
+      {% if live_status.actual_arrival %}<span>Actual arrival: {{ live_status.actual_arrival }}</span>{% endif %}
+    </div>
+    {% if live_status.contradictions %}<p class="small" style="color:#a0442f">{{ live_status.contradictions|join(' ') }}</p>{% endif %}
+    {% if live_status.sources %}<div class="status-sources">{% for source in live_status.sources[:5] %}<div class="status-source"><span>{{ source.provider|replace('_', ' ')|title }}</span><strong>{{ source.status|replace('_', ' ')|title }} · {{ (source.confidence * 100)|round|int }}%</strong></div>{% endfor %}</div>{% endif %}
+  </div>
+  <div>
+    <p class="eyebrow">Best course of action</p>
+    <h2>{{ strategy.label }}</h2>
+    <p class="small muted">Complaint readiness {{ strategy.readiness_score }}% · {{ strategy.category|title }}</p>
+    {% if strategy.reasons %}<p>{{ strategy.reasons[0] }}</p>{% endif %}
+    <p class="small"><strong>Recommended remedy:</strong> {{ strategy.requested_remedy }}</p>
+    {% if strategy.missing_facts %}<strong class="small">Information still worth collecting</strong><ul class="missing-list">{% for item in strategy.missing_facts %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
+    {% if strategy.next_review_at %}<p class="small muted">Next review: {{ strategy.next_review_at[:16]|replace('T', ' ') }}</p>{% endif %}
+    {% if strategy.filing_deadline %}<p class="small muted">GACA incident filing deadline: {{ strategy.filing_deadline }}</p>{% endif %}
   </div>
 </section>
 

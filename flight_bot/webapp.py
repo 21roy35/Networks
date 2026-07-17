@@ -15,10 +15,12 @@ from flask import (Flask, Response, abort, flash, jsonify, redirect, render_temp
 
 from . import db
 from .ai_assistant import ClaudeAssistant
+from .case_strategy import recommend_case
 from .captcha_solver import TwoCaptchaSolver
 from .compensation import (ELIGIBLE, POSSIBLY, assess, effective)
 from .complaints import (airline_complaint, complaint_payload, gaca_complaint,
                          missing_portal_fields)
+from .flight_status import refresh_flight_status
 from .mail_client import eta_text
 from .config import (passenger_profile_key, save_passenger_profile,
                      save_user_profile)
@@ -551,11 +553,34 @@ def create_app(config: dict) -> Flask:
         flight = db.get_flight(flight_id)
         if not flight:
             abort(404)
+        status_snapshot = (db.get_flight_status_snapshot(
+            flight.get("flight_key") or "") or {
+                "status": "not_checked", "label": "Not checked yet",
+                "confidence": 0, "provider": "none", "sources": [],
+            })
+        complaint_ids = {item["id"] for item in flight.get("complaints") or []}
+        responses = [item for item in db.complaint_response_details(50)
+                     if item.get("complaint_id") in complaint_ids]
+        strategy = recommend_case(
+            flight, status_snapshot, flight.get("complaints") or [], responses,
+            gaca_days=max(1, int((config.get("telegram") or {}).get(
+                "gaca_auto_escalate_days", 7))))
         flight = _flight_view(flight)
         return render_template(
             "flight.html", flight=flight,
             field_groups=_copyable_field_groups(flight),
-            assessment=flight["assessment"])
+            assessment=flight["assessment"], live_status=status_snapshot,
+            strategy=strategy)
+
+    @app.route("/flight/<int:flight_id>/status/refresh", methods=["POST"])
+    def flight_status_refresh(flight_id):
+        flight = db.get_flight(flight_id)
+        if not flight:
+            abort(404)
+        snapshot = refresh_flight_status(config, flight, force=True)
+        flash("Flight status refreshed: " + str(
+            snapshot.get("label") or snapshot.get("status") or "unknown"))
+        return redirect(url_for("flight_detail", flight_id=flight_id))
 
     @app.route("/flight/<int:flight_id>/override", methods=["POST"])
     def flight_override(flight_id):

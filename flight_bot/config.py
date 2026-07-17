@@ -60,9 +60,12 @@ DEFAULTS = {
         "timezone": "Asia/Riyadh",
     },
     "flight_status": {
-        "provider": "schedule",
+        "provider": "auto",
         "flightaware_api_key": "",
         "poll_minutes": 10,
+        "airplanes_live_enabled": True,
+        "adsb_lol_enabled": True,
+        "weather_enabled": True,
     },
     "captcha": {
         "enabled": False,

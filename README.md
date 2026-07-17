@@ -14,7 +14,7 @@ FlightDeck turns airline messages into complete flight records, tracks each jour
 - Escalates eligible airline complaints through GACA's official E-Services website.
 - Saves incident photos, official complaint references, status, and response history.
 - Uses Telegram for post-flight check-ins, issue/photo intake, OTP and CAPTCHA assistance, airline-response alerts, and one-tap GACA escalation.
-- Answers ordinary Telegram questions through Ghala: it can retrieve exact flights, passengers, complaints, references, matched responses, stored airline email, evidence photos, and portal screenshots; trigger a fresh Gmail sync; or return the private dashboard link.
+- Answers ordinary Telegram questions through Ghala: it can retrieve exact flights, passengers, complaints, references, responses, email, evidence and screenshots; refresh live flight evidence; recommend the best complaint action; trigger Gmail sync; or return the dashboard link.
 - Uses the optional Ghala-200 Claude assistant to organize plain-language incidents, understand airline decisions, and recover safely when an official portal changes.
 
 After the one-time profile and integration setup, the only per-incident input is a plain-language description such as “the seat was broken and the screen did not work,” plus any photos. FlightDeck supplies the stored passenger, booking, flight, evidence, legal basis, and requested remedies. Family bookings use separate passenger profiles: the bot asks once for that passenger's identity and never substitutes the account owner's National ID or loyalty number.
@@ -50,7 +50,7 @@ The inbox is used to import flight records and detect airline replies. It is not
 4. Put the printed private chat ID in `telegram.chat_id`, or set `FLIGHTBOT_TELEGRAM_CHAT_ID`.
 5. Run `python -m flight_bot telegram`. Running `python -m flight_bot web` also starts Telegram automatically when both credentials are configured.
 
-The bot accepts messages only from the configured private chat ID. `/status` reports the current flight, complaint, and mailbox totals. `/web` returns a short-lived private sign-in link for opening the dashboard on a phone or other device; after opening it, that browser remains signed in for the configured session period. OTP replies are deleted from the Telegram chat after use when Telegram permits deletion. Evidence photos are downloaded to the ignored local `telegram_evidence/` directory and linked to the complaint record.
+The bot accepts messages only from the configured private chat ID. `/status` reports the current flight, complaint, and mailbox totals. `/flightstatus SV1671` refreshes source-attributed live evidence for an exact flight, and `/recommend SV1671` explains its best complaint next step. `/web` returns a short-lived private sign-in link for opening the dashboard on a phone or other device; after opening it, that browser remains signed in for the configured session period. OTP replies are deleted from the Telegram chat after use when Telegram permits deletion. Evidence photos are downloaded to the ignored local `telegram_evidence/` directory and linked to the complaint record.
 
 When Anthropic is enabled, you can also write normal requests such as “show my latest complaint,” “what did the airline say about C_2761389?”, “send the latest portal screenshot,” “show Mansour’s SV1671,” or “check Gmail now.” Claude is used only to interpret the intent and selectors. Flight, passenger, case, email, and image matching is performed by deterministic code against stored records; Claude cannot invent or directly alter them. Slash commands, SMS-reference capture, active post-flight intake, OTP, and CAPTCHA replies always take priority over this fallback. AI lookups run outside the Telegram polling thread so a slow Anthropic response does not freeze the bot.
 
@@ -80,19 +80,26 @@ If Anthropic is unavailable or returns an unusable answer, FlightDeck continues 
 
 Set `FLIGHTBOT_2CAPTCHA_API_KEY` to enable the 2Captcha API v2 integration. FlightDeck creates a proxyless reCAPTCHA v2 task, polls at the documented five-second minimum, applies the returned token and invokes the page callback when present. The configured Telegram chat remains the fallback. Solver usage consumes the balance on the configured 2Captcha account.
 
-## Flight completion detection
+## Live flight evidence
 
-The default `schedule` provider triggers after the stored arrival time plus `post_flight_delay_minutes`. For live landed-state checks, configure FlightAware AeroAPI:
+FlightDeck persists normalized observations and derives a current status with its provider, timestamp, confidence, and contradictions. It polls only near departure: every 30 minutes from six hours before departure, every 10 minutes close to departure, and every four minutes while a flight may be airborne. Final states back off automatically.
+
+The account-free default uses Airplanes.live for live ADS-B callsign tracking, adsb.lol as fallback, Aviation Weather Center METARs for context, booking emails for exact cancellation or rebooking evidence, and the stored schedule as the final fallback. Missing ADS-B data is never treated as cancellation, schedule completion is separate from verified landing, and weather is context rather than proof of legal cause.
+
+FlightAware AeroAPI remains an optional higher-confidence operational source when a key is available:
 
 ```json
 "flight_status": {
-  "provider": "flightaware",
+  "provider": "auto",
   "flightaware_api_key": "your-key",
-  "poll_minutes": 10
+  "poll_minutes": 10,
+  "airplanes_live_enabled": true,
+  "adsb_lol_enabled": true,
+  "weather_enabled": true
 }
 ```
 
-The key can instead be supplied as `FLIGHTBOT_FLIGHTAWARE_API_KEY`. FlightAware usage may be billed under your AeroAPI plan; see the official [AeroAPI portal](https://www.flightaware.com/aeroapi/portal/).
+No account is required for the default providers. A FlightAware key can instead be supplied as `FLIGHTBOT_FLIGHTAWARE_API_KEY`; its usage may be billed under your AeroAPI plan. The dashboard shows the evidence timeline, confidence, recommended action, missing facts, tailored remedy, and escalation deadline.
 
 ## Official complaint workflow
 

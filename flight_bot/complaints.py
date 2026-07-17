@@ -98,13 +98,26 @@ def _subject(flight: dict, prefix: str) -> str:
             f"PNR {flight.get('pnr') or 'N/A'}")
 
 
-def airline_complaint(flight: dict, user: dict, incident: str = "") -> dict:
+def _requested_resolution(assessment: dict, requested: str = "") -> str:
+    requested = " ".join(str(requested or "").split()).strip()
+    if requested:
+        return requested
+    remedies = [str(value).strip() for value in assessment.get("remedies") or []
+                if str(value).strip()]
+    if remedies:
+        return "; ".join(remedies)
+    return "a proportionate remedy supported by the incident and evidence"
+
+
+def airline_complaint(flight: dict, user: dict, incident: str = "",
+                      requested_remedy: str = "") -> dict:
     """Generate the airline claim shown to the user and sent to its portal."""
     assessment = assess(flight)
     code = flight.get("airline_code")
     info = AIRLINES.get(code, {})
     airline = flight.get("airline_name") or code or "the airline"
     incident = incident.strip() or "Describe what went wrong."
+    requested_remedy = _requested_resolution(assessment, requested_remedy)
     subject = _subject(flight, "Passenger rights complaint")
     body = f"""{incident}
 
@@ -112,10 +125,11 @@ Flight details:
 {_flight_facts(flight, user)}
 
 Requested compensation and resolution:
-  I request fair financial compensation for what occurred, reimbursement for
-  every related loss or expense, and every additional refund, repair,
-  replacement, or duty-of-care remedy available. Please provide a written
-  decision and complaint reference number.
+  I request {requested_remedy}, including fair financial compensation where
+  applicable. I also request reimbursement of reasonable, documented related
+  expenses and any additional remedy that the evidence and applicable
+  passenger-rights rules support. Please provide a written decision and
+  complaint reference number.
 
 Assessment basis:
   {"; ".join(assessment["frameworks"])}.
@@ -136,11 +150,13 @@ Contact:
 
 def gaca_complaint(flight: dict, user: dict, incident: str = "",
                    airline_reference: str = "",
-                   airline_complaint_date: str = "") -> dict:
+                   airline_complaint_date: str = "",
+                   requested_remedy: str = "") -> dict:
     """Generate the regulator escalation sent through GACA's official portal."""
     assessment = assess(flight)
     airline = flight.get("airline_name") or flight.get("airline_code") or "the airline"
     incident = incident.strip() or "Describe what went wrong."
+    requested_remedy = _requested_resolution(assessment, requested_remedy)
     subject = _subject(flight, f"GACA escalation against {airline}")
     body = f"""{incident}
 
@@ -153,9 +169,9 @@ Flight details:
 {_flight_facts(flight, user)}
 
 Requested compensation and resolution:
-  Please investigate this complaint and require the carrier to provide fair
-  financial compensation, reimbursement for every related loss or expense,
-  and every additional remedy due under the applicable passenger-rights rules.
+  Please investigate this complaint and require the carrier to provide
+  {requested_remedy}, reimbursement of reasonable documented related expenses,
+  and any additional remedy supported by the applicable passenger-rights rules.
 
 Assessment basis:
   {"; ".join(assessment["frameworks"])}.
@@ -210,6 +226,7 @@ def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
     destination = effective(flight, "destination") or ""
     ticket_numbers = flight.get("ticket_numbers") or []
     assessment = assess(flight)
+    requested_remedy = str((ai_analysis or {}).get("requested_remedy") or "")
     complaint_incident = incident
     if ai_analysis:
         facts = [str(item).strip() for item in ai_analysis.get("facts") or []
@@ -244,9 +261,9 @@ def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
     }
     letter = (gaca_complaint(
         flight, letter_user, complaint_incident, airline_reference,
-        airline_complaint_date)
+        airline_complaint_date, requested_remedy)
         if kind == "gaca" else airline_complaint(
-            flight, letter_user, complaint_incident))
+            flight, letter_user, complaint_incident, requested_remedy))
     departure = effective(flight, "departure") or ""
     return {
         "kind": kind,
