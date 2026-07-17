@@ -236,6 +236,24 @@ def test_cancelled_flight_gets_cancellation_specific_checkin(coordinator):
     assert len(api.messages) == 1
 
 
+def test_retracted_cancellation_prompt_cannot_open_complaint_intake(
+        coordinator):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = db.list_flights()[0]
+    db.record_survey(flight["flight_key"], bot.chat_id, 800, "asked")
+    db.update_survey_status(flight["flight_key"], "retracted")
+
+    bot._handle_callback({
+        "id": "old-cancellation-button",
+        "data": f"flight_issue:{flight['id']}",
+        "message": {"chat": {"id": 42}},
+    })
+
+    assert "check-in was retracted" in api.messages[-1]["text"]
+    assert db.survey_for_flight(flight["flight_key"])["status"] == "retracted"
+
+
 def test_post_flight_question_names_the_actual_family_passenger(coordinator):
     bot, _api = coordinator
     family_flight = {

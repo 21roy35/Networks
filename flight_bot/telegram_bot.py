@@ -1381,6 +1381,14 @@ class TelegramCoordinator:
         if not flight:
             self.notify("That flight is no longer available.")
             return
+        survey = db.survey_for_flight(flight["flight_key"])
+        if (action in {"flight_good", "flight_no_issue", "flight_issue"}
+                and survey and survey.get("status") == "retracted"):
+            self.notify(
+                "That check-in was retracted because the cancellation signal "
+                "belonged to an earlier flight on the same booking. No complaint "
+                "was opened from it.")
+            return
         if action == "flight_good":
             db.update_survey_status(flight["flight_key"], "good")
             self.notify(f"Glad {self._flight_label(flight)} went well ✈️")

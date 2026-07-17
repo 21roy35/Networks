@@ -153,6 +153,38 @@ def _compatible_pnr(a: dict, b: dict) -> bool:
     return not a.get("pnr") or not b.get("pnr") or a["pnr"] == b["pnr"]
 
 
+def _emails_for_segment(group: list[dict], cluster: dict) -> list[dict]:
+    """Return booking-wide emails plus messages that target this exact leg.
+
+    A PNR can be rebooked several times. Grouping by PNR is useful for shared
+    passenger, ticket, and payment facts, but a cancellation for the abandoned
+    flight must never mark every later replacement flight as cancelled.
+    """
+    target_number = cluster.get("flight_number")
+    target_date = cluster.get("date")
+    selected = []
+    for email in group:
+        explicit_numbers = set(email.get("flight_numbers") or [])
+        explicit_dates = set()
+        for segment in email.get("segments") or []:
+            if segment.get("flight_number"):
+                explicit_numbers.add(segment["flight_number"])
+            if (not target_number
+                    or segment.get("flight_number") == target_number):
+                if segment.get("date"):
+                    explicit_dates.add(segment["date"])
+        if explicit_numbers:
+            if target_number not in explicit_numbers:
+                continue
+            if target_date and explicit_dates and target_date not in explicit_dates:
+                continue
+        elif (target_date and email.get("flight_date")
+              and email["flight_date"] != target_date):
+            continue
+        selected.append(email)
+    return selected
+
+
 def _segment_flights(base: dict, group: list[dict]) -> list[dict]:
     """Split a merged booking into one flight record per itinerary segment.
 
@@ -193,6 +225,7 @@ def _segment_flights(base: dict, group: list[dict]) -> list[dict]:
     for key in order:
         c = clusters[key]
         flight = dict(base)
+        relevant_emails = _emails_for_segment(group, c)
         flight["origin"] = c["origin"]
         flight["destination"] = c["destination"]
         if flight.get("origin_city") and len(clusters) > 1:
@@ -208,6 +241,22 @@ def _segment_flights(base: dict, group: list[dict]) -> list[dict]:
         if c["flight_number"]:
             flight["flight_number"] = c["flight_number"]
             flight["flight_numbers"] = [c["flight_number"]]
+        kinds = []
+        for email in sorted(relevant_emails, key=lambda e: e.get("date") or ""):
+            for kind in email.get("kinds") or []:
+                if kind not in kinds:
+                    kinds.append(kind)
+        flight["kinds"] = kinds
+        flight["kind_labels"] = [KIND_LABELS.get(kind, kind)
+                                 for kind in kinds]
+        flight["cancelled"] = CANCELLATION in kinds
+        flight["cancellation_reason"] = (
+            _pick(relevant_emails, "cancellation_reason")
+            if flight["cancelled"] else None)
+        flight["has_boarding_pass"] = BOARDING_PASS in kinds
+        flight["email_ids"] = [email["db_id"] for email in relevant_emails
+                               if email.get("db_id")]
+        flight["email_count"] = len(relevant_emails)
         key_parts = [flight.get("pnr") or "unknown",
                      flight.get("flight_number") or "?",
                      flight.get("flight_date") or "?"]
