@@ -786,6 +786,14 @@ def update_survey_status(flight_key: str, status: str):
             (status, flight_key))
 
 
+def delete_survey(flight_key: str) -> None:
+    """Remove a retracted prompt so the correct flight can be checked later."""
+    with connect() as conn:
+        conn.execute(
+            "DELETE FROM telegram_surveys WHERE flight_key = ?",
+            (flight_key,))
+
+
 def pending_survey(chat_id: str, reply_to_message_id: int | None = None) -> dict | None:
     query = ("SELECT * FROM telegram_surveys WHERE chat_id = ? "
              "AND status IN ('asked', 'awaiting_details', 'collecting')")

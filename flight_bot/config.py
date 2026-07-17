@@ -57,6 +57,7 @@ DEFAULTS = {
         "verification_timeout_minutes": 10,
         "mailbox_scan_minutes": 10,
         "gaca_auto_escalate_days": 7,
+        "timezone": "Asia/Riyadh",
     },
     "flight_status": {
         "provider": "schedule",

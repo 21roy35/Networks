@@ -2,7 +2,7 @@ import json
 import threading
 import time
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import requests
@@ -213,6 +213,15 @@ def test_due_flight_gets_one_telegram_survey(coordinator):
     assert db.survey_for_flight(flight["flight_key"])["status"] == "asked"
     bot.send_due_surveys(now=datetime.now())
     assert len(api.messages) == 1
+
+
+def test_flight_checkins_use_configured_local_timezone(coordinator):
+    bot, _api = coordinator
+    local_now = bot._flight_local_now()
+    assert local_now.tzinfo is None
+    assert abs((local_now - datetime.now(UTC).replace(tzinfo=None)
+                - timedelta(hours=3))
+               .total_seconds()) < 5
 
 
 def test_cancelled_flight_gets_cancellation_specific_checkin(coordinator):

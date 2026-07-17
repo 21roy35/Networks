@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from email.utils import parseaddr
 from pathlib import Path
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
@@ -1775,8 +1776,19 @@ class TelegramCoordinator:
         self._status_cache[key] = (now, value)
         return value
 
+    def _flight_local_now(self) -> datetime:
+        """Return naive local wall time matching stored itinerary timestamps."""
+        timezone_name = str(self.settings.get("timezone") or "Asia/Riyadh")
+        try:
+            return datetime.now(ZoneInfo(timezone_name)).replace(tzinfo=None)
+        except ZoneInfoNotFoundError:
+            logger.warning(
+                "Unknown Telegram flight timezone %s; using server time",
+                timezone_name)
+            return datetime.now()
+
     def send_due_surveys(self, now: datetime | None = None):
-        now = now or datetime.now()
+        now = now or self._flight_local_now()
         delay = int(self.settings.get("post_flight_delay_minutes", 20))
         lookback = timedelta(hours=int(self.settings.get("survey_lookback_hours", 24)))
         for summary in db.list_flights():
