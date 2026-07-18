@@ -1,3 +1,5 @@
+import re
+
 import pytest
 
 from flight_bot import portal_automation
@@ -9,6 +11,7 @@ from flight_bot.portal_automation import (_extract_reference,
 
 def sample_flight():
     return {
+        "flight_key": "ABC123|SV100|2026-06-01",
         "airline_code": "SV",
         "airline_name": "Saudia",
         "passenger": "Test Passenger",
@@ -45,6 +48,7 @@ def test_payload_maps_incident_and_every_known_portal_field():
     assert payload["ticket_number"] == "065-1234567890"
     assert payload["route"] == "RUH → JED"
     assert payload["incident"] in payload["description"]
+    assert payload["flight_key"] == "ABC123|SV100|2026-06-01"
     assert missing_portal_fields(payload) == []
 
 
@@ -618,9 +622,107 @@ def test_2captcha_extracts_site_key_and_applies_token(monkeypatch):
         "api_domain": "recaptcha.net",
     }
     assert page.injected == "automatic-token"
-    assert page.waits == [1500]
+    assert page.waits == [500]
     assert updates[0][0] == "verification"
     assert updates[-1][0] == "filling"
+
+
+def test_2captcha_prefers_live_widget_and_keeps_enterprise_data_s():
+    class Anchor:
+        first = None
+
+        def __init__(self, visible):
+            self.visible = visible
+            self.first = self
+
+        def count(self):
+            return int(self.visible is not None)
+
+        def is_visible(self):
+            return bool(self.visible)
+
+    class Frame:
+        def __init__(self, site_key, visible, data_s=""):
+            suffix = f"&s={data_s}" if data_s else ""
+            self.url = ("https://www.google.com/recaptcha/enterprise/anchor?"
+                        f"k={site_key}&size=normal{suffix}")
+            self.anchor = Anchor(visible)
+
+        def locator(self, selector):
+            assert selector == "#recaptcha-anchor"
+            return self.anchor
+
+    class Page:
+        url = "https://www.saudia.com/en/forms/complaint-form"
+        frames = [Frame("stale-key", False), Frame("live-key", True, "fresh-s")]
+
+        def evaluate(self, script):
+            assert script == "navigator.userAgent"
+            return "Modern Browser"
+
+    challenge = portal_automation._recaptcha_challenge(Page())
+    assert challenge["site_key"] == "live-key"
+    assert challenge["is_enterprise"] is True
+    assert challenge["data_s"] == "fresh-s"
+
+
+def test_arabic_saudi_nationality_maps_to_english_portal_option():
+    choices, queries = portal_automation._nationality_selection("سعودي")
+    assert queries == ["Saudi"]
+    assert any(re.search(choice, "Saudi Arabian", re.I) for choice in choices)
+
+
+def test_early_form_review_defers_captcha_until_final_submit(monkeypatch):
+    monkeypatch.setattr(
+        portal_automation, "_needs_human_step",
+        lambda _page: "Solve the CAPTCHA challenge.")
+    monkeypatch.setattr(
+        portal_automation, "_pending_captcha_kind", lambda _page: "recaptcha")
+    assert portal_automation._wait_for_human_step(
+        object(), lambda *_args: None, defer_captcha=True) is True
+
+
+def test_saudia_submit_retries_fresh_captcha_after_expiry(monkeypatch):
+    class Page:
+        url = "https://www.saudia.com/en/forms/complaint-form"
+
+        def __init__(self):
+            self.waits = []
+
+        def on(self, *_args):
+            pass
+
+        def wait_for_timeout(self, value):
+            self.waits.append(value)
+
+    results = iter([
+        portal_automation.PortalResult("verification_expired", "expired"),
+        portal_automation.PortalResult("submitted", "accepted", "C_1234567"),
+    ])
+    clicks = []
+    resets = []
+    updates = []
+    monkeypatch.setattr(portal_automation, "_wait_for_human_step",
+                        lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(portal_automation, "_verification_expired",
+                        lambda _page: False)
+    monkeypatch.setattr(portal_automation, "_body_text", lambda _page: "form")
+    monkeypatch.setattr(portal_automation, "_page_screenshot", lambda _page: b"shot")
+    monkeypatch.setattr(portal_automation, "_click",
+                        lambda *_args: clicks.append(True) or True)
+    monkeypatch.setattr(portal_automation, "_reset_recaptcha",
+                        lambda _page: resets.append(True))
+    monkeypatch.setattr(portal_automation, "_await_confirmation",
+                        lambda *_args, **_kwargs: next(results))
+
+    result = portal_automation._submit_with_captcha_recovery(
+        Page(), {"airline_code": "SV"},
+        lambda *args: updates.append(args))
+    assert result.status == "submitted"
+    assert result.reference == "C_1234567"
+    assert len(clicks) == 2
+    assert resets == [True]
+    assert any("retrying automatically" in args[1] for args in updates)
 
 
 def test_nested_hcaptcha_is_detected_and_sent_to_automatic_solver(monkeypatch):
@@ -1289,6 +1391,21 @@ def test_saudia_backend_rejection_and_unconfirmed_timeout_are_failures():
         payload={"airline_code": "SV"}, timeout_seconds=0,
         submission_capture={})
     assert result.status == "error"
+
+
+def test_saudia_backend_exposes_validation_reason_and_recovers_captcha():
+    captcha = portal_automation._saudia_submission_result({
+        "seen": True, "status": 400,
+        "json": {"data": None, "message": "Verification expired"},
+    })
+    assert captcha.status == "verification_expired"
+
+    nationality = portal_automation._saudia_submission_result({
+        "seen": True, "status": 400,
+        "json": {"data": None, "errors": {"message": "Nationality is required"}},
+    })
+    assert nationality.status == "error"
+    assert "Nationality is required" in nationality.message
 
 
 def test_ai_portal_guardrails_block_final_and_security_actions(monkeypatch):

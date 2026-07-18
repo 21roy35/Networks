@@ -68,12 +68,12 @@ async function refreshStatus() {
       if (job.status === 'submitted') note.textContent = 'Submission confirmed and saved to this flight’s claim history.';
       return;
     }
-    setTimeout(refreshStatus, 1200);
+    setTimeout(refreshStatus, 2500);
   } catch (error) {
     message.textContent = 'Waiting to reconnect to the local status tracker…';
-    setTimeout(refreshStatus, 2500);
+    setTimeout(refreshStatus, 5000);
   }
 }
-setTimeout(refreshStatus, 700);
+setTimeout(refreshStatus, 800);
 </script>
 {% endblock %}

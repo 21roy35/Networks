@@ -372,14 +372,23 @@ class TelegramCoordinator:
 
     def _poll_loop(self):
         timeout = int(self.settings.get("poll_timeout_seconds", 25))
+        consecutive_failures = 0
         while not self.stop_event.is_set():
             try:
                 for update in self.api.updates(self.offset, timeout):
                     self.offset = max(self.offset, int(update["update_id"]) + 1)
                     self.handle_update(update)
-            except Exception:
-                logger.exception("Telegram update polling failed")
-                self.stop_event.wait(3)
+                consecutive_failures = 0
+            except Exception as exc:
+                consecutive_failures += 1
+                # Telegram long polling occasionally times out or drops a
+                # connection. Updates remain queued at the saved offset, so use
+                # a short bounded backoff without flooding the error log.
+                if consecutive_failures == 1 or consecutive_failures % 10 == 0:
+                    logger.warning(
+                        "Telegram polling temporarily unavailable (attempt %s): %s",
+                        consecutive_failures, exc)
+                self.stop_event.wait(min(30, 2 ** min(consecutive_failures, 5)))
 
     def _monitor_loop(self):
         interval = max(15, int(self.settings.get("monitor_interval_seconds", 60)))
@@ -418,6 +427,24 @@ class TelegramCoordinator:
         response = message.get("text") or message.get("caption") or ""
         if not response.strip():
             return True
+        safe_labels = {
+            "otp": "[OTP response received]",
+            "recaptcha": "[CAPTCHA response received]",
+            "hcaptcha": "[CAPTCHA response received]",
+            "captcha": "[CAPTCHA response received]",
+            "text_captcha": "[CAPTCHA response received]",
+            "field_input": "[Required field response received]",
+            "login": "[Portal login response received]",
+            "approval": "[Portal approval response received]",
+        }
+        try:
+            db.record_telegram_message(
+                "incoming", message.get("message_id"),
+                safe_labels.get(waiter.kind, "[Verification response received]"),
+                "photo" if message.get("photo") else "text",
+                (message.get("reply_to_message") or {}).get("message_id"))
+        except Exception:
+            logger.exception("Could not journal Telegram verification response")
         waiter.response = response.strip()
         waiter.event.set()
         if waiter.kind == "otp":

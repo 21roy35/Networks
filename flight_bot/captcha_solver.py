@@ -104,6 +104,9 @@ class TwoCaptchaSolver:
         api_domain = str(challenge.get("api_domain") or "").strip()
         if api_domain in {"google.com", "recaptcha.net"}:
             task["apiDomain"] = api_domain
+        data_s = str(challenge.get("data_s") or "").strip()
+        if data_s:
+            task["recaptchaDataSValue"] = data_s
 
         return self._solve_task(task, ("gRecaptchaResponse", "token"))
 

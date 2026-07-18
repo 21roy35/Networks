@@ -42,6 +42,7 @@ _AI_HANDLER: Callable[[dict], dict | None] | None = None
 _CAPTCHA_SOLVER: Callable[[dict], dict | None] | None = None
 _AI_MAX_ATTEMPTS = 3
 _MAX_CAPTCHA_ROUNDS = 20
+_MAX_CAPTCHA_SUBMIT_RETRIES = 2
 _CHROME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -385,6 +386,63 @@ def _select(page, labels: list[str], choices: list[str],
     return False
 
 
+def _material_selection_state(page, labels: list[str]) -> bool | None:
+    """Return whether a matching Material field has a displayed value."""
+    try:
+        fields = page.locator("mat-form-field").all()
+    except Exception:
+        return None
+    for field in fields:
+        try:
+            if not field.is_visible():
+                continue
+            label = field.locator("mat-label")
+            label_text = (label.first.inner_text() if label.count()
+                          else field.get_attribute("aria-label") or "")
+            if not any(re.search(pattern, label_text, re.I)
+                       for pattern in labels):
+                continue
+            select = field.locator("mat-select")
+            if _visible(select):
+                value = select.first.locator(
+                    ".mat-mdc-select-value-text, .mat-select-value-text, "
+                    ".mat-mdc-select-min-line").first
+                if value.count():
+                    return bool(re.sub(r"\s+", " ", value.inner_text()).strip())
+                return bool(re.sub(
+                    r"\s+", " ", select.first.inner_text()).strip())
+            autocomplete = field.locator("input:not([type=hidden])")
+            if _visible(autocomplete):
+                return bool(str(autocomplete.first.input_value() or "").strip())
+            return None
+        except Exception:
+            continue
+    return None
+
+
+def _ensure_saudia_selection(page, field_name: str, labels: list[str],
+                              choices: list[str], queries: list[str],
+                              update) -> None:
+    """Set and verify a required Saudia profile dropdown without guessing."""
+    for attempt in range(3):
+        state = _material_selection_state(page, labels)
+        if state is True:
+            return
+        selected = _select(page, labels, choices, queries=queries)
+        state = _material_selection_state(page, labels)
+        if selected and state is not False:
+            return
+        if attempt < 2:
+            update(
+                "filling",
+                f"Saudia has not retained {field_name} yet. Retrying that saved value…")
+            _dismiss_feedback_overlay(page)
+            page.wait_for_timeout(650)
+    raise RuntimeError(
+        f"Saudia's production form did not retain the saved {field_name}; "
+        "nothing was submitted.")
+
+
 def _choose_yes(page, labels: list[str]) -> bool:
     for label in labels:
         group = page.get_by_label(re.compile(label, re.I))
@@ -495,32 +553,107 @@ def _captcha_completed(page) -> bool:
     return False
 
 
+def _verification_expired(page) -> bool:
+    """Detect a CAPTCHA token that the portal has explicitly rejected."""
+    return bool(re.search(
+        r"verification\s+(?:has\s+)?expired|captcha\s+(?:has\s+)?expired|"
+        r"check\s+the\s+(?:captcha\s+)?checkbox\s+again|"
+        r"(?:re-?captcha|captcha).{0,60}(?:expired|timed?\s*out)",
+        _body_text(page)[:5000], re.I))
+
+
+def _reset_recaptcha(page) -> None:
+    """Clear a consumed/expired token and refresh the rendered widget."""
+    try:
+        page.evaluate("""() => {
+            for (const field of document.querySelectorAll(
+                    "textarea[name='g-recaptcha-response'], " +
+                    "input[name='g-recaptcha-response']")) {
+                const proto = field instanceof HTMLTextAreaElement
+                    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+                if (setter) setter.call(field, ""); else field.value = "";
+                field.textContent = "";
+                field.dispatchEvent(new Event("input", {bubbles: true}));
+                field.dispatchEvent(new Event("change", {bubbles: true}));
+            }
+            try { window.grecaptcha?.reset(); } catch (_) {}
+        }""")
+    except Exception:
+        logger.debug("Could not explicitly reset reCAPTCHA", exc_info=True)
+
+
 def _recaptcha_challenge(page) -> dict | None:
-    for frame in getattr(page, "frames", []):
+    candidates = []
+    for position, frame in enumerate(getattr(page, "frames", [])):
         raw_url = str(getattr(frame, "url", ""))
         parsed = urlparse(raw_url)
-        if "recaptcha" not in raw_url or "anchor" not in parsed.path:
+        if "recaptcha" not in raw_url:
             continue
         params = parse_qs(parsed.query)
         site_key = (params.get("k") or [""])[0].strip()
         if not site_key:
             continue
+        # A persistent browser profile can retain a hidden placeholder iframe.
+        # Prefer the live checkbox and only use another keyed frame as fallback.
+        score = 1 if "anchor" in parsed.path else 0
+        try:
+            anchor = frame.locator("#recaptcha-anchor")
+            if anchor.count():
+                score += 2
+                if anchor.first.is_visible():
+                    score += 4
+        except Exception:
+            pass
+        data_s = (params.get("s") or [""])[0].strip()
+        candidates.append((score, -position, parsed, params, site_key, data_s))
+    if not candidates:
+        # Angular can expose its site key before Google's iframe is attached.
+        try:
+            widget = page.locator(
+                ".g-recaptcha[data-sitekey], [data-sitekey]").first
+            site_key = str(widget.get_attribute("data-sitekey") or "").strip()
+            data_s = str(widget.get_attribute("data-s") or "").strip()
+        except Exception:
+            site_key = ""
+            data_s = ""
+        if not site_key:
+            return None
         try:
             user_agent = str(page.evaluate("navigator.userAgent") or "")
         except Exception:
             user_agent = _CHROME_USER_AGENT
-        return {
+        challenge = {
             "kind": "recaptcha",
             "website_url": page.url,
             "site_key": site_key,
-            "is_invisible": (params.get("size") or [""])[0] == "invisible",
-            "is_enterprise": "/enterprise/" in parsed.path,
+            "is_invisible": False,
+            "is_enterprise": False,
             "user_agent": user_agent,
-            "api_domain": ("recaptcha.net"
-                           if (parsed.hostname or "").endswith("recaptcha.net")
-                           else "google.com"),
+            "api_domain": "google.com",
         }
-    return None
+        if data_s:
+            challenge["data_s"] = data_s
+        return challenge
+    _score, _position, parsed, params, site_key, data_s = max(candidates)
+    try:
+        user_agent = str(page.evaluate("navigator.userAgent") or "")
+    except Exception:
+        user_agent = _CHROME_USER_AGENT
+    challenge = {
+        "kind": "recaptcha",
+        "website_url": page.url,
+        "site_key": site_key,
+        "is_invisible": (params.get("size") or [""])[0] == "invisible",
+        "is_enterprise": "/enterprise/" in parsed.path,
+        "user_agent": user_agent,
+        "api_domain": ("recaptcha.net"
+                       if (parsed.hostname or "").endswith("recaptcha.net")
+                       else "google.com"),
+    }
+    if data_s:
+        challenge["data_s"] = data_s
+    return challenge
 
 
 def _hcaptcha_challenge(page) -> dict | None:
@@ -709,19 +842,30 @@ def _inject_hcaptcha_token(page, token: str) -> bool:
 def _solve_recaptcha_automatically(page, update) -> bool:
     if not _CAPTCHA_SOLVER:
         return False
-    challenge = _recaptcha_challenge(page)
+    challenge = None
+    for attempt in range(4):
+        challenge = _recaptcha_challenge(page)
+        if challenge:
+            break
+        if attempt < 3:
+            page.wait_for_timeout(500)
     if not challenge:
+        logger.warning("2Captcha skipped: no current reCAPTCHA site key was found")
         return False
     update("verification", "2Captcha is solving the reCAPTCHA automatically…")
     try:
         result = _CAPTCHA_SOLVER(challenge) or {}
     except Exception:
+        logger.exception("Automatic reCAPTCHA solving failed")
         return False
     token = str(result.get("token") or "").strip()
     if not token or not _inject_recaptcha_token(page, token):
+        logger.warning("2Captcha returned a token that the page could not apply")
         return False
-    page.wait_for_timeout(1500)
-    update("filling", "2Captcha verification applied. Continuing automatically…")
+    page.wait_for_timeout(500)
+    update(
+        "filling",
+        "2Captcha returned a token. Validating it with the official portal now…")
     return True
 
 
@@ -795,7 +939,7 @@ def _portal_elements(page) -> list[dict]:
     """Return visible control metadata without passwords or entered values."""
     try:
         controls = page.locator(
-            "input:not([type=hidden]), textarea, select, button, "
+            "input:not([type=hidden]), textarea, select, mat-select, button, "
             "a[role='button'], input[type='submit']")
         count = min(controls.count(), 80)
     except Exception:
@@ -820,7 +964,7 @@ def _portal_elements(page) -> list[dict]:
                     id: el.id || '',
                     placeholder: el.getAttribute('placeholder') || '',
                     aria_label: el.getAttribute('aria-label') || '',
-                    text: ['button', 'a'].includes(el.tagName.toLowerCase())
+                    text: ['button', 'a', 'mat-select'].includes(el.tagName.toLowerCase())
                         ? (el.innerText || '').trim().slice(0, 180) : '',
                     required: !!el.required,
                     invalid: !!el.validationMessage,
@@ -909,8 +1053,13 @@ def _apply_ai_decision(page, decision: dict | None, payload: dict,
         if value not in allowed:
             return False, False
         labels = [re.escape(target)]
-        changed = (_fill(page, labels, value) if action == "fill"
-                   else _select(page, labels, [re.escape(value)]))
+        if action == "fill":
+            changed = _fill(page, labels, value)
+        elif re.search(r"nationality", target, re.I):
+            choices, queries = _nationality_selection(value)
+            changed = _select(page, labels, choices, queries=queries)
+        else:
+            changed = _select(page, labels, [re.escape(value)])
         if changed:
             update("filling", f"Ghala-200 safely completed {target} from stored trip data.")
         return changed, False
@@ -1240,12 +1389,17 @@ def _approve_declaration(page, update) -> bool:
     return True
 
 
-def _wait_for_human_step(page, update, timeout_seconds: int = 600) -> bool:
+def _wait_for_human_step(page, update, timeout_seconds: int = 600,
+                         defer_captcha: bool = False) -> bool:
     message = _needs_human_step(page)
     if not message:
         return True
-    update("verification", message)
     captcha_kind = _pending_captcha_kind(page)
+    # Required-field repair can be slow enough to age a valid CAPTCHA token.
+    # Defer it until those checks are finished so the token is fresh at submit.
+    if captcha_kind and defer_captcha:
+        return True
+    update("verification", message)
     if _VERIFICATION_HANDLER and _solve_otp(page, update):
         pass
     elif _VERIFICATION_HANDLER and _solve_text_captcha(page, update):
@@ -1582,11 +1736,8 @@ def _fill_common(page, payload: dict):
           payload["description"])
     _select(page, ["title"], [re.escape(payload.get("title") or "")])
     nationality = str(payload.get("nationality") or "").strip()
-    nationality_choices = [re.escape(nationality)]
-    nationality_queries = [nationality]
-    if re.fullmatch(r"saudi(?: arabia| arabian)?", nationality, re.I):
-        nationality_choices = [r"^saudi(?: arabia| arabian)?$"]
-        nationality_queries = ["Saudi"]
+    nationality_choices, nationality_queries = _nationality_selection(
+        nationality)
     _select(page, ["nationality"], nationality_choices,
             queries=nationality_queries)
     country_code = str(payload.get("country_code") or "").strip()
@@ -1610,6 +1761,17 @@ def _fill_common(page, payload: dict):
                 break
             except Exception:
                 continue
+
+
+def _nationality_selection(nationality: str) -> tuple[list[str], list[str]]:
+    """Map stored English/Arabic Saudi labels to Saudia's English dropdown."""
+    nationality = str(nationality or "").strip()
+    if re.fullmatch(
+            r"saudi(?: arabia| arabian)?|saudi\s+arabia|"
+            r"(?:المملكة\s+العربية\s+السعودية|السعودية|سعودي|سعودية)",
+            nationality, re.I):
+        return [r"^saudi(?: arabia| arabian)?$"], ["Saudi"]
+    return [re.escape(nationality)], [nationality]
 
 
 def _saudia_complaint_category(payload: dict) -> str:
@@ -1709,6 +1871,23 @@ def _prepare_saudia(page, payload: dict, update):
             "details on the production form.",
             _page_screenshot(page))
     _fill_common(page, payload)
+    nationality = str(payload.get("nationality") or "").strip()
+    nationality_choices, nationality_queries = _nationality_selection(
+        nationality)
+    _ensure_saudia_selection(
+        page, "nationality", ["nationality"], nationality_choices,
+        nationality_queries, update)
+
+    country_code = str(payload.get("country_code") or "").strip()
+    country_choices = [re.escape(country_code)]
+    country_queries = [country_code.lstrip("+")]
+    if country_code.replace(" ", "") in {"966", "+966"}:
+        country_choices.append(r"saudi arabia")
+        country_queries.append("Saudi")
+    _ensure_saudia_selection(
+        page, "phone country code",
+        ["country code", "country or territory code"], country_choices,
+        country_queries, update)
     category = _saudia_complaint_category(payload)
     if not _select(page, [r"^complaint\s*\*?$"], [
             rf"^{re.escape(category)}$"]):
@@ -1998,6 +2177,36 @@ def _submission_reference(body) -> str:
     return ""
 
 
+def _submission_error_detail(capture: dict | None) -> str:
+    """Extract portal-provided validation messages without echoing form data."""
+    if not capture:
+        return ""
+    body = capture.get("json")
+    messages = []
+
+    def visit(value, key: str = "", depth: int = 0):
+        if depth > 5 or len(messages) >= 6:
+            return
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                visit(child, str(child_key), depth + 1)
+        elif isinstance(value, list):
+            for child in value[:10]:
+                visit(child, key, depth + 1)
+        elif (isinstance(value, (str, int, float))
+              and re.search(r"error|message|reason|detail|validation", key, re.I)):
+            text = re.sub(r"\s+", " ", str(value)).strip()
+            if 2 < len(text) <= 300:
+                messages.append(text)
+
+    visit(body)
+    if not messages and capture.get("text"):
+        text = re.sub(r"\s+", " ", str(capture["text"])).strip()
+        if text and not text.startswith("<"):
+            messages.append(text[:300])
+    return "; ".join(dict.fromkeys(messages))[:600]
+
+
 def _saudia_submission_result(capture: dict | None) -> PortalResult | None:
     """Interpret Saudia's production submission response conservatively."""
     if not capture or not capture.get("seen"):
@@ -2009,10 +2218,23 @@ def _saudia_submission_result(capture: dict | None) -> PortalResult | None:
     body = capture.get("json")
     data = body.get("data") if isinstance(body, dict) else None
     if not 200 <= status < 300 or not data:
+        detail = _submission_error_detail(capture)
+        logger.warning(
+            "Saudia submission rejected status=%s detail=%s",
+            status, detail or "not provided")
+        if re.search(
+                r"(?:captcha|verification).{0,80}"
+                r"(?:expired|invalid|required|failed|missing)", detail, re.I):
+            return PortalResult(
+                "verification_expired",
+                "Saudia rejected the current verification token. A fresh token "
+                "and safe resubmission are required.")
+        suffix = f" Portal response: {detail}" if detail else ""
         return PortalResult(
             "error",
             "Saudia's production submission service did not accept the "
-            "complaint. It is recorded as failed and may be retried safely.")
+            "complaint. It is recorded as failed and may be retried safely."
+            + suffix)
     reference = _submission_reference(body)
     if reference:
         return PortalResult(
@@ -2048,18 +2270,35 @@ def _await_confirmation(page, before_url: str, update,
                         before_text: str = "",
                         payload: dict | None = None,
                         timeout_seconds: int = 120,
-                        submission_capture: dict | None = None) -> PortalResult:
+                        submission_capture: dict | None = None,
+                        ignore_initial_expiry: bool = False) -> PortalResult:
     started = time.monotonic()
     deadline = started + timeout_seconds
     waiting_reported = False
     while time.monotonic() < deadline:
+        is_saudia = bool(payload and payload.get("airline_code") == "SV")
+        if (is_saudia and _verification_expired(page)
+                and not (ignore_initial_expiry
+                         and time.monotonic() - started < 2)):
+            return PortalResult(
+                "verification_expired",
+                "Saudia expired the verification token before accepting the "
+                "complaint. A fresh verification and submit attempt are required.")
         saudia_result = _saudia_submission_result(submission_capture)
         if saudia_result:
-            update(
-                saudia_result.status,
-                saudia_result.message,
-                _page_screenshot(page) if not page.is_closed() else None)
-            return saudia_result
+            if saudia_result.status == "verification_expired":
+                return saudia_result
+            # Give Angular a brief opportunity to render the specific validation
+            # error before classifying a generic rejected API response.
+            if not (saudia_result.status == "error"
+                    and time.monotonic() - started < 2):
+                if is_saudia and saudia_result.status == "error":
+                    return saudia_result
+                update(
+                    saudia_result.status,
+                    saudia_result.message,
+                    _page_screenshot(page) if not page.is_closed() else None)
+                return saudia_result
         if page.is_closed():
             if payload and payload.get("airline_code") == "SV":
                 return PortalResult(
@@ -2107,6 +2346,12 @@ def _await_confirmation(page, before_url: str, update,
                 "submitted", "Submitted through the official website.", reference)
         human = _needs_human_step(page)
         if human:
+            if (is_saudia and _pending_captcha_kind(page)
+                    and time.monotonic() - started >= 2):
+                return PortalResult(
+                    "verification_expired",
+                    "Saudia requires a fresh verification before the complaint "
+                    "can be submitted again.")
             update("verification", human)
             if _VERIFICATION_HANDLER and _wait_for_human_step(page, update):
                 update("submitting", "Verification complete. Waiting for confirmation…")
@@ -2128,6 +2373,105 @@ def _await_confirmation(page, before_url: str, update,
         "confirmation_unknown",
         "The complaint was sent once, but the official portal did not expose "
         "a readable confirmation. FlightDeck will not submit it again.")
+
+
+def _submit_with_captcha_recovery(page, payload: dict, update) -> PortalResult:
+    """Submit once, but safely reacquire an expired CAPTCHA token when needed."""
+    is_saudia = payload.get("airline_code") == "SV"
+    submission_capture = {} if is_saudia else None
+    if submission_capture is not None:
+        page.on(
+            "response",
+            lambda response: _capture_saudia_response(
+                response, submission_capture))
+    attempts = 1 + (_MAX_CAPTCHA_SUBMIT_RETRIES if is_saudia else 0)
+    for attempt in range(attempts):
+        if attempt:
+            _reset_recaptcha(page)
+            page.wait_for_timeout(700)
+        if not _wait_for_human_step(page, update):
+            return PortalResult(
+                "needs_attention",
+                "The final CAPTCHA or verification was not completed, so the "
+                "complaint was not submitted.")
+
+        had_expired_message = _verification_expired(page) if is_saudia else False
+        before_text = _body_text(page)
+        before_url = page.url
+        if submission_capture is not None:
+            submission_capture.clear()
+        update(
+            "submitting",
+            ("Verification is fresh. Submitting to the official website now…"
+             if attempt else
+             "Finished the form checks. Submitting to the official website now…"),
+            _page_screenshot(page))
+        clicked = _click(page, [
+            "Submit", "Send", "File complaint", "Submit request",
+            "إرسال", "تقديم"])
+        if not clicked:
+            if _VERIFICATION_HANDLER:
+                response = _ask_verification(
+                    "approval",
+                    "The official site changed its final button. Review the "
+                    "screenshot and tap Submit to continue from Telegram.",
+                    page, choices=["Submit", "Cancel"])
+                if str(response or "").lower() == "cancel":
+                    return PortalResult(
+                        "needs_attention",
+                        "Portal submission was cancelled in Telegram.")
+                clicked = (str(response or "").lower() == "submit"
+                           and _submit_fallback(page))
+            if not clicked:
+                return PortalResult(
+                    "needs_attention",
+                    "The official site changed its final Submit control and no "
+                    "complaint was sent.")
+
+        result = _await_confirmation(
+            page, before_url, update, before_text, payload,
+            submission_capture=submission_capture,
+            ignore_initial_expiry=had_expired_message)
+        if (result.status == "error" and is_saudia
+                and attempt + 1 < attempts):
+            changed, cancelled = _resolve_invalid_fields(page, update, payload)
+            if cancelled:
+                return PortalResult(
+                    "needs_attention", "Portal input was cancelled in Telegram.")
+            if not changed and _AI_HANDLER:
+                decision = _ask_ai(
+                    page, payload,
+                    "Saudia rejected the production request. Diagnose the visible "
+                    "validation state and choose one safe corrective action. "
+                    f"Response: {_submission_error_detail(submission_capture) or 'none'}")
+                action = str((decision or {}).get("action") or "").lower()
+                handled, cancelled = _apply_ai_decision(
+                    page, decision, payload, update)
+                if cancelled:
+                    return PortalResult(
+                        "needs_attention", "Portal recovery was cancelled in Telegram.")
+                changed = handled and action in {"fill", "select", "click"}
+            if changed:
+                update(
+                    "filling",
+                    "The rejected form exposed a correctable field. It was restored "
+                    "from saved data; refreshing verification before one safe retry…",
+                    _page_screenshot(page))
+                continue
+        if result.status != "verification_expired":
+            return result
+        if attempt + 1 >= attempts:
+            return PortalResult(
+                "error",
+                "Saudia expired verification repeatedly. The complaint was not "
+                "accepted after three safe attempts and can be retried later.")
+        update(
+            "verification",
+            f"Saudia expired verification before accepting the complaint. "
+            f"Refreshing it with 2Captcha and retrying automatically "
+            f"({attempt + 1}/{_MAX_CAPTCHA_SUBMIT_RETRIES})…",
+            _page_screenshot(page))
+    return PortalResult("error", "The portal submission did not complete.")
 
 
 def submit_portal_claim(payload: dict, update: Callable[..., None]) -> PortalResult:
@@ -2196,7 +2540,7 @@ def submit_portal_claim(payload: dict, update: Callable[..., None]) -> PortalRes
                 "reviewing",
                 "Finished filling the known details. Checking verification and required fields.",
                 _page_screenshot(page))
-            if not _wait_for_human_step(page, update):
+            if not _wait_for_human_step(page, update, defer_captcha=True):
                 return PortalResult(
                     "needs_attention",
                     "Login or verification was not completed before the portal timed out.")
@@ -2204,48 +2548,10 @@ def submit_portal_claim(payload: dict, update: Callable[..., None]) -> PortalRes
             if cancelled:
                 return PortalResult(
                     "needs_attention", "Portal input was cancelled in Telegram.")
-            # Resolving a required field can mount or refresh the final CAPTCHA.
-            # Re-check the rendered frames immediately before the one authorized
-            # submit click so an unchecked widget can never be mistaken for a
-            # completed form.
-            page.wait_for_timeout(1200)
-            if not _wait_for_human_step(page, update):
-                return PortalResult(
-                    "needs_attention",
-                    "The final CAPTCHA or verification was not completed, so "
-                    "the complaint was not submitted.")
-            update(
-                "submitting",
-                "Finished the form checks. Submitting to the official website now…",
-                _page_screenshot(page))
-            before_text = _body_text(page)
-            before_url = page.url
-            submission_capture = None
-            if code == "SV":
-                submission_capture = {}
-                page.on(
-                    "response",
-                    lambda response: _capture_saudia_response(
-                        response, submission_capture))
-            if not _click(page, ["Submit", "Send", "File complaint",
-                                 "Submit request", "إرسال", "تقديم"]):
-                if _VERIFICATION_HANDLER:
-                    response = _ask_verification(
-                        "approval",
-                        "The official site changed its final button. Review the screenshot and tap Submit to continue from Telegram.",
-                        page, choices=["Submit", "Cancel"])
-                    if str(response or "").lower() == "cancel":
-                        return PortalResult(
-                            "needs_attention", "Portal submission was cancelled in Telegram.")
-                    if str(response or "").lower() == "submit":
-                        _submit_fallback(page)
-                update("verification", "The official site changed its final control. Telegram assistance is active while confirmation is tracked.")
-                return _await_confirmation(
-                    page, before_url, update, before_text, payload,
-                    submission_capture=submission_capture)
-            return _await_confirmation(
-                page, before_url, update, before_text, payload,
-                submission_capture=submission_capture)
+            # Mount the final widget, solve it once all slower field work is done,
+            # and submit while the resulting token is still fresh.
+            page.wait_for_timeout(500)
+            return _submit_with_captcha_recovery(page, payload, update)
         finally:
             context.close()
 

@@ -267,6 +267,7 @@ def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
     departure = effective(flight, "departure") or ""
     return {
         "kind": kind,
+        "flight_key": flight.get("flight_key") or "",
         "airline_code": flight.get("airline_code") or "",
         "airline_name": flight.get("airline_name")
                         or flight.get("airline_code") or "",

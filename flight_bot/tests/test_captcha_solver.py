@@ -51,6 +51,8 @@ def test_2captcha_creates_polls_and_returns_recaptcha_token():
         "user_agent": "Modern Browser",
         "api_domain": "recaptcha.net",
         "is_invisible": False,
+        "is_enterprise": True,
+        "data_s": "dynamic-enterprise-value",
     })
 
     assert result == {
@@ -59,12 +61,13 @@ def test_2captcha_creates_polls_and_returns_recaptcha_token():
     create = session.requests[0][1]
     assert create["clientKey"] == "test-key"
     assert create["task"] == {
-        "type": "RecaptchaV2TaskProxyless",
+        "type": "RecaptchaV2EnterpriseTaskProxyless",
         "websiteURL": "https://www.saudia.com/form",
         "websiteKey": "site-key",
         "isInvisible": False,
         "userAgent": "Modern Browser",
         "apiDomain": "recaptcha.net",
+        "recaptchaDataSValue": "dynamic-enterprise-value",
     }
     assert session.requests[1][1]["taskId"] == 12345
 
