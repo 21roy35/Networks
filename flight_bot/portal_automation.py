@@ -1399,7 +1399,11 @@ def _wait_for_human_step(page, update, timeout_seconds: int = 600,
     # Defer it until those checks are finished so the token is fresh at submit.
     if captcha_kind and defer_captcha:
         return True
-    update("verification", message)
+    # When an automatic solver is available, do not tell the user to solve it.
+    # The solver's next update explains that 2Captcha is working; Telegram is
+    # mentioned only if that attempt actually fails and fallback is required.
+    if not (captcha_kind and _CAPTCHA_SOLVER):
+        update("verification", message)
     if _VERIFICATION_HANDLER and _solve_otp(page, update):
         pass
     elif _VERIFICATION_HANDLER and _solve_text_captcha(page, update):

@@ -831,6 +831,8 @@ def test_2captcha_failure_falls_back_to_telegram_grid(monkeypatch):
     assert manual == [True]
     assert any("Falling back to Telegram" in message
                for _stage, message in updates)
+    assert not any(message == "Solve the CAPTCHA challenge."
+                   for _stage, message in updates)
 
 
 def test_solved_recaptcha_widget_is_not_reported_as_pending_step():

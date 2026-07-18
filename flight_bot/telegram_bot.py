@@ -318,8 +318,7 @@ class TelegramCoordinator:
             key = (status, message)
             previous = state["stage"]
             if (key == state["key"]
-                    or (status in terminal and previous == status)
-                    or (status == previous and not image)):
+                    or (status in terminal and previous == status)):
                 return
             current_label = labels.get(status, status.replace("_", " "))
             if status == "submitted":

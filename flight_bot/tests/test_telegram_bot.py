@@ -198,6 +198,21 @@ def test_portal_progress_reports_stage_transitions_with_screenshots(coordinator)
     assert len(api.photos) == 2
 
 
+def test_portal_progress_keeps_changed_updates_within_same_stage(coordinator):
+    bot, api = coordinator
+    relay = bot.portal_progress_handler()
+    relay("verification", "2Captcha is solving automatically.")
+    relay("verification", "2Captcha returned a token; validating it now.")
+    relay("submitted", "Submission confirmed.")
+    deadline = time.time() + 2
+    while len(api.messages) < 3 and time.time() < deadline:
+        time.sleep(.01)
+
+    texts = [item["text"] for item in api.messages]
+    assert any("2Captcha is solving automatically" in item for item in texts)
+    assert any("returned a token" in item for item in texts)
+
+
 def test_due_flight_gets_one_telegram_survey(coordinator):
     bot, api = coordinator
     assert load_demo(log=lambda *_args, **_kwargs: None) == 3
