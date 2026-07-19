@@ -2193,6 +2193,8 @@ def _prepare_gaca(page, payload: dict, update):
 
     update("filling", "GACA step 3 of 4: selecting the complaint category…")
     main, sub, detail = _gaca_categories(payload)
+    payload["selected_complaint_category"] = " › ".join(
+        value for value in (main, sub, detail) if value)
     _select(page, [r"^main category"], [rf"^{re.escape(main)}$"])
     page.wait_for_timeout(450)
     if sub:

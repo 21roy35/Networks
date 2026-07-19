@@ -1116,7 +1116,9 @@ def test_short_ai_follow_up_reuses_last_exact_complaint_not_another_case(
     db.add_complaint(
         flights[0]["flight_key"], "airline", None, "First", "submitted",
         reference="C_8000001", details="First issue",
-        attachments=[str(first_photo)])
+        attachments=[str(first_photo)],
+        submitted_text="First issue. I request compensation.",
+        portal_category="Quality of services")
     db.add_complaint(
         flights[1]["flight_key"], "airline", None, "Second", "submitted",
         reference="C_8000002", details="Second issue",
@@ -1129,12 +1131,15 @@ def test_short_ai_follow_up_reuses_last_exact_complaint_not_another_case(
     bot._send_complaint_details({
         **base, "name": "complaint_details", "reference": "C_8000001",
     })
+    detail_message = api.messages[-1]["text"]
     follow_up = bot._contextualize_ai_action({
         **base, "name": "show_evidence", "reference": "",
     }, "send its photos")
     bot._execute_ai_action(follow_up)
 
     assert follow_up["reference"] == "C_8000001"
+    assert "Portal category: Quality of services" in detail_message
+    assert "Text sent to portal: First issue. I request compensation." in detail_message
     assert len(api.photos) == 1
     assert api.photos[0]["image"] == b"first-case-photo"
 

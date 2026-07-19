@@ -1329,6 +1329,8 @@ def test_gaca_adapter_walks_all_four_steps(monkeypatch):
     assert [item[0] for item in selectize] == [
         r"country\s*code", r"flight\s*from", r"flight\s*to"]
     assert any("step 4 of 4" in message for _stage, message in updates)
+    assert payload["selected_complaint_category"] == (
+        "On Board Services › Entertainment Services › In- flight Screens")
 
 
 def test_claude_baggage_category_maps_to_saudia_quality_option():

@@ -789,6 +789,8 @@ class TelegramCoordinator:
                 "kind": complaint.get("kind") or "",
                 "status": complaint.get("status") or "",
                 "created_at": complaint.get("created_at") or "",
+                "portal_category": complaint.get("portal_category") or "",
+                "issue": _clean_excerpt(complaint.get("details") or "", 240),
                 "flight_number": self._effective_flight_value(
                     flight, "flight_number") or ", ".join(
                         flight.get("flight_numbers") or []),
@@ -978,6 +980,7 @@ class TelegramCoordinator:
                 str(value or "") for value in (
                     item.get("reference"), item.get("kind"), item.get("status"),
                     item.get("subject"), item.get("details"),
+                    item.get("portal_category"), item.get("submitted_text"),
                     self._flight_label(item.get("flight_data") or {}),
                     self._flight_passenger(item.get("flight_data") or {}),
                 )).casefold()]
@@ -1175,7 +1178,11 @@ class TelegramCoordinator:
             f"Type/status: {complaint.get('kind') or 'unknown'} / {complaint.get('status') or 'unknown'}",
             f"Flight: {self._flight_summary(flight)}",
             f"Created: {complaint.get('created_at') or 'unknown'}",
+            f"Portal category: {complaint.get('portal_category') or 'not recorded'}",
             f"Issue: {_clean_excerpt(complaint.get('details') or 'not recorded', 900)}",
+            "Text sent to portal: " + _clean_excerpt(
+                complaint.get("submitted_text") or
+                "not recorded by the older filing version", 1800),
             f"Evidence files: {len(complaint.get('attachments') or [])}",
             f"Matched airline responses: {len(responses)}",
             f"GACA auto-escalation due: {due_text}",
@@ -1797,7 +1804,8 @@ class TelegramCoordinator:
             return
         complaint_id = db.begin_complaint(
             flight_key, "airline", payload["subject"], intake.incident,
-            intake.attachments)
+            intake.attachments,
+            submitted_text=payload.get("description") or "")
         if complaint_id is None:
             existing = db.active_complaint_for_flight(flight_key, "airline")
             if existing and existing.get("status") in {
@@ -1816,17 +1824,22 @@ class TelegramCoordinator:
         db.update_survey_status(flight_key, "filing")
         self.notify(f"Filing with {payload['airline_name']} on its official website now…")
 
+        def finish_record(status: str, reference_value: str | None = None):
+            db.finish_complaint(
+                complaint_id, status, reference_value,
+                submitted_text=payload.get("description") or None,
+                portal_category=(
+                    payload.get("selected_complaint_category") or None))
+
         def complete(result: PortalResult):
             if result.status == "submitted":
-                db.finish_complaint(
-                    complaint_id, "submitted", result.reference or None)
+                finish_record("submitted", result.reference or None)
                 db.update_survey_status(flight_key, "filed")
                 reference = f" Reference: {result.reference}." if result.reference else ""
                 self.notify("Complaint submitted on the official airline portal."
                             + reference + " I’ll watch for the airline’s response.")
             elif result.status == "accepted_pending_reference":
-                db.finish_complaint(
-                    complaint_id, "accepted_pending_reference")
+                finish_record("accepted_pending_reference")
                 db.update_survey_status(flight_key, "needs_attention")
                 self.notify(
                     "Saudia accepted the complaint without returning its "
@@ -1834,13 +1847,13 @@ class TelegramCoordinator:
                     "reference is still missing after the mailbox scan, I will "
                     "ask you for the SMS in Telegram. I will not submit a duplicate.")
             elif result.status == "confirmation_unknown":
-                db.finish_complaint(complaint_id, "failed")
+                finish_record("failed")
                 db.update_survey_status(flight_key, "needs_attention")
                 self.notify(
                     "The airline did not return readable confirmation. The "
                     "attempt is recorded as failed, not submitted.")
             else:
-                db.finish_complaint(complaint_id, "failed")
+                finish_record("failed")
                 db.update_survey_status(flight_key, "needs_attention")
                 self.notify(f"Portal filing needs attention: {result.message}")
 
@@ -1898,7 +1911,8 @@ class TelegramCoordinator:
             return False
         complaint_id = db.begin_complaint(
             flight["flight_key"], "gaca", payload["subject"], incident,
-            prior.get("attachments") or [])
+            prior.get("attachments") or [],
+            submitted_text=payload.get("description") or "")
         if complaint_id is None:
             self.notify(
                 "A GACA escalation for this flight is already underway or on "
@@ -1912,19 +1926,25 @@ class TelegramCoordinator:
         else:
             self.notify("Escalating to GACA's official E-Services portal now...")
 
+        def finish_record(status: str, reference_value: str | None = None):
+            db.finish_complaint(
+                complaint_id, status, reference_value,
+                submitted_text=payload.get("description") or None,
+                portal_category=(
+                    payload.get("selected_complaint_category") or None))
+
         def complete(result: PortalResult):
             if result.status == "submitted":
-                db.finish_complaint(
-                    complaint_id, "submitted", result.reference or None)
+                finish_record("submitted", result.reference or None)
                 suffix = f" Reference: {result.reference}." if result.reference else ""
                 self.notify("GACA escalation submitted." + suffix)
             elif result.status == "confirmation_unknown":
-                db.finish_complaint(complaint_id, "failed")
+                finish_record("failed")
                 self.notify(
                     "GACA returned no readable confirmation. The escalation "
                     "attempt is recorded as failed, not submitted.")
             else:
-                db.finish_complaint(complaint_id, "needs_attention")
+                finish_record("needs_attention")
                 self.notify(f"GACA escalation needs attention: {result.message}")
 
         start_portal_job(

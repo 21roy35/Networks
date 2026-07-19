@@ -876,7 +876,8 @@ def create_app(config: dict) -> Flask:
         subject = payload["subject"]
         complaint_id = db.begin_complaint(
             flight_key, kind, subject, incident,
-            payload.get("attachments") or [])
+            payload.get("attachments") or [],
+            submitted_text=payload.get("description") or "")
         if complaint_id is None:
             existing = db.active_complaint_for_flight(flight_key, kind)
             status = (existing or {}).get("status") or "filing"
@@ -885,10 +886,16 @@ def create_app(config: dict) -> Flask:
                 "FlightDeck will not submit it again.")
             return redirect(url_for("flight_detail", flight_id=flight_id))
 
+        def finish_record(status: str, reference_value: str | None = None):
+            db.finish_complaint(
+                complaint_id, status, reference_value,
+                submitted_text=payload.get("description") or None,
+                portal_category=(
+                    payload.get("selected_complaint_category") or None))
+
         def record_result(result: PortalResult):
             if result.status == "submitted":
-                db.finish_complaint(
-                    complaint_id, "submitted", result.reference or None)
+                finish_record("submitted", result.reference or None)
                 if telegram:
                     suffix = (f" Reference: {result.reference}."
                               if result.reference else "")
@@ -896,8 +903,7 @@ def create_app(config: dict) -> Flask:
                         f"{kind.upper()} complaint submitted through the official portal."
                         + suffix)
             elif result.status == "accepted_pending_reference":
-                db.finish_complaint(
-                    complaint_id, "accepted_pending_reference")
+                finish_record("accepted_pending_reference")
                 if telegram:
                     telegram.notify(
                         f"{kind.upper()} was accepted without returning its "
@@ -905,13 +911,13 @@ def create_app(config: dict) -> Flask:
                         "reference is still missing after the mailbox scan, I will "
                         "ask for the SMS in Telegram. No duplicate will be filed.")
             elif result.status == "confirmation_unknown":
-                db.finish_complaint(complaint_id, "failed")
+                finish_record("failed")
                 if telegram:
                     telegram.notify(
                         f"{kind.upper()} returned no readable confirmation and "
                         "is recorded as failed, not submitted.")
             else:
-                db.finish_complaint(complaint_id, "failed")
+                finish_record("failed")
                 if telegram:
                     telegram.notify(
                         f"{kind.upper()} portal submission needs attention: {result.message}")

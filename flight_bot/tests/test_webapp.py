@@ -69,6 +69,7 @@ def test_official_portal_route_uses_only_the_incident(client, monkeypatch):
     def fake_start(payload, on_complete, on_update=None):
         launches.append(payload)
         launched.update(payload)
+        payload["selected_complaint_category"] = "Flight Cancellation"
         on_complete(webapp.PortalResult(
             "submitted", "Submitted.", "CASE-123456"))
         return "job-123"
@@ -96,6 +97,13 @@ def test_official_portal_route_uses_only_the_incident(client, monkeypatch):
     flight = db.get_flight(flight_id)
     assert flight["complaints"][0]["status"] == "submitted"
     assert flight["complaints"][0]["reference"] == "CASE-123456"
+    assert flight["complaints"][0]["portal_category"] == "Flight Cancellation"
+    assert flight["complaints"][0]["submitted_text"] == launched["description"]
+    detail_page = client.get(f"/flight/{flight_id}")
+    assert b"Statement entered" in detail_page.data
+    assert b"Exact text sent to portal" in detail_page.data
+    assert b"Flight Cancellation" in detail_page.data
+    assert b"had to buy a hotel room" in detail_page.data
 
     duplicate = client.post(
         f"/flight/{flight_id}/complaint/airline/submit", data={

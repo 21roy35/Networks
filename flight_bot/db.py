@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS complaints (
     subject TEXT,
     reference TEXT,
     details TEXT,
+    submitted_text TEXT,
+    portal_category TEXT,
     attachments TEXT DEFAULT '[]',
     status TEXT NOT NULL,        -- 'sent' | 'filed'
     created_at TEXT DEFAULT (datetime('now', 'localtime'))
@@ -197,6 +199,12 @@ def init_db():
         if "attachments" not in columns:
             conn.execute(
                 "ALTER TABLE complaints ADD COLUMN attachments TEXT DEFAULT '[]'")
+        if "submitted_text" not in columns:
+            conn.execute(
+                "ALTER TABLE complaints ADD COLUMN submitted_text TEXT")
+        if "portal_category" not in columns:
+            conn.execute(
+                "ALTER TABLE complaints ADD COLUMN portal_category TEXT")
         # Older builds incorrectly treated an unreadable portal confirmation
         # as a protected success. Such rows are failures and must never unlock
         # a GACA escalation or suppress a safe retry.
@@ -743,18 +751,20 @@ def delete_email(email_id: int):
 
 
 def add_complaint(flight_key: str, kind: str, to_addr: str | None,
-                  subject: str | None, status: str,
-                  reference: str | None = None,
-                  details: str | None = None,
-                  attachments: list[str] | None = None):
+                   subject: str | None, status: str,
+                   reference: str | None = None,
+                   details: str | None = None,
+                   attachments: list[str] | None = None,
+                   submitted_text: str | None = None,
+                   portal_category: str | None = None):
     with connect() as conn:
         conn.execute(
             """INSERT INTO complaints
                (flight_key, kind, to_addr, subject, status, reference, details,
-                attachments)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                 attachments, submitted_text, portal_category)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (flight_key, kind, to_addr, subject, status, reference, details,
-             json.dumps(attachments or [])))
+             json.dumps(attachments or []), submitted_text, portal_category))
 
 
 def active_complaint_for_flight(flight_key: str, kind: str) -> dict | None:
@@ -775,8 +785,10 @@ def active_complaint_for_flight(flight_key: str, kind: str) -> dict | None:
 
 
 def begin_complaint(flight_key: str, kind: str, subject: str | None,
-                    details: str | None = None,
-                    attachments: list[str] | None = None) -> int | None:
+                     details: str | None = None,
+                     attachments: list[str] | None = None,
+                     submitted_text: str | None = None,
+                     portal_category: str | None = None) -> int | None:
     """Atomically reserve one official filing per flight and destination."""
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -799,20 +811,26 @@ def begin_complaint(flight_key: str, kind: str, subject: str | None,
                 (current["id"],))
         cursor = conn.execute(
             """INSERT INTO complaints
-               (flight_key, kind, subject, status, details, attachments)
-               VALUES (?, ?, ?, 'filing', ?, ?)""",
+               (flight_key, kind, subject, status, details, attachments,
+                submitted_text, portal_category)
+               VALUES (?, ?, ?, 'filing', ?, ?, ?, ?)""",
             (flight_key, kind, subject, details,
-             json.dumps(attachments or [])))
+             json.dumps(attachments or []), submitted_text, portal_category))
         return int(cursor.lastrowid)
 
 
 def finish_complaint(complaint_id: int, status: str,
-                     reference: str | None = None) -> None:
+                     reference: str | None = None,
+                     *, submitted_text: str | None = None,
+                     portal_category: str | None = None) -> None:
     with connect() as conn:
         conn.execute(
             """UPDATE complaints SET status = ?,
-               reference = COALESCE(?, reference) WHERE id = ?""",
-            (status, reference, complaint_id))
+               reference = COALESCE(?, reference),
+               submitted_text = COALESCE(?, submitted_text),
+               portal_category = COALESCE(?, portal_category)
+               WHERE id = ?""",
+            (status, reference, submitted_text, portal_category, complaint_id))
 
 
 def complaints_for_flight(flight_key: str) -> list[dict]:
