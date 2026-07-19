@@ -219,8 +219,11 @@ def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
                  else trip_passenger or profile_name)
     parsed_first, parsed_middle, parsed_last = _names(
         profile_name or trip_passenger)
+    has_explicit_names = bool(explicit_names[0] or explicit_names[2])
     first = explicit_names[0] or parsed_first
-    middle = explicit_names[1] or parsed_middle
+    # An explicitly structured profile may intentionally have no middle name.
+    # Do not recreate one by splitting a multiword family name from full_name.
+    middle = explicit_names[1] if has_explicit_names else parsed_middle
     last = explicit_names[2] or parsed_last
     origin = effective(flight, "origin") or ""
     destination = effective(flight, "destination") or ""

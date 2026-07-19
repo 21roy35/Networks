@@ -88,6 +88,29 @@ def test_portal_vision_places_png_before_the_untrusted_page_text():
     assert content[0]["source"]["media_type"] == "image/png"
 
 
+def test_category_choice_is_constrained_to_live_portal_options():
+    result = {
+        "category": "Baggage Services",
+        "rationale": "The primary issue is delayed and damaged baggage.",
+    }
+    session = FakeSession({
+        "content": [{"type": "text", "text": json.dumps(result)}],
+    })
+    assistant = ClaudeAssistant(enabled_config(), session=session)
+    options = ["Flight Delay", "Baggage Services", "Quality of services"]
+
+    assert assistant.choose_complaint_category(
+        "My baggage arrived a day late and damaged.", options,
+        {"category": "baggage"}, {"flight_number": "SV1674"}) == result
+
+    request = session.calls[0][1]["json"]
+    schema = request["output_config"]["format"]["schema"]
+    assert schema["properties"]["category"]["enum"] == options
+    assert request["max_tokens"] == 350
+    assert "baggage problem, not a delayed-flight problem" in (
+        request["messages"][0]["content"][-1]["text"])
+
+
 def test_portal_failure_explanation_is_grounded_in_job_and_screenshot():
     result = {
         "visible_state": "The CAPTCHA checkbox is unchecked.",

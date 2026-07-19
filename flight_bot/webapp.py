@@ -1,11 +1,13 @@
 """Local Flask interface for inbox-derived flights and passenger claims."""
 
 import hashlib
+import hmac
 import json
 import math
 import re
 import secrets
 import threading
+import unicodedata
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
@@ -14,6 +16,7 @@ from flask import (Flask, Response, abort, flash, jsonify, redirect, render_temp
                    request, session, url_for)
 
 from . import db
+from .airlines import AIRLINES, airline_for_name
 from .ai_assistant import ClaudeAssistant
 from .case_strategy import recommend_case
 from .captcha_solver import TwoCaptchaSolver
@@ -27,7 +30,8 @@ from .config import (passenger_profile_key, save_passenger_profile,
 from .pipeline import (load_demo, rebuild_flights, reparse_emails,
                        scan_mailbox)
 from .portal_automation import (PortalResult, portal_job_status, set_ai_handler,
-                                set_captcha_solver, start_portal_job)
+                                set_captcha_solver, set_category_handler,
+                                start_portal_job)
 from .telegram_bot import start_telegram
 from .web_access import verify_web_token
 
@@ -35,6 +39,21 @@ _ACTIVE_PHASES = {"starting", "connecting", "searching", "fetching", "linking"}
 _scan_progress: dict = {}
 _scan_lock = threading.Lock()
 _ai_profile_lock = threading.Lock()
+
+_OTP_CONTEXT_RE = re.compile(
+    r"(?:otp|one[ -]?time(?:\s+(?:password|code))?|verification\s+code|"
+    r"authentication\s+code|security\s+code|login\s+code|passcode|"
+    r"temporary\s+(?:password|pin)|"
+    r"رمز\s*(?:التحقق|التأكيد|الدخول|المصادقة|الأمان))",
+    re.I,
+)
+_SHORT_CODE_RE = re.compile(r"(?<!\d)(\d{4,8})(?!\d)")
+_REFERENCE_RE = re.compile(
+    r"(?:(?:complaint|case|request)(?:\s+reference)?|reference)\s*"
+    r"(?:number|no\.?|id)?\s*"
+    r"(?:is\s*)?[:#-]?\s*([A-Z0-9][A-Z0-9_-]{3,79})",
+    re.I,
+)
 
 _TEMPLATES = Path(__file__).resolve().parent / "templates"
 _REQUIRED_TEMPLATES = (
@@ -45,6 +64,39 @@ _REQUIRED_TEMPLATES = (
 
 def _scan_running() -> bool:
     return _scan_progress.get("phase") in _ACTIVE_PHASES
+
+
+def _ascii_digits(value: str) -> str:
+    output = []
+    for char in value:
+        if not char.isdigit():
+            continue
+        try:
+            output.append(str(unicodedata.digit(char)))
+        except (TypeError, ValueError):
+            continue
+    return "".join(output)
+
+
+def _extract_sms_otp(body: str) -> str:
+    if not _OTP_CONTEXT_RE.search(body):
+        return ""
+    ranked = []
+    for match in _SHORT_CODE_RE.finditer(body):
+        candidate = _ascii_digits(match.group(1))
+        context = body[max(0, match.start() - 80):match.end() + 80]
+        score = (100 if _OTP_CONTEXT_RE.search(context) else 0)
+        score += 10 if len(candidate) == 4 else 0
+        ranked.append((score, candidate))
+    return max(ranked, default=(0, ""))[1]
+
+
+def _extract_sms_reference(body: str) -> str:
+    match = re.search(r"(?<![A-Z0-9])C[\s_-]*(\d{6,})(?!\d)", body, re.I)
+    if match:
+        return f"C_{match.group(1)}"
+    match = _REFERENCE_RE.search(body)
+    return match.group(1).upper() if match else ""
 
 
 def _run_scan(config: dict):
@@ -304,14 +356,18 @@ def create_app(config: dict) -> Flask:
     set_ai_handler(
         assistant.portal_decision if assistant.enabled else None,
         int(assistant.settings.get("max_portal_attempts", 3)))
+    set_category_handler(
+        getattr(assistant, "choose_complaint_category", None)
+        if assistant.enabled else None)
     captcha = TwoCaptchaSolver(config)
     set_captcha_solver(
         captcha.solve_recaptcha if captcha.enabled else None)
     telegram = start_telegram(config)
+    sms_secret = str((config.get("sms") or {}).get("ingest_secret") or "")
 
     @app.before_request
     def require_private_web_link():
-        if request.path == "/healthz" or not access_secret:
+        if request.path in {"/healthz", "/api/internal/sms"} or not access_secret:
             return None
         supplied = request.args.get("access", "")
         if supplied:
@@ -333,6 +389,109 @@ def create_app(config: dict) -> Flask:
                 "Private FlightDeck access required. Send /web to the Telegram bot for a fresh link.",
                 status=401, content_type="text/plain")
         return None
+
+    def sms_sender_email(sender: str, body: str) -> str:
+        """Map an SMS sender label to a trusted airline domain for matching."""
+        blob = f"{sender} {body}"
+        _, info = airline_for_name(blob)
+        if not info:
+            folded = re.sub(r"[^a-z0-9]", "", blob.casefold())
+            for candidate, candidate_info in AIRLINES.items():
+                aliases = {
+                    re.sub(r"[^a-z0-9]", "", candidate.casefold()),
+                    re.sub(r"[^a-z0-9]", "", candidate_info["name"].casefold()),
+                    re.sub(r"[^a-z0-9]", "", candidate_info.get("icao", "").casefold()),
+                }
+                if any(alias and alias in folded for alias in aliases):
+                    info = candidate_info
+                    break
+        if not info:
+            body_folded = body.casefold()
+            for complaint in db.list_complaints():
+                reference = str(complaint.get("reference") or "").casefold()
+                if reference and reference in body_folded:
+                    flight = complaint.get("flight_data") or {}
+                    info = AIRLINES.get(flight.get("airline_code"))
+                    break
+        domains = (info or {}).get("domains") or []
+        return f"sms@{domains[0]}" if domains else "sms@unknown.invalid"
+
+    @app.post("/api/internal/sms")
+    def ingest_sms():
+        supplied = request.headers.get("X-SMS-Secret", "")
+        if not sms_secret or not hmac.compare_digest(supplied, sms_secret):
+            abort(404)
+        value = request.get_json(silent=True)
+        if not isinstance(value, dict):
+            return jsonify(ok=False, error="JSON object required"), 400
+        body = str(value.get("text") or value.get("body") or "").strip()
+        if not body:
+            return jsonify(ok=False, error="SMS text is required"), 400
+        if len(body) > 20000:
+            return jsonify(ok=False, error="SMS text is too long"), 413
+        sender = str(value.get("sender") or "")[:250]
+        received_at = str(value.get("received_at") or "")[:100]
+        message_id = str(value.get("message_id") or "")[:250]
+        fingerprint = message_id or hashlib.sha256(
+            f"{sender.casefold()}\x1f{received_at}\x1f{body}".encode("utf-8")
+        ).hexdigest()
+        otp = _extract_sms_otp(body)
+        reference = _extract_sms_reference(body)
+        looks_distillable = bool(
+            _SHORT_CODE_RE.search(body)
+            or re.search(
+                r"otp|verification|passcode|complaint|case|request|reference|ticket",
+                body, re.I,
+            )
+        )
+        if assistant.enabled and looks_distillable and (not otp or not reference):
+            distilled = assistant.distill_sms(sender, body) or {}
+            otp = otp or str(distilled.get("otp") or "")
+            reference = reference or str(distilled.get("reference") or "")
+        if otp:
+            receipt = hmac.new(
+                sms_secret.encode("utf-8"),
+                f"{sender.casefold()}\x1f{otp}".encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            is_new = db.remember_otp_receipt(receipt)
+            if is_new and telegram:
+                telegram.notify(
+                    f"🔐 FlightDeck verification code from "
+                    f"{sender or 'unknown sender'}: {otp}\n"
+                    "The SMS body was not stored."
+                )
+            return jsonify(
+                ok=True, ignored=True, reason="otp", otp=otp,
+                duplicate=not is_new,
+            )
+        sms_id, created = db.save_sms_message({
+            "fingerprint": fingerprint, "sender": sender,
+            "received_at": received_at, "body": body,
+            "source": str(value.get("source") or "telecombot-shortcut")[:100],
+        })
+        if not created:
+            return jsonify(ok=True, duplicate=True)
+        event_id = db.save_mail_event({
+            "message_id": f"<sms-{fingerprint}@flightdeck.local>",
+            "subject": (
+                f"SMS from {sender or 'airline'}"
+                + (f" · Complaint reference: {reference}" if reference else "")
+            ),
+            "sender": sms_sender_email(sender, body),
+            "date": received_at or datetime.now().isoformat(),
+            "body": body,
+        })
+        db.link_sms_mail_event(sms_id, event_id)
+        if telegram:
+            telegram.check_complaint_responses()
+            telegram.notify(
+                f"📱 FlightDeck received an airline SMS from {sender or 'unknown sender'} "
+                "and checked it against active complaints.")
+        return jsonify(
+            ok=True, duplicate=False, mail_event_id=event_id,
+            reference=reference,
+        )
 
     @app.context_processor
     def template_context():

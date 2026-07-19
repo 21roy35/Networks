@@ -71,6 +71,28 @@ def test_payload_prefers_exact_saved_profile_names_and_alfursan_id():
     assert payload["alfursan_id"] == "30680000"
 
 
+def test_payload_preserves_primary_users_multiword_surname():
+    flight = sample_flight()
+    flight["passenger"] = "Mansour Albu Asais"
+    saved = profile()
+    saved.update({
+        "full_name": "Mansour Albu Asais",
+        "first_name": "Mansour",
+        "middle_name": "",
+        "last_name": "Albu Asais",
+    })
+
+    payload = complaint_payload(
+        flight, saved, "airline",
+        "My baggage arrived one day late and was damaged.")
+
+    assert payload["passenger_is_primary"] is True
+    assert payload["passenger_name"] == "Mansour Albu Asais"
+    assert payload["first_name"] == "Mansour"
+    assert payload["middle_name"] == ""
+    assert payload["last_name"] == "Albu Asais"
+
+
 def test_family_booking_never_inherits_primary_users_identity():
     flight = sample_flight()
     flight["passenger"] = "Muhannad Alqahtani"
@@ -1132,6 +1154,66 @@ def test_saudia_complaint_category_mapping(incident, category):
     assert portal_automation._saudia_complaint_category({
         "incident": incident, "ai_analysis": {},
     }) == category
+
+
+def test_ghala_chooses_from_actual_saudia_dropdown_options(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        portal_automation, "_CATEGORY_HANDLER",
+        lambda incident, options, analysis, flight: calls.append({
+            "incident": incident, "options": options,
+            "analysis": analysis, "flight": flight,
+        }) or {"category": "Baggage Services"})
+    payload = {
+        "incident": "My baggage arrived a day late and damaged.",
+        "ai_analysis": {"category": "baggage"},
+        "airline_code": "SV", "flight_number": "SV1674",
+        "flight_date": "2026-07-09", "origin": "AHB", "destination": "RUH",
+    }
+    options = ["Flight Delay", "Baggage Services", "Quality of services"]
+
+    assert portal_automation._choose_saudia_category(
+        payload, options) == ("Baggage Services", True)
+    assert calls[0]["options"] == options
+    assert calls[0]["analysis"] == {"category": "baggage"}
+    assert calls[0]["flight"]["flight_number"] == "SV1674"
+
+
+def test_invalid_ghala_category_falls_back_within_live_options(monkeypatch):
+    monkeypatch.setattr(
+        portal_automation, "_CATEGORY_HANDLER",
+        lambda *_args: {"category": "Invented category"})
+    category, used_ai = portal_automation._choose_saudia_category({
+        "incident": "My baggage arrived a day late and damaged.",
+        "ai_analysis": {"category": "baggage"},
+    }, ["Flight Delay", "Baggage Services", "Quality of services"])
+
+    assert category == "Baggage Services"
+    assert used_ai is False
+
+
+def test_missing_recaptcha_anchor_does_not_wait_for_attribute():
+    class MissingAnchor:
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return 0
+
+        def get_attribute(self, *_args, **_kwargs):
+            raise AssertionError("missing controls must not be awaited")
+
+    class Frame:
+        url = "https://www.google.com/recaptcha/api2/anchor?k=placeholder"
+
+        def locator(self, _selector):
+            return MissingAnchor()
+
+    class Page:
+        frames = [Frame()]
+
+    assert portal_automation._captcha_completed(Page()) is False
 
 
 def test_gaca_screen_issue_uses_exact_three_level_category():

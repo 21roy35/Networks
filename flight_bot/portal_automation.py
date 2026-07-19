@@ -39,6 +39,7 @@ _TERMINAL = {
 _BROWSER_LOCK = threading.Lock()
 _VERIFICATION_HANDLER: Callable[[dict], object] | None = None
 _AI_HANDLER: Callable[[dict], dict | None] | None = None
+_CATEGORY_HANDLER: Callable[..., dict | None] | None = None
 _CAPTCHA_SOLVER: Callable[[dict], dict | None] | None = None
 _AI_MAX_ATTEMPTS = 3
 _MAX_CAPTCHA_ROUNDS = 20
@@ -69,6 +70,12 @@ def set_ai_handler(handler: Callable[[dict], dict | None] | None,
     global _AI_HANDLER, _AI_MAX_ATTEMPTS
     _AI_HANDLER = handler
     _AI_MAX_ATTEMPTS = max(1, min(int(max_attempts or 3), 10))
+
+
+def set_category_handler(handler: Callable[..., dict | None] | None):
+    """Install Ghala's constrained category chooser for live portal options."""
+    global _CATEGORY_HANDLER
+    _CATEGORY_HANDLER = handler
 
 
 def set_captcha_solver(handler: Callable[[dict], dict | None] | None):
@@ -386,6 +393,125 @@ def _select(page, labels: list[str], choices: list[str],
     return False
 
 
+def _material_dropdown_options(page, labels: list[str]) -> list[str]:
+    """Read the exact options currently rendered by a Material dropdown."""
+    try:
+        material_fields = page.locator("mat-form-field").all()
+    except Exception:
+        return []
+    for field in material_fields:
+        opened = False
+        try:
+            if not field.is_visible():
+                continue
+            label = field.locator("mat-label")
+            label_text = (label.first.inner_text() if label.count()
+                          else field.inner_text())
+            label_text = re.sub(r"\s+", " ", label_text).strip()
+            if not any(re.search(pattern, label_text, re.I)
+                       for pattern in labels):
+                continue
+            control = field.locator("mat-select")
+            if not _visible(control):
+                continue
+            control.first.click(force=True)
+            opened = True
+            page.wait_for_timeout(250)
+            options = page.locator("mat-option, [role='option']")
+            rendered = []
+            for index in range(options.count()):
+                option = options.nth(index)
+                if not option.is_visible():
+                    continue
+                text = re.sub(r"\s+", " ", option.inner_text()).strip()
+                if text and text not in rendered:
+                    rendered.append(text)
+            return rendered
+        except Exception:
+            continue
+        finally:
+            if opened:
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+    return []
+
+
+def _choose_saudia_category(payload: dict,
+                             options: list[str]) -> tuple[str, bool]:
+    """Ask Ghala to choose an exact live option, with a bounded fallback."""
+    rendered = [" ".join(str(option or "").split()).strip()
+                for option in options]
+    rendered = list(dict.fromkeys(option for option in rendered if option))
+    if _CATEGORY_HANDLER and rendered:
+        try:
+            flight = {
+                key: payload.get(key) for key in (
+                    "airline_code", "flight_number", "flight_date",
+                    "origin", "destination")
+                if payload.get(key) not in (None, "", [])
+            }
+            decision = _CATEGORY_HANDLER(
+                str(payload.get("incident") or ""), rendered,
+                payload.get("ai_analysis") or {}, flight) or {}
+            requested = str(decision.get("category") or "").strip()
+            exact = next((option for option in rendered
+                          if option.casefold() == requested.casefold()), "")
+            if exact:
+                return exact, True
+            logger.warning(
+                "Ghala returned no valid category from the live Saudia options")
+        except Exception:
+            logger.exception("Ghala category selection failed")
+
+    text = str(payload.get("incident") or "").casefold()
+    option_patterns = []
+    if re.search(r"\b(?:bag|bags|baggage|luggage|suitcase|suitcases)\b", text):
+        # Prefer a newly exposed baggage-specific option over the historical
+        # generic Saudia fallback when Ghala is temporarily unavailable.
+        specific = next((option for option in rendered
+                         if re.search(r"bag|luggage", option, re.I)), "")
+        if specific:
+            return specific, False
+        option_patterns.append(r"quality|service")
+    elif re.search(r"\bcancel(?:led|ed|lation)?\b", text):
+        option_patterns.append(r"cancel")
+    elif re.search(r"\b(?:delay|delayed|late)\b", text):
+        option_patterns.append(r"delay")
+    preferred = _saudia_complaint_category(payload)
+    exact = next((option for option in rendered
+                  if option.casefold() == preferred.casefold()), "")
+    if exact:
+        return exact, False
+    option_patterns.extend((r"quality\s+of\s+services?", r"service"))
+    for pattern in option_patterns:
+        match = next((option for option in rendered
+                      if re.search(pattern, option, re.I)), "")
+        if match:
+            return match, False
+    return (rendered[0] if rendered else preferred), False
+
+
+def _select_saudia_complaint_category(page, payload: dict, update) -> str:
+    labels = [r"^complaint\s*\*?$"]
+    options = _material_dropdown_options(page, labels)
+    if options and _CATEGORY_HANDLER:
+        update(
+            "filling",
+            f"Ghala is choosing the best category from Saudia's "
+            f"{len(options)} current dropdown options…")
+    category, used_ai = _choose_saudia_category(payload, options)
+    if not _select(page, labels, [rf"^{re.escape(category)}$"]):
+        raise RuntimeError(
+            f"Saudia's production form did not accept the '{category}' "
+            "complaint category; nothing was submitted.")
+    payload["selected_complaint_category"] = category
+    source = "Ghala selected" if used_ai else "Selected"
+    update("filling", f"{source} Saudia category: {category}.")
+    return category
+
+
 def _material_selection_state(page, labels: list[str]) -> bool | None:
     """Return whether a matching Material field has a displayed value."""
     try:
@@ -527,14 +653,18 @@ def _captcha_completed(page) -> bool:
     for frame in getattr(page, "frames", []):
         url = str(getattr(frame, "url", ""))
         try:
-            if ("recaptcha" in url and "anchor" in url
-                    and frame.locator("#recaptcha-anchor")
-                    .get_attribute("aria-checked") == "true"):
-                return True
-            if ("hcaptcha.com" in url and "checkbox" in url
-                    and frame.locator("#checkbox")
-                    .get_attribute("aria-checked") == "true"):
-                return True
+            if "recaptcha" in url and "anchor" in url:
+                anchor = frame.locator("#recaptcha-anchor")
+                present = anchor.count() if hasattr(anchor, "count") else 1
+                if (present and anchor.get_attribute(
+                        "aria-checked") == "true"):
+                    return True
+            if "hcaptcha.com" in url and "checkbox" in url:
+                checkbox = frame.locator("#checkbox")
+                present = checkbox.count() if hasattr(checkbox, "count") else 1
+                if (present and checkbox.get_attribute(
+                        "aria-checked") == "true"):
+                    return True
         except Exception:
             continue
     for frame in getattr(page, "frames", []):
@@ -1892,12 +2022,7 @@ def _prepare_saudia(page, payload: dict, update):
         page, "phone country code",
         ["country code", "country or territory code"], country_choices,
         country_queries, update)
-    category = _saudia_complaint_category(payload)
-    if not _select(page, [r"^complaint\s*\*?$"], [
-            rf"^{re.escape(category)}$"]):
-        raise RuntimeError(
-            f"Saudia's production form did not accept the '{category}' "
-            "complaint category; nothing was submitted.")
+    _select_saudia_complaint_category(page, payload, update)
     details = page.locator("textarea[name='descriptionInfo']")
     details_control = _wait_for_any_visible(page, details, 7000)
     if details_control is not None:
