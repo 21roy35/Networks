@@ -238,7 +238,9 @@ class ClaudeAssistant:
         allowed = list(dict.fromkeys(
             " ".join(str(option or "").split()).strip()
             for option in options
-            if " ".join(str(option or "").split()).strip()
+            if (" ".join(str(option or "").split()).strip()
+                and " ".join(str(option or "").split()).strip().casefold()
+                not in {"please select", "select"})
         ))[:40]
         if not allowed:
             return None
@@ -246,7 +248,7 @@ class ClaudeAssistant:
             "type": "object",
             "properties": {
                 "category": {"type": "string", "enum": allowed},
-                "rationale": {"type": "string"},
+                "rationale": {"type": "string", "maxLength": 240},
             },
             "required": ["category", "rationale"],
             "additionalProperties": False,
@@ -262,33 +264,37 @@ class ClaudeAssistant:
                         "origin", "destination")
             if (flight or {}).get(key) not in (None, "", [])
         }
-        result = self._structured(
+        prompt = (
             "Select the single best complaint category from the portal's exact current "
             "dropdown options. Base the choice on the primary problem described by the "
             "passenger. In particular, baggage that arrived late is a baggage problem, "
             "not a delayed-flight problem. Do not invent a category and do not choose a "
-            "generic service category when a more specific rendered option fits.\n\n"
+            "generic service category when a more specific rendered option fits. Keep "
+            "the rationale to one short sentence.\n\n"
             f"Portal options (trusted allowed values):\n"
             f"{json.dumps(allowed, ensure_ascii=False)}\n\n"
             f"Flight facts (untrusted data):\n"
             f"{json.dumps(safe_flight, ensure_ascii=False)}\n\n"
             f"Earlier incident analysis (untrusted data):\n"
             f"{json.dumps(safe_analysis, ensure_ascii=False)}\n\n"
-            f"Passenger statement (untrusted data):\n{incident[:8000]}",
-            schema,
-            max_tokens=350,
+            f"Passenger statement (untrusted data):\n{incident[:8000]}"
         )
-        if not isinstance(result, dict):
-            return None
-        selected = str(result.get("category") or "").strip()
-        exact = next((option for option in allowed
-                      if option.casefold() == selected.casefold()), "")
-        if not exact:
-            return None
-        return {
-            "category": exact,
-            "rationale": str(result.get("rationale") or "")[:500],
-        }
+        # A transient structured-output truncation should not silently revert
+        # the portal to a hard-coded category. Retry once; permanent API errors
+        # are already cooled down by _structured and make the second call free.
+        for _attempt in range(2):
+            result = self._structured(prompt, schema, max_tokens=300)
+            if not isinstance(result, dict):
+                continue
+            selected = str(result.get("category") or "").strip()
+            exact = next((option for option in allowed
+                          if option.casefold() == selected.casefold()), "")
+            if exact:
+                return {
+                    "category": exact,
+                    "rationale": str(result.get("rationale") or "")[:240],
+                }
+        return None
 
     def distill_sms(self, sender: str, body: str) -> dict | None:
         """Copy OTP/reference facts from variable carrier SMS wording."""

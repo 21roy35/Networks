@@ -200,6 +200,38 @@ def test_saudia_uses_current_public_complaint_form():
         "https://booking-uat.dcloud.saudia.com/forms/contact-form")
 
 
+def test_direct_saudia_page_starts_at_first_usable_form_control(monkeypatch):
+    class Page:
+        def __init__(self):
+            self.goto_args = None
+            self.waits = []
+
+        def goto(self, url, **kwargs):
+            self.goto_args = (url, kwargs)
+
+        def get_by_label(self, _pattern):
+            return object()
+
+        def wait_for_timeout(self, value):
+            self.waits.append(value)
+
+        def wait_for_load_state(self, *_args, **_kwargs):
+            raise AssertionError("the fast path should not await DOMContentLoaded")
+
+    page = Page()
+    monkeypatch.setattr(
+        portal_automation, "_wait_for_any_visible",
+        lambda _page, _locator, timeout: object() if timeout == 15000 else None)
+    url = "https://www.saudia.com/en/forms/complaint-form"
+
+    portal_automation._open_official_page(
+        page, url, {"airline_code": "SV"})
+
+    assert page.goto_args == (
+        url, {"wait_until": "commit", "timeout": 60000})
+    assert page.waits == [500]
+
+
 def test_block_page_is_not_mistaken_for_a_form():
     class Body:
         def inner_text(self, timeout=None):

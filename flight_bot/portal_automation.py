@@ -424,7 +424,8 @@ def _material_dropdown_options(page, labels: list[str]) -> list[str]:
                 if not option.is_visible():
                     continue
                 text = re.sub(r"\s+", " ", option.inner_text()).strip()
-                if text and text not in rendered:
+                if (text and text.casefold() not in {"please select", "select"}
+                        and text not in rendered):
                     rendered.append(text)
             return rendered
         except Exception:
@@ -2603,6 +2604,28 @@ def _submit_with_captcha_recovery(page, payload: dict, update) -> PortalResult:
     return PortalResult("error", "The portal submission did not complete.")
 
 
+def _open_official_page(page, url: str, payload: dict) -> None:
+    """Open Saudia as soon as its form is usable; retain a safe load fallback."""
+    direct_saudia = (payload.get("airline_code") == "SV"
+                     and "complaint-form" in urlparse(url).path.casefold())
+    if not direct_saudia:
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(3500)
+        return
+
+    page.goto(url, wait_until="commit", timeout=60000)
+    booking = page.get_by_label(re.compile("booking reference", re.I))
+    ready = _wait_for_any_visible(page, booking, 15000)
+    if ready is None:
+        # Slow/WAF-checked loads still receive the original conservative wait.
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=45000)
+        except Exception:
+            pass
+        _wait_for_any_visible(page, booking, 6000)
+    page.wait_for_timeout(500)
+
+
 def submit_portal_claim(payload: dict, update: Callable[..., None]) -> PortalResult:
     """Open, fill and submit one official web form in the managed browser."""
     url = _official_url(payload)
@@ -2620,8 +2643,7 @@ def submit_portal_claim(payload: dict, update: Callable[..., None]) -> PortalRes
         page = context.pages[0] if context.pages else context.new_page()
         try:
             update("opening", "Opening the official website in Microsoft Edge…")
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(3500)
+            _open_official_page(page, url, payload)
             if (_request_blocked(page)
                     and payload.get("airline_code") == "SV"):
                 for attempt in range(2):

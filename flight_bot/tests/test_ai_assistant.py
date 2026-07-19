@@ -106,9 +106,38 @@ def test_category_choice_is_constrained_to_live_portal_options():
     request = session.calls[0][1]["json"]
     schema = request["output_config"]["format"]["schema"]
     assert schema["properties"]["category"]["enum"] == options
-    assert request["max_tokens"] == 350
+    assert request["max_tokens"] == 300
     assert "baggage problem, not a delayed-flight problem" in (
         request["messages"][0]["content"][-1]["text"])
+
+
+def test_category_choice_retries_one_transient_structured_output_failure():
+    class SequenceSession:
+        def __init__(self):
+            self.calls = []
+            self.responses = [
+                FakeResponse({"content": [{"type": "text", "text": "{"}]}),
+                FakeResponse({"content": [{"type": "text", "text": json.dumps({
+                    "category": "Quality of services",
+                    "rationale": "No baggage-specific option is available.",
+                })}]}),
+            ]
+
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return self.responses.pop(0)
+
+    session = SequenceSession()
+    assistant = ClaudeAssistant(enabled_config(), session=session)
+    result = assistant.choose_complaint_category(
+        "My baggage arrived damaged.",
+        ["Please Select", "Flight Delay", "Quality of services"])
+
+    assert result["category"] == "Quality of services"
+    assert len(session.calls) == 2
+    schema = session.calls[0][1]["json"]["output_config"]["format"]["schema"]
+    assert schema["properties"]["category"]["enum"] == [
+        "Flight Delay", "Quality of services"]
 
 
 def test_portal_failure_explanation_is_grounded_in_job_and_screenshot():
