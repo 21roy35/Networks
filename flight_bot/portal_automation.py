@@ -56,6 +56,19 @@ class PortalResult:
     message: str
     reference: str = ""
     retry_safe: bool = False
+    error_code: str = ""
+
+
+class GacaWafBlockedError(RuntimeError):
+    """GACA rejected the browser/network identity before final Submit."""
+
+    code = "gaca_waf_blocked"
+
+
+class GacaIdentityRateLimitError(RuntimeError):
+    """GACA temporarily rejected one passenger identity at Step 2."""
+
+    code = "gaca_identity_rate_limited"
 
 
 def set_verification_handler(handler: Callable[[dict], object] | None):
@@ -212,6 +225,7 @@ def _maybe_use_gaca_email_fallback(
             f"{result.message} The official email fallback also failed: "
             f"{delivery.error}",
             retry_safe=True,
+            error_code=result.error_code,
         )
     payload["gaca_submission_channel"] = "official_email"
     payload["gaca_email_message_id"] = delivery.message_id
@@ -228,6 +242,7 @@ def _maybe_use_gaca_email_fallback(
         "not a verified portal submission. The GACA portal job remains "
         "queued until a real regulator reference is confirmed." + recovery,
         retry_safe=True,
+        error_code=result.error_code,
     )
 
 
@@ -299,8 +314,13 @@ def _start_portal_worker(
                 result = submit_portal_claim(payload, update)
         except Exception as exc:  # pragma: no cover - final safety boundary
             logger.exception("Portal automation job %s crashed", job_id)
+            error_code = str(getattr(exc, "code", "") or "")
             result = PortalResult(
-                "error", f"Portal automation stopped: {exc}")
+                "error",
+                f"Portal automation stopped: {exc}",
+                retry_safe=bool(error_code),
+                error_code=error_code,
+            )
         result = _maybe_use_gaca_email_fallback(
             job_id, payload, result, update)
         previous_stage = state["last_stage"]
@@ -322,43 +342,29 @@ def _start_portal_worker(
                 r"GACA[\s\S]{0,160}too many submission attempts",
                 str(result.message or ""),
                 re.I,
-            ))
+            )) or result.error_code == "gaca_identity_rate_limited"
+            gaca_waf_blocked = (
+                result.error_code == "gaca_waf_blocked"
+                or (
+                    remediated_proxy
+                    and bool(re.search(
+                        r"\bWAF\b|HTTP\s*403|blocked",
+                        str(result.message or ""),
+                        re.I,
+                    ))
+                )
+            )
             gaca_form_not_ready = bool(re.search(
                 r"GACA (?:Gender|Country Code) could not be set",
                 str(result.message or ""),
                 re.I,
             ))
-            if gaca_rate_limited and remediated_proxy:
-                # GACA support treats this banner as a technical/session
-                # failure. Once the residential session is replaced, the old
-                # identity-wide circuit no longer describes the active
-                # browser. Retry only this job after a short settling period.
-                db.clear_gaca_portal_circuit()
-                raw_rotated_delay = os.environ.get(
-                    "FLIGHTBOT_GACA_ROTATED_RETRY_SECONDS", "300").strip()
-                try:
-                    rotated_delay = int(raw_rotated_delay)
-                except (TypeError, ValueError):
-                    rotated_delay = 5 * 60
-                try:
-                    consecutive_rejections = max(
-                        1, int(payload.get(
-                            "_gaca_technical_rejections") or 1))
-                except (TypeError, ValueError):
-                    consecutive_rejections = 1
-                rotated_delay *= 2 ** min(
-                    consecutive_rejections - 1, 4)
-                next_attempt = db.retry_portal_job(
-                    job_id,
-                    result.message,
-                    fixed_delay=max(90, min(rotated_delay, 60 * 60)),
-                )
-            elif gaca_rate_limited:
+            if gaca_rate_limited:
                 raw_delay = os.environ.get(
                     "FLIGHTBOT_GACA_RATE_LIMIT_SECONDS", "86400").strip()
                 raw_spacing = os.environ.get(
                     "FLIGHTBOT_GACA_RATE_LIMIT_SPACING_SECONDS",
-                    "21600",
+                    "86400",
                 ).strip()
                 try:
                     circuit_delay = int(raw_delay)
@@ -367,12 +373,34 @@ def _start_portal_worker(
                 try:
                     circuit_spacing = int(raw_spacing)
                 except (TypeError, ValueError):
-                    circuit_spacing = 6 * 3600
-                next_attempt = db.defer_gaca_portal_jobs(
+                    circuit_spacing = 24 * 3600
+                next_attempt = db.defer_gaca_identity_jobs(
                     job_id,
                     result.message,
+                    payload=payload,
                     delay=circuit_delay,
                     spacing=circuit_spacing,
+                )
+            elif gaca_waf_blocked:
+                rotated = bool(payload.get("_gaca_waf_rotated"))
+                raw_delay = os.environ.get(
+                    "FLIGHTBOT_GACA_WAF_RETRY_SECONDS",
+                    "300" if rotated else "3600",
+                ).strip()
+                try:
+                    waf_delay = int(raw_delay)
+                except (TypeError, ValueError):
+                    waf_delay = 5 * 60 if rotated else 60 * 60
+                try:
+                    consecutive_waf_blocks = max(
+                        1, int(payload.get("_gaca_waf_rejections") or 1))
+                except (TypeError, ValueError):
+                    consecutive_waf_blocks = 1
+                waf_delay *= 2 ** min(consecutive_waf_blocks - 1, 3)
+                next_attempt = db.retry_portal_job(
+                    job_id,
+                    result.message,
+                    fixed_delay=max(90, min(waf_delay, 60 * 60)),
                 )
             else:
                 next_attempt = db.retry_portal_job(
@@ -473,6 +501,24 @@ def start_portal_job(payload: dict,
     with _JOBS_LOCK:
         _JOBS[job_id] = job
     db.save_portal_job(job)
+    identity_circuit_until = db.apply_gaca_identity_circuit(job_id)
+    if identity_circuit_until > time.time():
+        refreshed = db.get_portal_job(job_id) or {}
+        with _JOBS_LOCK:
+            current = _JOBS.get(job_id)
+            if current:
+                current.update(refreshed)
+        wait_hours = max(
+            1, round((identity_circuit_until - time.time()) / 3600))
+        if on_update:
+            on_update(
+                "retry_wait",
+                "This passenger is temporarily paused by GACA's identity "
+                f"limit. The saved complaint will retry in about "
+                f"{wait_hours} hours; other passengers are unaffected.",
+                None,
+            )
+        return job_id
     claimed = db.claim_portal_job(job_id)
     if not claimed:
         raise RuntimeError("Could not lease the persisted portal job")
@@ -517,11 +563,10 @@ def _is_official_url(url: str) -> bool:
 
 
 def _attach_gaca_network_diagnostics(page) -> None:
-    """Log GACA wizard traffic only during an explicit live-debug run."""
-    enabled = os.environ.get(
-        "FLIGHTBOT_GACA_DEBUG_NETWORK", "").strip().casefold()
-    if enabled not in {"1", "true", "yes", "on"}:
-        return
+    """Capture GACA POST outcomes and optionally log safe diagnostics."""
+    debug_enabled = os.environ.get(
+        "FLIGHTBOT_GACA_DEBUG_NETWORK", "").strip().casefold() in {
+            "1", "true", "yes", "on"}
 
     def relevant(url: str) -> bool:
         value = str(url or "").casefold()
@@ -536,6 +581,11 @@ def _attach_gaca_network_diagnostics(page) -> None:
         try:
             if relevant(response.url):
                 if str(response.request.method).upper() == "POST":
+                    try:
+                        response_headers = response.headers or {}
+                    except Exception:
+                        response_headers = {}
+                    location = str(response_headers.get("location") or "")
                     setattr(
                         page,
                         "_flightdeck_gaca_last_post_status",
@@ -546,11 +596,23 @@ def _attach_gaca_network_diagnostics(page) -> None:
                         "_flightdeck_gaca_last_post_url",
                         str(response.url or ""),
                     )
+                    setattr(
+                        page,
+                        "_flightdeck_gaca_last_post_location",
+                        location,
+                    )
+                if not debug_enabled:
+                    return
                 logger.warning(
-                    "GACA network response HTTP %s %s %s",
+                    "GACA network response HTTP %s %s %s location=%s",
                     response.status,
                     response.request.method,
                     response.url,
+                    str(getattr(
+                        page,
+                        "_flightdeck_gaca_last_post_location",
+                        "",
+                    ) or ""),
                 )
                 if str(response.request.method).upper() == "POST":
                     fields = parse_qs(
@@ -609,7 +671,7 @@ def _attach_gaca_network_diagnostics(page) -> None:
 
     def on_failed(request) -> None:
         try:
-            if relevant(request.url):
+            if debug_enabled and relevant(request.url):
                 logger.warning(
                     "GACA network request failed %s %s: %s",
                     request.method,
@@ -3668,14 +3730,15 @@ def _gaca_step2_invalid_summary(page) -> str:
 
 
 def _gaca_rate_limit_abort(
-        payload: dict, page=None, update=None) -> RuntimeError:
-    """Replace a technically blocked GACA network session before retrying."""
+        payload: dict, page=None, update=None) -> GacaIdentityRateLimitError:
+    """Pause the affected passenger without rotating a healthy network."""
     if page is not None and update is not None:
         update(
             "verification",
             "GACA returned its technical “too many submission attempts” "
             "page before final Submit. Nothing was submitted; the current "
-            "page is captured before the network session is replaced.",
+            "page is captured. Only this passenger will wait 24 hours; "
+            "other passengers can continue.",
             _page_screenshot(page),
         )
     try:
@@ -3684,18 +3747,59 @@ def _gaca_rate_limit_abort(
     except (TypeError, ValueError):
         rejection_count = 1
     payload["_gaca_technical_rejections"] = min(rejection_count, 100)
+    payload["_gaca_restart_normal_browser"] = False
+    payload["_gaca_waf_rotated"] = False
+    return GacaIdentityRateLimitError(
+        "GACA reported too many submission attempts for this passenger "
+        "identity before Submit. FlightDeck will retry only this passenger "
+        "after 24 hours; other passengers remain eligible.")
+
+
+def _gaca_waf_abort(
+        payload: dict, page=None, update=None, *,
+        after_submit: bool = False) -> GacaWafBlockedError:
+    """Rotate the proxy and force a clean GACA browser after a WAF block."""
+    if page is not None and update is not None:
+        stage_message = (
+            "GACA's WAF replaced the confirmation page, so acceptance is "
+            "not verified."
+            if after_submit else
+            "GACA's WAF blocked the browser before final Submit. Nothing "
+            "was submitted."
+        )
+        update(
+            "verification",
+            f"{stage_message} The blocked page is saved before FlightDeck "
+            "changes IP and restarts a clean GACA browser.",
+            _page_screenshot(page),
+        )
+    try:
+        rejection_count = int(payload.get("_gaca_waf_rejections") or 0) + 1
+    except (TypeError, ValueError):
+        rejection_count = 1
+    payload["_gaca_waf_rejections"] = min(rejection_count, 100)
     rotated = gaca_normal_browser.rotate_proxy_session()
     payload["_gaca_restart_normal_browser"] = rotated
+    payload["_gaca_waf_rotated"] = rotated
     if rotated:
-        return RuntimeError(
-            "GACA reported too many submission attempts before Submit. "
-            "FlightDeck rotated the GACA residential proxy, cleared only "
-            "GACA's stale browser state, and will retry this one job in a "
-            "fresh normal-browser session.")
-    return RuntimeError(
-        "GACA reported too many submission attempts and requested a "
-        "waiting period before retry. Automatic GACA proxy rotation is not "
-        "configured, so FlightDeck will keep the jobs behind one cooldown.")
+        return GacaWafBlockedError(
+            "GACA's WAF rejected the browser"
+            + (
+                " after Submit without verified acceptance. "
+                if after_submit else " before Submit. "
+            )
+            + "FlightDeck "
+            "rotated the GACA residential proxy and will relaunch normal "
+            "Chrome with clean GACA cookies and storage before retrying.")
+    return GacaWafBlockedError(
+        "GACA's WAF rejected the browser"
+        + (
+            " after Submit without verified acceptance. "
+            if after_submit else " before Submit. "
+        )
+        + "Automatic proxy "
+        "rotation is not configured, so FlightDeck closed this attempt and "
+        "will retry after a longer cooldown.")
 
 
 def _gaca_dwell(page, started: float, env_name: str, default: int) -> None:
@@ -3809,61 +3913,78 @@ def _prepare_gaca(page, payload: dict, update):
                     r"too many submission attempts",
                     _body_text(page), re.I):
                 raise _gaca_rate_limit_abort(payload, page, update)
-            _select_gaca_gender(page, payload)
-            _selectize_by_label(
-                page, r"country\s*code", country_query,
-                country_choices or [r"Saudi Arabia"])
-            if _click(page, [r"^Next$"]):
+            last_post_status = int(getattr(
+                page, "_flightdeck_gaca_last_post_status", 0) or 0)
+            last_post_location = str(getattr(
+                page, "_flightdeck_gaca_last_post_location", "") or "")
+            last_post_path = urlparse(last_post_location).path.casefold()
+            if last_post_status == 403:
+                raise _gaca_waf_abort(payload, page, update)
+            if last_post_path.endswith("/step2"):
+                detail = (
+                    _gaca_step2_invalid_summary(page)
+                    or "portal redirected the identity back to step 2"
+                )
+                raise RuntimeError(
+                    "GACA rejected the personal-information step before "
+                    f"Submit ({detail}). The same POST was not repeated.")
+            if last_post_path.endswith("/step3"):
                 advanced = _wait_for_any_visible(
                     page,
-                    page.get_by_label(re.compile("main category", re.I)), 7000)
-            if advanced is None:
-                try:
-                    page.wait_for_function(
-                        """() => /too many submission attempts/i.test(
-                            document.body ? document.body.innerText : '')""",
-                        timeout=7000,
-                    )
-                except Exception:
-                    pass
-                last_post_status = int(getattr(
-                    page,
-                    "_flightdeck_gaca_last_post_status",
-                    0,
-                ) or 0)
-                if last_post_status == 403 and _request_blocked(page):
-                    rotated = gaca_normal_browser.rotate_proxy_session()
-                    payload["_gaca_restart_normal_browser"] = rotated
-                    if rotated:
-                        update(
-                            "verification",
-                            "GACA returned HTTP 403 at Step 2 before final "
-                            "Submit. Nothing was submitted; the rejection "
-                            "page is captured before the network session is "
-                            "replaced.",
-                            _page_screenshot(page),
-                        )
-                        raise RuntimeError(
-                            "GACA's WAF rejected the personal-information "
-                            "POST with HTTP 403 before Submit. FlightDeck "
-                            "rotated the GACA residential proxy and will "
-                            "relaunch normal Chrome with clean GACA state.")
+                    page.get_by_label(re.compile("main category", re.I)),
+                    10000,
+                )
+                if advanced is None:
                     raise RuntimeError(
-                        "GACA's WAF rejected the personal-information POST "
-                        "with HTTP 403 before Submit, but automatic proxy "
-                        "rotation is not configured.")
-                if re.search(
-                        r"too many submission attempts",
-                        _body_text(page), re.I):
-                    raise _gaca_rate_limit_abort(payload, page, update)
-                detail = _gaca_step2_invalid_summary(page) or "unknown required field"
-                raise RuntimeError(
-                    "GACA did not advance past personal information "
-                    f"({detail}).")
+                        "GACA accepted personal information and redirected "
+                        "to step 3, but the category controls did not finish "
+                        "loading. The identity POST was not repeated.")
+            else:
+                # If no POST response was observed, the first click may have
+                # been stopped by client-side widget state. Repair it once.
+                _select_gaca_gender(page, payload)
+                _selectize_by_label(
+                    page, r"country\s*code", country_query,
+                    country_choices or [r"Saudi Arabia"])
+                if _click(page, [r"^Next$"]):
+                    advanced = _wait_for_any_visible(
+                        page,
+                        page.get_by_label(
+                            re.compile("main category", re.I)),
+                        7000,
+                    )
+                if advanced is None:
+                    try:
+                        page.wait_for_function(
+                            """() => /too many submission attempts/i.test(
+                                document.body ? document.body.innerText : '')""",
+                            timeout=7000,
+                        )
+                    except Exception:
+                        pass
+                    last_post_status = int(getattr(
+                        page,
+                        "_flightdeck_gaca_last_post_status",
+                        0,
+                    ) or 0)
+                    if last_post_status == 403:
+                        raise _gaca_waf_abort(payload, page, update)
+                    if re.search(
+                            r"too many submission attempts",
+                            _body_text(page), re.I):
+                        raise _gaca_rate_limit_abort(payload, page, update)
+                    detail = (
+                        _gaca_step2_invalid_summary(page)
+                        or "unknown required field"
+                    )
+                    raise RuntimeError(
+                        "GACA did not advance past personal information "
+                        f"({detail}).")
 
     step3_started = time.monotonic()
     update("filling", "GACA step 3 of 4: selecting the complaint category…")
     payload["_gaca_technical_rejections"] = 0
+    payload["_gaca_waf_rejections"] = 0
     main, sub, detail = _select_gaca_category_tree(page, payload)
     payload["selected_complaint_category"] = " › ".join(
         value for value in (main, sub, detail) if value)
@@ -4489,17 +4610,13 @@ def _await_confirmation(page, before_url: str, update,
                     "service verified acceptance. The attempt is recorded as "
                     "failed, not submitted.")
             if is_gaca:
-                ai_result = _gaca_ai_submission_result(
-                    page, payload,
-                    "The visible page appears to be a security/WAF page.")
-                if ai_result:
-                    return ai_result
+                waf_error = _gaca_waf_abort(
+                    payload, page, update, after_submit=True)
                 return PortalResult(
                     "error",
-                    "GACA displayed a WAF/error page without an acceptance "
-                    "message or reference. No verified submission exists; the "
-                    "durable job will reconcile email/SMS and retry.",
+                    str(waf_error),
                     retry_safe=True,
+                    error_code=waf_error.code,
                 )
             return PortalResult(
                 "confirmation_unknown",
@@ -5044,7 +5161,9 @@ def submit_portal_claim(payload: dict, update: Callable[..., None]) -> PortalRes
                     if not _request_blocked(page):
                         break
             if _request_blocked(page):
-                site = "GACA" if payload.get("kind") == "gaca" else "official site"
+                if payload.get("kind") == "gaca":
+                    raise _gaca_waf_abort(payload, page, update)
+                site = "official site"
                 return PortalResult(
                     "needs_attention",
                     f"The {site} blocked the VPS browser request "
@@ -5070,6 +5189,8 @@ def submit_portal_claim(payload: dict, update: Callable[..., None]) -> PortalRes
                 _prepare_generic(page, payload, update)
 
             if _request_blocked(page):
+                if payload.get("kind") == "gaca":
+                    raise _gaca_waf_abort(payload, page, update)
                 return PortalResult(
                     "needs_attention",
                     "The official site blocked the VPS browser while preparing the form.")

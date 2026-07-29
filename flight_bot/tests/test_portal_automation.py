@@ -1,4 +1,5 @@
 import os
+import sqlite3
 
 import pytest
 
@@ -82,6 +83,53 @@ def test_portal_job_payload_and_retry_survive_restart(tmp_path, monkeypatch):
     assert restored["next_attempt_at"] == next_attempt
 
 
+def test_existing_database_migrates_and_backfills_gaca_identity(
+        tmp_path, monkeypatch):
+    database = tmp_path / "legacy-portal.db"
+    with sqlite3.connect(database) as conn:
+        conn.execute(
+            """CREATE TABLE portal_jobs (
+                   id TEXT PRIMARY KEY,
+                   kind TEXT,
+                   airline_code TEXT,
+                   flight_number TEXT,
+                   flight_key TEXT,
+                   complaint_id INTEGER,
+                   payload TEXT NOT NULL DEFAULT '{}',
+                   status TEXT NOT NULL,
+                   message TEXT,
+                   reference TEXT,
+                   screenshot_file TEXT,
+                   terminal INTEGER NOT NULL DEFAULT 0,
+                   attempts INTEGER NOT NULL DEFAULT 0,
+                   max_attempts INTEGER NOT NULL DEFAULT 100000,
+                   next_attempt_at REAL,
+                   lease_until REAL,
+                   last_error TEXT,
+                   created_at TEXT DEFAULT (datetime('now', 'localtime')),
+                   updated_at TEXT DEFAULT (datetime('now', 'localtime'))
+               )""")
+        conn.execute(
+            """INSERT INTO portal_jobs
+                   (id, kind, payload, status)
+               VALUES (?, 'gaca', ?, 'queued')""",
+            ("legacy-gaca", '{"kind":"gaca","national_id":"1108337526"}'),
+        )
+
+    monkeypatch.setattr(db, "DB_PATH", database)
+    db.init_db()
+
+    migrated = db.get_portal_job("legacy-gaca")
+    assert migrated["identity_key"] == db.gaca_identity_key(
+        migrated["payload"])
+    with db.connect() as conn:
+        indexes = {
+            row["name"] for row in conn.execute(
+                "PRAGMA index_list(portal_jobs)")
+        }
+    assert "idx_portal_jobs_identity_due" in indexes
+
+
 def test_complaint_lineage_keeps_immutable_original_and_child_context(
         tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "lineage.db")
@@ -156,44 +204,57 @@ def test_remediated_proxy_retry_bypasses_old_exponential_backoff(
     assert 85 <= due - before <= 95
 
 
-def test_gaca_rate_limit_defers_and_serializes_all_gaca_jobs(
+def test_gaca_rate_limit_pauses_only_matching_passenger_for_24_hours(
         tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "gaca-circuit.db")
     db.init_db()
-    for job_id, kind in (
-            ("gaca-current", "gaca"),
-            ("gaca-sibling", "gaca"),
-            ("airline-job", "airline")):
+    jobs = (
+        ("gaca-current", "gaca", "1111111111"),
+        ("gaca-same-passenger", "gaca", "1111111111"),
+        ("gaca-family-member", "gaca", "2222222222"),
+        ("airline-job", "airline", ""),
+    )
+    for job_id, kind, national_id in jobs:
         db.save_portal_job({
             "id": job_id,
             "kind": kind,
             "status": "queued",
-            "payload": {"kind": kind},
+            "payload": {
+                "kind": kind,
+                "national_id": national_id,
+                "passenger_name": job_id,
+            },
             "max_attempts": 100000,
         })
     assert db.claim_portal_job("gaca-current") is not None
     before = db.time.time()
 
-    first_due = db.defer_gaca_portal_jobs(
+    first_due = db.defer_gaca_identity_jobs(
         "gaca-current",
         "GACA reported too many submission attempts.",
         delay=24 * 3600,
-        spacing=6 * 3600,
+        spacing=24 * 3600,
     )
 
     current = db.get_portal_job("gaca-current")
-    sibling = db.get_portal_job("gaca-sibling")
+    same_passenger = db.get_portal_job("gaca-same-passenger")
+    family_member = db.get_portal_job("gaca-family-member")
     airline = db.get_portal_job("airline-job")
     assert 24 * 3600 - 5 <= first_due - before <= 24 * 3600 + 5
     assert current["status"] == "retry_wait"
     assert current["next_attempt_at"] == first_due
-    assert sibling["status"] == "retry_wait"
-    assert sibling["next_attempt_at"] == first_due + 6 * 3600
+    assert same_passenger["status"] == "retry_wait"
+    assert same_passenger["next_attempt_at"] == first_due + 24 * 3600
+    assert family_member["status"] == "queued"
     assert airline["status"] == "queued"
-    assert db.gaca_portal_circuit_until() == first_due
+    assert db.gaca_identity_circuit_until(
+        identity_key=current["identity_key"]) == first_due
+    assert set(item["id"] for item in db.list_due_portal_jobs(10)) == {
+        "gaca-family-member", "airline-job",
+    }
 
 
-def test_new_gaca_job_cannot_bypass_shared_rate_limit_circuit(
+def test_new_same_passenger_job_cannot_bypass_identity_circuit(
         tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "gaca-circuit-new.db")
     db.init_db()
@@ -201,15 +262,21 @@ def test_new_gaca_job_cannot_bypass_shared_rate_limit_circuit(
         "id": "gaca-original",
         "kind": "gaca",
         "status": "queued",
-        "payload": {"kind": "gaca"},
+        "payload": {"kind": "gaca", "national_id": "1111111111"},
     })
-    db.defer_gaca_portal_jobs(
+    db.defer_gaca_identity_jobs(
         "gaca-original", "rate limited", delay=3600, spacing=900)
     db.save_portal_job({
-        "id": "gaca-new",
+        "id": "gaca-new-same-passenger",
         "kind": "gaca",
         "status": "queued",
-        "payload": {"kind": "gaca"},
+        "payload": {"kind": "gaca", "national_id": "1111111111"},
+    })
+    db.save_portal_job({
+        "id": "gaca-family-member",
+        "kind": "gaca",
+        "status": "queued",
+        "payload": {"kind": "gaca", "national_id": "2222222222"},
     })
     db.save_portal_job({
         "id": "airline-due",
@@ -218,9 +285,16 @@ def test_new_gaca_job_cannot_bypass_shared_rate_limit_circuit(
         "payload": {"kind": "airline"},
     })
 
-    assert [item["id"] for item in db.list_due_portal_jobs(10)] == [
-        "airline-due",
-    ]
+    deadline = db.apply_gaca_identity_circuit(
+        "gaca-new-same-passenger")
+    assert deadline > db.time.time()
+    assert db.get_portal_job(
+        "gaca-new-same-passenger")["status"] == "retry_wait"
+    assert db.claim_portal_job("gaca-new-same-passenger") is None
+    assert db.apply_gaca_identity_circuit("gaca-family-member") == 0
+    assert set(item["id"] for item in db.list_due_portal_jobs(10)) == {
+        "gaca-family-member", "airline-due",
+    }
 
 
 def test_legacy_job_restores_routing_fields_before_worker(monkeypatch):
@@ -423,6 +497,81 @@ def test_gaca_rate_limit_is_identified_for_fixed_retry_delay():
     assert portal_automation._retry_minimum_delay(
         portal_automation.PortalResult(
             "error", message, retry_safe=True)) == 3600
+
+
+def test_gaca_identity_keys_isolate_relatives_sharing_contact_details():
+    mansour = {
+        "passenger_name": "Mansour Albu Asais",
+        "email": "family@example.com",
+        "phone": "+966500000000",
+    }
+    muhannad = dict(mansour, passenger_name="Muhannad Albu Asais")
+
+    assert db.gaca_identity_key({
+        "national_id": "110-833-7526",
+    }) == db.gaca_identity_key({
+        "national_id": "1108337526",
+        "passenger_name": "A differently formatted name",
+    })
+    assert db.gaca_identity_key(mansour) != db.gaca_identity_key(muhannad)
+
+
+def test_gaca_identity_limit_does_not_rotate_but_waf_does(monkeypatch):
+    rotations = []
+    monkeypatch.setattr(
+        portal_automation.gaca_normal_browser,
+        "rotate_proxy_session",
+        lambda: rotations.append("rotated") or True,
+    )
+
+    identity_payload = {}
+    identity_error = portal_automation._gaca_rate_limit_abort(
+        identity_payload)
+    assert identity_error.code == "gaca_identity_rate_limited"
+    assert rotations == []
+    assert identity_payload["_gaca_restart_normal_browser"] is False
+
+    waf_payload = {}
+    waf_error = portal_automation._gaca_waf_abort(waf_payload)
+    assert waf_error.code == "gaca_waf_blocked"
+    assert rotations == ["rotated"]
+    assert waf_payload["_gaca_restart_normal_browser"] is True
+    assert waf_payload["_gaca_waf_rotated"] is True
+
+
+def test_gaca_network_capture_records_redirect_location_without_debug(
+        monkeypatch):
+    handlers = {}
+
+    class Page:
+        def on(self, event, callback):
+            handlers[event] = callback
+
+    class Request:
+        method = "POST"
+        url = (
+            "https://myeservices.gaca.gov.sa/eservices/public/qpe/"
+            "complaint-airline/step2"
+        )
+
+    class Response:
+        request = Request()
+        url = Request.url
+        status = 302
+        headers = {
+            "location": (
+                "http://myeservices.gaca.gov.sa/eservices/public/qpe/"
+                "complaint-airline/step3"
+            )
+        }
+
+    monkeypatch.delenv("FLIGHTBOT_GACA_DEBUG_NETWORK", raising=False)
+    page = Page()
+    portal_automation._attach_gaca_network_diagnostics(page)
+    handlers["response"](Response())
+
+    assert page._flightdeck_gaca_last_post_status == 302
+    assert page._flightdeck_gaca_last_post_location.endswith("/step3")
 
 
 def test_payload_maps_incident_and_every_known_portal_field():

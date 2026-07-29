@@ -1,12 +1,51 @@
 """SQLite storage for parsed emails, linked flights and manual overrides."""
 
+import hashlib
 import json
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
 from datetime import datetime
 
 from .config import DB_PATH, passenger_profile_key
+
+
+def gaca_identity_key(payload: dict | None) -> str:
+    """Return a non-PII key for the passenger used on GACA Step 2."""
+    payload = payload if isinstance(payload, dict) else {}
+    national_id = re.sub(
+        r"[^0-9A-Za-z]", "",
+        str(
+            payload.get("national_id")
+            or payload.get("passport_number")
+            or payload.get("passport")
+            or payload.get("iqama")
+            or ""
+        ),
+    ).casefold()
+    if national_id:
+        identity = f"id:{national_id}"
+    else:
+        passenger_name = str(
+            payload.get("profile_passenger_name")
+            or payload.get("passenger_name")
+            or " ".join(filter(None, (
+                payload.get("first_name"),
+                payload.get("middle_name"),
+                payload.get("last_name"),
+            )))
+            or ""
+        )
+        name_key = passenger_profile_key(passenger_name)
+        phone = re.sub(r"\D", "", str(payload.get("phone") or ""))
+        email = str(payload.get("email") or "").strip().casefold()
+        if not any((name_key, phone, email)):
+            return ""
+        # Include the name even when relatives share a phone number or email.
+        identity = f"name:{name_key}|phone:{phone}|email:{email}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS emails (
@@ -131,6 +170,7 @@ CREATE TABLE IF NOT EXISTS telegram_messages (
 CREATE TABLE IF NOT EXISTS portal_jobs (
     id TEXT PRIMARY KEY,
     kind TEXT,
+    identity_key TEXT,
     airline_code TEXT,
     flight_number TEXT,
     flight_key TEXT,
@@ -281,6 +321,7 @@ def init_db():
         portal_migrations = {
             "complaint_id": "INTEGER REFERENCES complaints(id)",
             "payload": "TEXT NOT NULL DEFAULT '{}'",
+            "identity_key": "TEXT",
             "attempts": "INTEGER NOT NULL DEFAULT 0",
             "max_attempts": "INTEGER NOT NULL DEFAULT 100000",
             "next_attempt_at": "REAL",
@@ -291,6 +332,25 @@ def init_db():
             if name not in portal_columns:
                 conn.execute(
                     f"ALTER TABLE portal_jobs ADD COLUMN {name} {declaration}")
+        # CREATE INDEX in the base schema runs before migrations, so existing
+        # databases need the identity index after the column is added.
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_portal_jobs_identity_due
+               ON portal_jobs(kind, identity_key, status, next_attempt_at)""")
+        for row in conn.execute(
+                """SELECT id, payload FROM portal_jobs
+                   WHERE kind='gaca'
+                     AND COALESCE(identity_key, '')=''""").fetchall():
+            try:
+                stored_payload = json.loads(row["payload"] or "{}")
+            except (TypeError, ValueError):
+                stored_payload = {}
+            identity_key = gaca_identity_key(stored_payload)
+            if identity_key:
+                conn.execute(
+                    "UPDATE portal_jobs SET identity_key=? WHERE id=?",
+                    (identity_key, str(row["id"])),
+                )
         conn.execute(
             """UPDATE portal_jobs
                SET max_attempts = 100000
@@ -557,16 +617,20 @@ def initialize_fifo_response_floor() -> int:
         return latest
 
 
-_GACA_PORTAL_CIRCUIT_KEY = "gaca_portal_rate_limit_until_v1"
+_GACA_IDENTITY_CIRCUIT_PREFIX = "gaca_identity_rate_limit_until_v1:"
 
 
-def gaca_portal_circuit_until() -> float:
-    """Return the shared GACA portal cooldown deadline, if one is active."""
+def gaca_identity_circuit_until(
+        payload: dict | None = None, *, identity_key: str = "") -> float:
+    """Return the cooldown for one GACA passenger identity."""
+    key = str(identity_key or gaca_identity_key(payload)).strip()
+    if not key:
+        return 0.0
     with connect() as conn:
         row = conn.execute(
-            "SELECT state_value FROM complaint_response_state "
-            "WHERE state_key = ?",
-            (_GACA_PORTAL_CIRCUIT_KEY,),
+            """SELECT state_value FROM complaint_response_state
+               WHERE state_key=?""",
+            (_GACA_IDENTITY_CIRCUIT_PREFIX + key,),
         ).fetchone()
     try:
         return float(row["state_value"]) if row else 0.0
@@ -574,31 +638,76 @@ def gaca_portal_circuit_until() -> float:
         return 0.0
 
 
-def clear_gaca_portal_circuit() -> None:
-    """Close the shared GACA cooldown after its network session is replaced."""
+def apply_gaca_identity_circuit(job_id: str) -> float:
+    """Move a newly queued GACA job behind its passenger's active cooldown."""
+    now = time.time()
     with connect() as conn:
+        row = conn.execute(
+            """SELECT p.identity_key, s.state_value
+               FROM portal_jobs p
+               LEFT JOIN complaint_response_state s
+                 ON s.state_key=? || p.identity_key
+               WHERE p.id=? AND p.kind='gaca'""",
+            (_GACA_IDENTITY_CIRCUIT_PREFIX, str(job_id)),
+        ).fetchone()
+        try:
+            deadline = float(row["state_value"]) if row else 0.0
+        except (TypeError, ValueError):
+            deadline = 0.0
+        if deadline <= now:
+            return 0.0
         conn.execute(
-            "DELETE FROM complaint_response_state WHERE state_key = ?",
-            (_GACA_PORTAL_CIRCUIT_KEY,),
+            """UPDATE portal_jobs
+               SET status='retry_wait', terminal=0, lease_until=NULL,
+                   next_attempt_at=?, message=?,
+                   updated_at=datetime('now', 'localtime')
+               WHERE id=? AND status IN ('queued', 'retry_wait')""",
+            (
+                deadline,
+                "This passenger is still inside GACA's 24-hour identity "
+                "cooldown. The complaint is saved and will start afterward.",
+                str(job_id),
+            ),
         )
+    return deadline
 
 
-def defer_gaca_portal_jobs(
+def defer_gaca_identity_jobs(
         current_job_id: str, error: str, *,
-        delay: int = 24 * 3600, spacing: int = 6 * 3600) -> float:
-    """Open one shared GACA circuit after the portal rate-limits an identity.
+        payload: dict | None = None, identity_key: str = "",
+        delay: int = 24 * 3600, spacing: int = 24 * 3600) -> float:
+    """Pause only one passenger after GACA rejects their Step 2 identity.
 
-    GACA applies its Step 2 quota across the complainant's submissions, not
-    independently per complaint. Deferring only the current job lets sibling
-    complaints keep POSTing the same personal information and continually
-    refresh the block. Move every active GACA job behind one durable deadline
-    and stagger the jobs so only one re-enters the portal at a time.
+    Other family members remain eligible. Multiple complaints for the same
+    passenger are serialized so they cannot all retry when the cooldown ends.
     """
     delay = max(3600, min(int(delay), 7 * 24 * 3600))
-    spacing = max(15 * 60, min(int(spacing), 24 * 3600))
-    first_due = time.time() + delay
+    spacing = max(15 * 60, min(int(spacing), 7 * 24 * 3600))
     with connect() as conn:
+        row = conn.execute(
+            "SELECT identity_key,payload FROM portal_jobs WHERE id=?",
+            (str(current_job_id),),
+        ).fetchone()
+        key = str(identity_key or (row["identity_key"] if row else "")).strip()
+        if not key and payload is None and row:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+        key = key or gaca_identity_key(payload)
+        # A legacy row without usable identity data must not stop relatives.
+        # Give only that job an isolated circuit instead.
+        if not key:
+            key = hashlib.sha256(
+                f"job:{current_job_id}".encode("utf-8")
+            ).hexdigest()[:32]
+
+        first_due = time.time() + delay
         conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE portal_jobs SET identity_key=? WHERE id=?",
+            (key, str(current_job_id)),
+        )
         conn.execute(
             """INSERT INTO complaint_response_state (state_key, state_value)
                VALUES (?, ?)
@@ -607,17 +716,18 @@ def defer_gaca_portal_jobs(
                        CAST(complaint_response_state.state_value AS REAL),
                        CAST(excluded.state_value AS REAL)
                    )""",
-            (_GACA_PORTAL_CIRCUIT_KEY, str(first_due)),
+            (_GACA_IDENTITY_CIRCUIT_PREFIX + key, str(first_due)),
         )
         rows = conn.execute(
             """SELECT id FROM portal_jobs
-               WHERE kind='gaca' AND terminal=0
-                 AND status NOT IN ('submitted', 'superseded', 'cancelled')
+               WHERE kind='gaca' AND identity_key=? AND terminal=0
+                 AND status NOT IN (
+                     'submitted', 'superseded', 'cancelled')
                ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END,
                         COALESCE(next_attempt_at, 0), created_at, id""",
-            (str(current_job_id),),
+            (key, str(current_job_id)),
         ).fetchall()
-        for index, row in enumerate(rows):
+        for index, active in enumerate(rows):
             due = first_due + index * spacing
             conn.execute(
                 """UPDATE portal_jobs
@@ -628,10 +738,10 @@ def defer_gaca_portal_jobs(
                 (
                     due,
                     str(error)[:2000],
-                    "GACA's shared submission quota is active. All GACA "
-                    "jobs are serialized behind one cooldown so sibling "
-                    "complaints cannot prolong the restriction.",
-                    str(row["id"]),
+                    "GACA temporarily limited this passenger identity. "
+                    "Only this passenger is paused; the next safe attempt "
+                    "is scheduled after the 24-hour cooldown.",
+                    str(active["id"]),
                 ),
             )
     return first_due
@@ -1483,14 +1593,23 @@ def save_portal_job(job: dict) -> None:
     else:
         payload_json = json.dumps(
             payload, ensure_ascii=False, separators=(",", ":"))
+    parsed_payload = payload if isinstance(payload, dict) else {}
+    if not parsed_payload and isinstance(payload, str):
+        try:
+            parsed_payload = json.loads(payload)
+        except (TypeError, ValueError):
+            parsed_payload = {}
+    kind = str(job.get("kind") or parsed_payload.get("kind") or "")
+    identity_key = (
+        gaca_identity_key(parsed_payload) if kind == "gaca" else "")
     with connect() as conn:
         conn.execute(
             """INSERT INTO portal_jobs
-                   (id, kind, airline_code, flight_number, flight_key,
+                   (id, kind, identity_key, airline_code, flight_number, flight_key,
                     complaint_id, payload, status, message, reference,
                     screenshot_file, terminal, attempts, max_attempts,
                     next_attempt_at, lease_until, last_error)
-               VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, '{}'), ?, ?, ?, ?, ?,
+               VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, '{}'), ?, ?, ?, ?, ?,
                        ?, ?, ?, ?, ?)
                ON CONFLICT(id) DO UPDATE SET
                    status=excluded.status,
@@ -1501,6 +1620,9 @@ def save_portal_job(job: dict) -> None:
                    terminal=excluded.terminal,
                    complaint_id=COALESCE(excluded.complaint_id,
                                          portal_jobs.complaint_id),
+                   identity_key=COALESCE(
+                       NULLIF(excluded.identity_key, ''),
+                       portal_jobs.identity_key),
                    payload=CASE
                        WHEN excluded.payload IS NOT NULL
                             AND excluded.payload != '{}'
@@ -1511,7 +1633,7 @@ def save_portal_job(job: dict) -> None:
                    lease_until=excluded.lease_until,
                    last_error=excluded.last_error,
                    updated_at=datetime('now', 'localtime')""",
-            (str(job.get("id") or ""), str(job.get("kind") or ""),
+            (str(job.get("id") or ""), kind, identity_key or None,
              str(job.get("airline_code") or ""),
              str(job.get("flight_number") or ""),
              str(job.get("flight_key") or ""),
@@ -1648,8 +1770,24 @@ def claim_portal_job(job_id: str, lease_seconds: int = 20 * 60) -> dict | None:
                WHERE id=?
                  AND attempts < max_attempts
                  AND status IN ('queued', 'retry_wait')
-                 AND (next_attempt_at IS NULL OR next_attempt_at <= ?)""",
-            (now + max(60, int(lease_seconds)), str(job_id), now))
+                 AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                 AND (
+                     kind != 'gaca'
+                     OR COALESCE(identity_key, '')=''
+                     OR NOT EXISTS (
+                         SELECT 1
+                         FROM complaint_response_state circuit
+                         WHERE circuit.state_key=? || portal_jobs.identity_key
+                           AND CAST(circuit.state_value AS REAL) > ?
+                     )
+                 )""",
+            (
+                now + max(60, int(lease_seconds)),
+                str(job_id),
+                now,
+                _GACA_IDENTITY_CIRCUIT_PREFIX,
+                now,
+            ))
         if not cursor.rowcount:
             return None
     return get_portal_job(job_id)
@@ -1666,17 +1804,19 @@ def list_due_portal_jobs(limit: int = 3) -> list[dict]:
                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
                  AND (
                      kind != 'gaca'
-                     OR COALESCE((
-                         SELECT CAST(state_value AS REAL)
-                         FROM complaint_response_state
-                         WHERE state_key=?
-                     ), 0) <= ?
+                     OR COALESCE(identity_key, '')=''
+                     OR NOT EXISTS (
+                         SELECT 1
+                         FROM complaint_response_state circuit
+                         WHERE circuit.state_key=? || portal_jobs.identity_key
+                           AND CAST(circuit.state_value AS REAL) > ?
+                     )
                  )
                ORDER BY COALESCE(next_attempt_at, 0), created_at, id
                LIMIT ?""",
             (
                 now,
-                _GACA_PORTAL_CIRCUIT_KEY,
+                _GACA_IDENTITY_CIRCUIT_PREFIX,
                 now,
                 max(1, min(int(limit or 3), 20)),
             ),
