@@ -4045,7 +4045,11 @@ def _ensure_gaca_step4_ready(page):
     """
     submit = page.get_by_role(
         "button", name=re.compile(r"^Submit$", re.I))
-    ready = _wait_for_any_visible(page, submit, 12_000)
+    # Do not interrupt the first response prematurely. GACA has recently
+    # streamed this server-rendered page for well over 12 seconds before the
+    # final controls arrived. The proxy tunnel deliberately stays alive long
+    # enough for this bounded wait.
+    ready = _wait_for_any_visible(page, submit, 90_000)
     if ready is not None:
         return ready
     if "/complaint-airline/step4" not in str(page.url or ""):
@@ -4053,14 +4057,17 @@ def _ensure_gaca_step4_ready(page):
             "GACA did not reach its final complaint-information step; "
             "nothing was submitted.")
     try:
-        page.reload(wait_until="domcontentloaded", timeout=60_000)
+        # "commit" confirms that the safe GET reached GACA without requiring
+        # its sometimes-never-fired DOMContentLoaded event. We then watch for
+        # the actual Submit control, which is the state that matters.
+        page.reload(wait_until="commit", timeout=60_000)
     except Exception as exc:
         raise RuntimeError(
             "GACA's final complaint page arrived incomplete and did not "
             "reload safely; nothing was submitted.") from exc
     submit = page.get_by_role(
         "button", name=re.compile(r"^Submit$", re.I))
-    ready = _wait_for_any_visible(page, submit, 20_000)
+    ready = _wait_for_any_visible(page, submit, 90_000)
     if ready is None:
         raise RuntimeError(
             "GACA's final complaint page remained incomplete after one safe "

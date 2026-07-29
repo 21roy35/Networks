@@ -2196,7 +2196,7 @@ def test_gaca_incomplete_step4_reloads_once_before_filling(monkeypatch):
         def reload(self, **kwargs):
             self.reloads += 1
             assert kwargs == {
-                "wait_until": "domcontentloaded",
+                "wait_until": "commit",
                 "timeout": 60_000,
             }
 
