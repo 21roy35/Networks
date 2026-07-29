@@ -279,6 +279,20 @@ def _search_queries(since: str, first_uid: int | None = None) -> list[str]:
     return queries
 
 
+def _search_signature() -> str:
+    """Version a mailbox cursor against the candidate-search registry.
+
+    When support for a new airline/domain or subject family is deployed, one
+    bounded full-window scan is required to recover older messages that the
+    previous query set could never see. Subsequent scans remain incremental.
+    """
+    value = "\n".join(
+        sorted(domain.casefold() for domain in all_domains())
+        + sorted(keyword.casefold() for keyword in _SUBJECT_KEYWORDS)
+    )
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:20]
+
+
 def _selected_mailbox_value(conn, name: str) -> str:
     """Return an integer SELECT response such as UIDVALIDITY or UIDNEXT."""
     try:
@@ -311,6 +325,7 @@ def fetch_airline_emails(config: dict, log=print, progress: dict | None = None):
 
     since_dt = datetime.now() - timedelta(days=imap_cfg.get("since_days", 730))
     since = since_dt.strftime("%d-%b-%Y")
+    query_signature = _search_signature()
 
     if progress is None:
         progress = {}
@@ -336,7 +351,9 @@ def fetch_airline_emails(config: dict, log=print, progress: dict | None = None):
             uidnext_text = _selected_mailbox_value(conn, "UIDNEXT")
             cursor = db.get_mailbox_cursor(folder)
             incremental = bool(
-                cursor and cursor.get("uidvalidity") == uidvalidity)
+                cursor
+                and cursor.get("uidvalidity") == uidvalidity
+                and cursor.get("query_signature") == query_signature)
             first_uid = int(cursor["last_uid"]) + 1 if incremental else None
             high_uid = (max(0, int(uidnext_text) - 1)
                         if uidnext_text else int(cursor["last_uid"])
@@ -394,7 +411,8 @@ def fetch_airline_emails(config: dict, log=print, progress: dict | None = None):
                 yield message_to_raw(msg, raw_bytes=raw_bytes)
             if folder_ok:
                 db.save_mailbox_cursor(
-                    folder, batch["uidvalidity"], batch["high_uid"])
+                    folder, batch["uidvalidity"], batch["high_uid"],
+                    query_signature)
     finally:
         try:
             conn.logout()

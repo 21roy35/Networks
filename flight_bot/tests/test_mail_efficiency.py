@@ -87,6 +87,56 @@ def test_imap_cursor_fetches_only_new_uids(isolated_db, monkeypatch):
     assert db.get_mailbox_cursor("INBOX")["last_uid"] == 12
 
 
+def test_old_cursor_runs_one_backfill_when_search_registry_changes(
+        isolated_db, monkeypatch):
+    class FakeIMAP:
+        def __init__(self, *_args, **_kwargs):
+            self.searches = []
+            self.fetches = []
+
+        def login(self, *_args):
+            return "OK", []
+
+        def select(self, _folder, readonly=True):
+            return "OK", [b"1"]
+
+        def response(self, name):
+            return (name, [b"777" if name == "UIDVALIDITY" else b"13"])
+
+        def uid(self, command, *args):
+            if command == "SEARCH":
+                self.searches.append(str(args[-1]))
+                return "OK", [b"12"]
+            uid = int(args[0])
+            self.fetches.append(uid)
+            return "OK", [(b"RFC822", _raw_message(uid))]
+
+        def logout(self):
+            return "BYE", []
+
+    instance = FakeIMAP()
+    monkeypatch.setattr(
+        mail_client.imaplib, "IMAP4_SSL",
+        lambda *_args, **_kwargs: instance)
+    db.save_mailbox_cursor("INBOX", "777", 12)
+    config = {"imap": {
+        "host": "imap.example", "port": 993,
+        "user": "passenger@example.com", "password": "app-password",
+        "folders": ["INBOX"], "since_days": 730,
+    }}
+
+    recovered = list(mail_client.fetch_airline_emails(
+        config, log=lambda *_: None))
+    second = list(mail_client.fetch_airline_emails(
+        config, log=lambda *_: None))
+
+    assert len(recovered) == 1
+    assert instance.fetches == [12]
+    assert any("SINCE" in query for query in instance.searches)
+    assert db.get_mailbox_cursor("INBOX")["query_signature"]
+    assert second == []
+
+
 def test_verification_email_uses_exact_gmail_alias(monkeypatch):
     def message(recipient, code, number):
         value = EmailMessage()

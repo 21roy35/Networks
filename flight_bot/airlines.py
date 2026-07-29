@@ -21,6 +21,14 @@ AIRLINES = {
         "domains": ["flyadeal.com"],
         "complaint_url": "https://help.flyadeal.com/hc/en-us/requests/new",
     },
+    "RX": {
+        "name": "Riyadh Air",
+        # Flight-status providers can still use the marketing number when an
+        # ICAO callsign is unavailable; the official IATA designator is RX.
+        "icao": "",
+        "domains": ["riyadhair.com"],
+        "complaint_url": "https://www.riyadhair.com/en/help/contact-us",
+    },
     "EK": {
         "name": "Emirates",
         "icao": "UAE",
@@ -114,7 +122,7 @@ AIRLINES = {
 }
 
 # Carriers whose home regulator is GACA (Saudi Arabia).
-SAUDI_CARRIERS = {"SV", "XY", "F3"}
+SAUDI_CARRIERS = {"SV", "XY", "F3", "RX"}
 
 # Carriers in the registry that establish inbound EU/EEA or UK territorial
 # coverage. Pegasus is Turkish and must not be treated as an EU carrier; BA is

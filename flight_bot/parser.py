@@ -52,7 +52,8 @@ _KIND_PATTERNS = [
     (REFUND, r"\brefund"),
     (SCHEDULE_CHANGE, r"re-?scheduled|schedule\s+change|itinerary\s+change|time\s+change"),
     (RECEIPT, r"receipt|payment\s+(?:confirmation|received|successful)|invoice"),
-    (BOOKING, r"booking\s+(?:confirmation|confirmed|reference)|reservation\s+confirm|your\s+(?:booking|reservation|itinerary|trip)|flight\s+confirmation"),
+    (BOOKING, r"booking\s+(?:confirmation|confirmed|reference)|reservation\s+confirm|your\s+(?:booking|reservation|itinerary|trip)|flight\s+confirmation"
+              r"|order\s+(?:confirmation|summary)|order(?:['’]s|\s+is)\s+all\s+set"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -224,6 +225,23 @@ _CONTACT_PHONE_RE = re.compile(
     r"(\+?\d[\d ()-]{6,19})",
     re.IGNORECASE,
 )
+
+_RIYADH_ORDER_ID_RE = re.compile(
+    r"\border\s+id\s*:?\s*(RX[A-Z0-9]{8,18})\b", re.IGNORECASE)
+_RIYADH_CITY_LINE_RE = re.compile(
+    r"^(.{2,60}?)\s*\(([A-Z]{3})\)$")
+_RIYADH_GUEST_RE = re.compile(
+    r"(?im)^\s*\d+\s+guests?\s*$\s*"
+    r"^([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){1,4})\s*$")
+_RIYADH_PAYMENT_RE = re.compile(
+    r"(?is)\bform\s+of\s+payment\s*$\s*"
+    r"(visa|master\s*card|mastercard|mada|american\s+express|amex)"
+    r"\s*[-–—]\s*(\d{4})\b", re.MULTILINE)
+_RIYADH_SEAT_RE = re.compile(
+    r"(?i)\bseat\s*:\s*(\d{1,2})\s*([A-K])\b")
+_RIYADH_STACKED_SEAT_RE = re.compile(
+    r"(?is)\bcabin\s+class[^\n]{0,80}\bseat\s*$\s*"
+    r"(\d{1,2})\s*([A-K])\b", re.MULTILINE)
 
 _PNR_STOPWORDS = {"NUMBER", "BOOKING", "TICKET", "FLIGHT", "TRAVEL",
                   "ONLINE", "PLEASE", "BELOW"}
@@ -552,6 +570,107 @@ def segment_datetimes(seg: dict) -> tuple[str | None, str | None]:
     return dep, arr
 
 
+def _apply_riyadh_air_layout(
+        parsed: ParsedEmail, text: str,
+        email_dt: datetime | None) -> None:
+    """Read Riyadh Air's stacked order-confirmation itinerary layout.
+
+    Its production emails use an Order ID rather than a 5-8 character PNR,
+    and place time, date, city, flight, passenger, seat, and card values on
+    separate lines.  Keeping this adapter carrier-scoped avoids weakening the
+    generic patterns for every other sender.
+    """
+    if parsed.airline_code != "RX":
+        return
+    if order := _RIYADH_ORDER_ID_RE.search(text):
+        parsed.pnr = order.group(1).upper()
+    if BOOKING not in parsed.kinds and re.search(
+            r"order(?:['’]s|\s+is)\s+all\s+set|order\s+summary",
+            text, re.IGNORECASE):
+        parsed.kinds.append(BOOKING)
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    def label_index(label: str) -> int | None:
+        label = label.casefold()
+        return next((
+            index for index, line in enumerate(lines)
+            if line.casefold() == label
+        ), None)
+
+    def stacked_point(start: int | None) -> dict:
+        point = {"time": None, "date": None, "city": None, "airport": None}
+        if start is None:
+            return point
+        for line in lines[start + 1:start + 12]:
+            if point["time"] is None and _TIME_LINE_RE.fullmatch(line):
+                point["time"] = _normalise_time(line)
+                continue
+            if point["date"] is None:
+                point["date"] = _line_date(line, email_dt)
+                if point["date"]:
+                    continue
+            city = _RIYADH_CITY_LINE_RE.fullmatch(line)
+            if city and city.group(2) not in _NOT_AIRPORTS:
+                point["city"] = city.group(1).strip()
+                point["airport"] = city.group(2)
+                break
+        return point
+
+    departure_index = label_index("Departs at")
+    arrival_index = label_index("Arrives at")
+    departure = stacked_point(departure_index)
+    arrival = stacked_point(arrival_index)
+    flight_number = None
+    scan_start = (departure_index + 1) if departure_index is not None else 0
+    scan_end = arrival_index if arrival_index is not None else len(lines)
+    for line in lines[scan_start:scan_end]:
+        flight_number = _flight_no_in_line(line)
+        if flight_number:
+            break
+    if not flight_number:
+        flight_number = next(
+            filter(None, (_flight_no_in_line(line) for line in lines)), None)
+
+    if flight_number and flight_number not in parsed.flight_numbers:
+        parsed.flight_numbers.insert(0, flight_number)
+    if departure.get("airport"):
+        parsed.origin = departure["airport"]
+        parsed.origin_city = departure.get("city")
+    if arrival.get("airport"):
+        parsed.destination = arrival["airport"]
+        parsed.destination_city = arrival.get("city")
+    if departure.get("date"):
+        parsed.flight_date = departure["date"]
+    if departure.get("date") and departure.get("time"):
+        parsed.departure = (
+            f"{departure['date']} {departure['time']}")
+    if arrival.get("date") and arrival.get("time"):
+        parsed.arrival = f"{arrival['date']} {arrival['time']}"
+    if (flight_number and departure.get("airport")
+            and arrival.get("airport")):
+        parsed.segments = [{
+            "origin": departure["airport"],
+            "destination": arrival["airport"],
+            "date": departure.get("date"),
+            "dep_time": departure.get("time"),
+            "arr_time": arrival.get("time"),
+            "flight_number": flight_number,
+            "label": None,
+        }]
+
+    if guest := _RIYADH_GUEST_RE.search(text):
+        parsed.passenger = _clean_passenger_name(guest.group(1))
+    if payment := _RIYADH_PAYMENT_RE.search(text):
+        method = re.sub(r"\s+", " ", payment.group(1)).title()
+        method = {"Master Card": "Mastercard",
+                  "Amex": "American Express"}.get(method, method)
+        parsed.payment_method = f"{method} •••• {payment.group(2)}"
+    seat = _RIYADH_SEAT_RE.search(text) or _RIYADH_STACKED_SEAT_RE.search(text)
+    if seat:
+        parsed.seat = f"{seat.group(1)}{seat.group(2)}".upper()
+
+
 def _segment_dt(seg: dict, which: str) -> str | None:
     dep, arr = segment_datetimes(seg)
     return dep if which == "dep" else arr
@@ -870,6 +989,8 @@ def parse_email(message_id: str, subject: str, sender: str, date: datetime | Non
     if m := _AMOUNT_RE.search(text):
         parsed.currency = (m.group(1) or m.group(3) or "").upper() or None
         parsed.amount = m.group(2)
+
+    _apply_riyadh_air_layout(parsed, text, base_date)
 
     if m := _DELAY_HOURS_RE.search(text):
         parsed.delay_hours = float(m.group(1))

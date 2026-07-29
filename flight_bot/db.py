@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS mailbox_cursors (
     folder TEXT PRIMARY KEY,
     uidvalidity TEXT NOT NULL,
     last_uid INTEGER NOT NULL,
+    query_signature TEXT NOT NULL DEFAULT '',
     updated_at TEXT DEFAULT (datetime('now', 'localtime'))
 );
 
@@ -368,6 +369,14 @@ def init_db():
             if name not in columns:
                 conn.execute(
                     f"ALTER TABLE complaints ADD COLUMN {name} {declaration}")
+        cursor_columns = {
+            row["name"] for row in conn.execute(
+                "PRAGMA table_info(mailbox_cursors)")
+        }
+        if "query_signature" not in cursor_columns:
+            conn.execute(
+                "ALTER TABLE mailbox_cursors "
+                "ADD COLUMN query_signature TEXT NOT NULL DEFAULT ''")
         conn.execute(
             """UPDATE complaints
                SET original_text = COALESCE(
@@ -575,17 +584,19 @@ def get_mailbox_cursor(folder: str) -> dict | None:
 
 
 def save_mailbox_cursor(folder: str, uidvalidity: str,
-                        last_uid: int) -> None:
+                        last_uid: int, query_signature: str = "") -> None:
     with connect() as conn:
         conn.execute(
             """INSERT INTO mailbox_cursors
-                   (folder, uidvalidity, last_uid, updated_at)
-               VALUES (?, ?, ?, datetime('now', 'localtime'))
+                   (folder, uidvalidity, last_uid, query_signature, updated_at)
+               VALUES (?, ?, ?, ?, datetime('now', 'localtime'))
                ON CONFLICT(folder) DO UPDATE SET
                    uidvalidity=excluded.uidvalidity,
                    last_uid=excluded.last_uid,
+                   query_signature=excluded.query_signature,
                    updated_at=excluded.updated_at""",
-            (folder, str(uidvalidity), int(last_uid)))
+            (folder, str(uidvalidity), int(last_uid),
+             str(query_signature or "")))
 
 
 def mailbox_cursor_summary() -> dict:
