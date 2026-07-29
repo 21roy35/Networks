@@ -30,10 +30,23 @@ from .flight_status import (get_flight_status, live_landed, parse_flight_time,
                             refresh_flight_status, schedule_has_finished)
 from .gaca_account import sync_gaca_account
 from .mail_client import fetch_recent_verification_message
-from .pipeline import scan_mailbox
+from .pipeline import rebuild_flights, scan_mailbox
 from .portal_automation import (PortalResult, _extract_reference, set_ai_handler,
                                 set_captcha_solver, set_verification_handler,
                                 resume_due_portal_jobs, start_portal_job)
+from .ticket_import import (
+    build_parsed_ticket,
+    deterministic_ticket_details,
+    explicit_manual_complaint_request,
+    explicit_ticket_import_request,
+    extract_pdf_text,
+    manual_complaint_from_text,
+    merge_ticket_details,
+    missing_ticket_fields,
+    normalize_ticket_details,
+    selectors_from_text,
+    ticket_preview,
+)
 from .web_access import create_web_token
 
 
@@ -277,6 +290,9 @@ class TelegramAPI:
     def set_commands(self):
         commands = [
             {"command": "status", "description": "Show FlightDeck status"},
+            {"command": "ticket", "description": "Add a ticket or itinerary"},
+            {"command": "complaintref",
+             "description": "Attach a manually filed airline case"},
             {"command": "flightstatus", "description": "Refresh a flight status"},
             {"command": "recommend", "description": "Best complaint next step"},
             {"command": "gaca", "description": "Sync your GACA complaint account"},
@@ -729,13 +745,19 @@ class TelegramCoordinator:
         try:
             db.record_telegram_message(
                 "incoming", message.get("message_id"), journal_text,
-                "photo" if message.get("photo") else "text",
+                ("photo" if message.get("photo") else
+                 "document" if message.get("document") else "text"),
                 (message.get("reply_to_message") or {}).get("message_id"))
         except Exception:
             logger.exception("Could not journal incoming Telegram message")
         if text == "/start":
             self.notify(
-                "FlightDeck Telegram is connected. I’ll check in after flights, collect issue photos, file official complaints, relay verification steps, and report airline responses. Use /status for service status or /web for your private dashboard.")
+                "FlightDeck Telegram is connected. Send /ticket with a PDF, "
+                "photo, or booking details to add a flight; use /complaintref "
+                "for a case you filed manually. I’ll check in after flights, "
+                "collect issue photos, file official complaints, relay "
+                "verification steps, and report airline responses. Use "
+                "/status for service status or /web for your private dashboard.")
             return
         if text == "/status":
             self._send_status()
@@ -756,13 +778,12 @@ class TelegramCoordinator:
             self._send_web_link()
             return
         if text == "/cancel":
+            pending_import = db.latest_pending_ticket_import(self.chat_id)
+            if pending_import:
+                db.update_ticket_import(
+                    pending_import["token"], status="cancelled")
             self._cancel_latest_intake()
-            self.notify("Cancelled the pending complaint intake.")
-            return
-
-        reference = _telegram_sms_reference(pasted)
-        if reference and self._capture_telegram_reference(
-                reference, pasted, message):
+            self.notify("Cancelled the pending ticket or complaint intake.")
             return
 
         positive = re.fullmatch(
@@ -783,16 +804,62 @@ class TelegramCoordinator:
                     or self._looks_like_survey_issue(pasted))):
                 survey = pending
         if not survey:
+            command = text.split(maxsplit=1)[0].lower() if text else ""
+            if (command == "/ticket"
+                    and not text.partition(" ")[2].strip()
+                    and not message.get("photo")
+                    and not message.get("document")):
+                self.notify(
+                    "Send the ticket PDF/photo, or use:\n"
+                    "/ticket Flight SV123, 2026-08-01, RUH to JED, "
+                    "passenger Full Name, PNR ABC123, ticket 065-1234567890\n\n"
+                    "You can include: manual complaint C_1234567 filed "
+                    "2026-08-02 about <what happened>.",
+                    force_reply=True)
+                return
+            if (command == "/complaintref"
+                    and not text.partition(" ")[2].strip()):
+                self.notify(
+                    "Use: /complaintref C_1234567 flight SV123 "
+                    "date 2026-08-01 filed 2026-08-02 about <what happened>.\n"
+                    "I need enough flight detail to avoid attaching it to the "
+                    "wrong family passenger.",
+                    force_reply=True)
+                return
+            attachment = self._ticket_attachment(message)
+            if (explicit_ticket_import_request(pasted)
+                    or attachment and (
+                        attachment.get("kind") == "document" or not pasted)):
+                self._start_ticket_import(message)
+                return
+            if (command == "/complaintref"
+                    and explicit_manual_complaint_request(pasted)):
+                self._handle_manual_complaint_message(pasted)
+                return
+            if self._continue_ticket_import(message):
+                return
+            if explicit_manual_complaint_request(pasted):
+                self._handle_manual_complaint_message(pasted)
+                return
+
+            reference = _telegram_sms_reference(pasted)
+            if reference and self._capture_telegram_reference(
+                    reference, pasted, message):
+                return
+        if not survey:
             if pasted and self.ai.enabled:
                 self._dispatch_ai_message(pasted)
-            elif not pasted and message.get("photo"):
+            elif not pasted and (message.get("photo") or message.get("document")):
                 self.notify(
-                    "Add a caption telling me which flight or complaint this "
-                    "photo belongs to.")
+                    "I could not read that as a ticket. Send it again with "
+                    "a caption such as “add this ticket”, or paste the flight "
+                    "number, date, route, passenger, and PNR/e-ticket number.")
             else:
                 self.notify(
-                    "Reply to a post-flight question, use /status, or ask me "
-                    "about a flight, passenger, complaint, email, or screenshot.")
+                    "Reply to a post-flight question, use /ticket to add a "
+                    "booking, /complaintref to attach a manual airline case, "
+                    "or ask me about a flight, passenger, complaint, email, "
+                    "or screenshot.")
             return
         if (survey.get("status") == "asked" and positive
                 and not message.get("photo")):
@@ -806,6 +873,389 @@ class TelegramCoordinator:
                 self.notify("Glad the flight went well ✈️")
             return
         self._collect_issue(survey, message)
+
+    @staticmethod
+    def _ticket_attachment(message: dict) -> dict | None:
+        photos = message.get("photo") or []
+        if photos:
+            return {
+                "file_id": photos[-1].get("file_id") or "",
+                "suffix": ".jpg",
+                "media_type": "image/jpeg",
+                "kind": "photo",
+                "name": "telegram-ticket.jpg",
+            }
+        document = message.get("document") or {}
+        if not document:
+            return None
+        mime_type = str(document.get("mime_type") or "").casefold()
+        file_name = Path(str(
+            document.get("file_name") or "telegram-ticket"
+        )).name
+        suffix = Path(file_name).suffix.lower()
+        if mime_type == "application/pdf" or suffix == ".pdf":
+            suffix, mime_type = ".pdf", "application/pdf"
+        elif mime_type.startswith("image/") or suffix in {
+                ".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+            suffix = suffix if suffix in {
+                ".jpg", ".jpeg", ".png", ".webp", ".gif"} else ".jpg"
+            mime_type = {
+                ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".png": "image/png", ".webp": "image/webp",
+                ".gif": "image/gif",
+            }.get(suffix, mime_type or "image/jpeg")
+        elif mime_type.startswith("text/") or suffix in {".txt", ".csv"}:
+            suffix = suffix if suffix in {".txt", ".csv"} else ".txt"
+            mime_type = mime_type or "text/plain"
+        else:
+            return None
+        return {
+            "file_id": document.get("file_id") or "",
+            "suffix": suffix,
+            "media_type": mime_type,
+            "kind": "document",
+            "name": file_name,
+        }
+
+    def _start_ticket_import(self, message: dict) -> None:
+        """Download/read a Telegram ticket without blocking update polling."""
+        message_id = int(message.get("message_id") or 0)
+        if not message_id:
+            self.notify("I could not identify that Telegram message. Send it again.")
+            return
+        attachment = self._ticket_attachment(message)
+        pasted = (message.get("text") or message.get("caption") or "").strip()
+        token = uuid.uuid4().hex[:16]
+        draft = db.create_ticket_import(
+            token,
+            self.chat_id,
+            message_id,
+            (attachment or {}).get("kind") or "text",
+            source_text=pasted,
+        )
+        if draft.get("token") != token:
+            status = draft.get("status")
+            if status == "imported":
+                self.notify("That ticket message is already on the dashboard.")
+            else:
+                self.notify("I am already reading that ticket message.")
+            return
+        self.notify(
+            f"Reading the ticket now. {self.ai.name} will only fill fields "
+            "that are visibly present; I’ll show you a preview before saving.")
+        threading.Thread(
+            target=self._process_ticket_import,
+            args=(token, pasted, attachment),
+            name=f"ticket-import-{token[:8]}",
+            daemon=True,
+        ).start()
+
+    def _read_ticket_attachment(
+            self, token: str, attachment: dict | None
+    ) -> tuple[str, bytes | None, str, str]:
+        if not attachment:
+            return "", None, "", ""
+        destination = (
+            TELEGRAM_EVIDENCE_DIR / "ticket_imports"
+            / f"{token}{attachment['suffix']}")
+        self.api.download(attachment["file_id"], destination)
+        mime_type = str(attachment.get("media_type") or "")
+        if mime_type == "application/pdf":
+            return extract_pdf_text(destination), None, mime_type, str(destination)
+        if mime_type.startswith("text/"):
+            return (
+                destination.read_text(encoding="utf-8", errors="replace")[:60_000],
+                None, mime_type, str(destination))
+        return "", destination.read_bytes(), mime_type, str(destination)
+
+    def _process_ticket_import(
+            self, token: str, caption: str,
+            attachment: dict | None = None) -> None:
+        try:
+            attachment_text, image, media_type, source_file = (
+                self._read_ticket_attachment(token, attachment))
+            source_text = "\n\n".join(filter(None, (
+                caption, attachment_text)))[:60_000]
+            deterministic = deterministic_ticket_details(source_text)
+            details = deterministic
+            needs_ai = bool(image) or bool(missing_ticket_fields(deterministic))
+            if self.ai.enabled and needs_ai:
+                with self._ai_chat_lock:
+                    ai_details = self.ai.extract_ticket_details(
+                        source_text,
+                        image=image,
+                        media_type=media_type or "image/jpeg",
+                    )
+                details = merge_ticket_details(deterministic, ai_details)
+            missing = missing_ticket_fields(details)
+            status = "awaiting_details" if missing else "ready"
+            db.update_ticket_import(
+                token,
+                status=status,
+                source_file=source_file,
+                source_text=source_text,
+                extracted=details,
+                error="",
+            )
+            self._send_ticket_preview(token, details)
+        except Exception as exc:
+            logger.exception(
+                "Telegram ticket import could not be read (%s)",
+                type(exc).__name__)
+            db.update_ticket_import(
+                token,
+                status="awaiting_details",
+                error=f"{type(exc).__name__}: ticket could not be read",
+            )
+            self.notify(
+                "I could not read that attachment reliably. Paste the flight "
+                "number, date, route, passenger, and PNR/e-ticket number in "
+                "one reply and I’ll continue the same import.",
+                force_reply=True)
+
+    def _send_ticket_preview(self, token: str, details: dict) -> None:
+        missing = missing_ticket_fields(details)
+        rows = [[("Cancel", f"ticket_cancel:{token}")]]
+        if not missing:
+            rows[0].insert(0, ("Add to dashboard", f"ticket_confirm:{token}"))
+        prompt = ticket_preview(details)
+        if missing:
+            prompt += (
+                "\n\nReply with the missing details in plain language. "
+                "Nothing has been added yet.")
+        else:
+            prompt += (
+                "\n\nConfirm to add this as durable Telegram ticket evidence. "
+                "Nothing is filed with an airline by this button.")
+        self.notify(prompt, buttons=_buttons(rows), force_reply=bool(missing))
+
+    @staticmethod
+    def _looks_like_ticket_followup(text: str) -> bool:
+        return bool(re.search(
+            r"\b(?:flight|date|route|from|to|origin|destination|passenger|"
+            r"travell?er|pnr|booking|e-?ticket|ticket\s+(?:number|no)|"
+            r"seat|class|national\s+id|alfursan|complaint|case|reference|"
+            r"filed|submitted)\b",
+            str(text or ""), re.IGNORECASE))
+
+    def _continue_ticket_import(self, message: dict) -> bool:
+        pending = db.latest_pending_ticket_import(self.chat_id)
+        if not pending or pending.get("status") != "awaiting_details":
+            return False
+        text = (message.get("text") or message.get("caption") or "").strip()
+        if not text or not self._looks_like_ticket_followup(text):
+            return False
+        db.update_ticket_import(pending["token"], status="processing")
+        self.notify("Adding those details to the ticket preview now.")
+        threading.Thread(
+            target=self._apply_ticket_followup,
+            args=(pending["token"], text),
+            name=f"ticket-followup-{pending['token'][:8]}",
+            daemon=True,
+        ).start()
+        return True
+
+    def _apply_ticket_followup(self, token: str, text: str) -> None:
+        draft = db.get_ticket_import(token)
+        if not draft:
+            return
+        try:
+            deterministic = deterministic_ticket_details(text)
+            followup = deterministic
+            if self.ai.enabled and missing_ticket_fields(
+                    merge_ticket_details(draft.get("extracted"), deterministic)):
+                with self._ai_chat_lock:
+                    ai_details = self.ai.extract_ticket_details(text)
+                followup = merge_ticket_details(deterministic, ai_details)
+            details = merge_ticket_details(draft.get("extracted"), followup)
+            source_text = "\n\n".join(filter(None, (
+                draft.get("source_text") or "", text)))[:60_000]
+            status = (
+                "awaiting_details" if missing_ticket_fields(details) else "ready")
+            db.update_ticket_import(
+                token,
+                status=status,
+                source_text=source_text,
+                extracted=details,
+                error="",
+            )
+            self._send_ticket_preview(token, details)
+        except Exception:
+            logger.exception("Ticket follow-up could not be applied")
+            db.update_ticket_import(token, status="awaiting_details")
+            self.notify(
+                "I could not apply that safely. Please send the missing fields "
+                "with explicit labels, for example “Passenger: …, PNR: …”.",
+                force_reply=True)
+
+    def _flights_for_source_message(self, message_id: str) -> list[dict]:
+        matches = []
+        for summary in db.list_flights():
+            flight = db.get_flight(int(summary["id"]))
+            if flight and any(
+                    str(email.get("message_id") or "") == str(message_id)
+                    for email in flight.get("emails") or []):
+                matches.append(flight)
+        return matches
+
+    def _confirm_ticket_import(self, token: str) -> None:
+        draft = db.get_ticket_import(token)
+        if not draft or str(draft.get("chat_id")) != self.chat_id:
+            self.notify("That ticket preview has expired.")
+            return
+        if draft.get("status") == "imported":
+            self.notify("That ticket is already on the dashboard.")
+            return
+        details = normalize_ticket_details(draft.get("extracted"))
+        missing = missing_ticket_fields(details)
+        if missing:
+            db.update_ticket_import(token, status="awaiting_details")
+            self._send_ticket_preview(token, details)
+            return
+        db.update_ticket_import(token, status="importing")
+        message_id = f"telegram-ticket:{self.chat_id}:{token}"
+        imported_at = datetime.now()
+        parsed = build_parsed_ticket(
+            details,
+            message_id=message_id,
+            imported_at=imported_at,
+            source_text=draft.get("source_text") or "",
+            source_file=draft.get("source_file") or "",
+        )
+        db.save_mail_event({
+            "message_id": message_id,
+            "subject": parsed.subject,
+            "sender": parsed.sender,
+            "date": imported_at,
+            "body": parsed.body_text,
+        })
+        db.save_email(parsed)
+        rebuild_flights(log=logger.info)
+        flights = self._flights_for_source_message(message_id)
+        if not flights:
+            db.update_ticket_import(
+                token,
+                status="awaiting_details",
+                error="ticket source did not link to a flight",
+            )
+            self.notify(
+                "The source was saved, but it did not produce a reliable flight "
+                "record. I did not attach any complaint. Send the flight number "
+                "and date again so I can repair the preview.")
+            return
+        keys = [flight["flight_key"] for flight in flights]
+        db.update_ticket_import(
+            token,
+            status="imported",
+            imported_flight_keys=keys,
+            error="",
+        )
+        labels = ", ".join(self._flight_label(flight) for flight in flights)
+        self.notify(
+            f"✅ Added to the dashboard: {labels}. Flight monitoring and the "
+            "normal post-flight check-in now apply to the imported passenger.")
+        complaint = details.get("complaint") or {}
+        if complaint.get("reference"):
+            target_number = complaint.get("flight_number")
+            targets = [
+                flight for flight in flights
+                if not target_number or target_number in {
+                    flight.get("flight_number"),
+                    *(flight.get("flight_numbers") or []),
+                }]
+            if len(targets) == 1:
+                self._store_manual_complaint(targets[0], complaint)
+            else:
+                self.notify(
+                    "The ticket was added, but I did not guess which leg owns "
+                    f"manual complaint {complaint['reference']}. Send "
+                    f"“/complaintref {complaint['reference']} flight <number> "
+                    "filed <date>” to attach it exactly.")
+
+    def _matching_manual_reference_flights(self, text: str) -> list[dict]:
+        selectors = selectors_from_text(text)
+        if not any(selectors.values()):
+            return []
+        flights = db.list_flights()
+        if selectors.get("flight_number"):
+            number = selectors["flight_number"]
+            flights = [
+                flight for flight in flights if number in {
+                    flight.get("flight_number"),
+                    *(flight.get("flight_numbers") or []),
+                }]
+        if selectors.get("pnr"):
+            flights = [
+                flight for flight in flights
+                if str(flight.get("pnr") or "").upper() == selectors["pnr"]]
+        if selectors.get("flight_date"):
+            flights = [
+                flight for flight in flights
+                if str(flight.get("flight_date") or "")[:10]
+                == selectors["flight_date"]]
+        return flights
+
+    def _handle_manual_complaint_message(self, text: str) -> None:
+        complaint = manual_complaint_from_text(text)
+        if not complaint.get("reference"):
+            self.notify(
+                "I found the manual-complaint request, but not a clear case "
+                "number. Send “/complaintref <number> flight <number> "
+                "date <flight date>”.")
+            return
+        flights = self._matching_manual_reference_flights(text)
+        if len(flights) != 1:
+            if flights:
+                choices = "\n".join(
+                    f"• {self._flight_summary(flight)}"
+                    for flight in flights[:6])
+                self.notify(
+                    "I found more than one possible family flight and attached "
+                    "nothing. Add the exact flight date or PNR:\n" + choices)
+            else:
+                self.notify(
+                    "I could not match that reference to exactly one stored "
+                    "flight. Include the flight number plus its flight date or "
+                    "PNR; I will not guess between family passengers.")
+            return
+        self._store_manual_complaint(flights[0], complaint)
+
+    def _store_manual_complaint(self, flight: dict, complaint: dict) -> None:
+        try:
+            saved, outcome = db.record_manual_airline_complaint(
+                flight["flight_key"],
+                complaint.get("reference") or "",
+                details=complaint.get("text") or "",
+                category=complaint.get("category") or "",
+                filed_at=complaint.get("filed_at") or None,
+            )
+        except ValueError as exc:
+            self.notify(str(exc))
+            return
+        created = parse_flight_time(saved.get("created_at"))
+        delay_days = max(1, int(self.settings.get(
+            "gaca_auto_escalate_days", 7)))
+        due = created + timedelta(days=delay_days) if created else None
+        due_text = due.strftime("%Y-%m-%d %H:%M") if due else "in seven days"
+        if outcome == "completed_existing":
+            source_text = (
+                "This completed the reference that FlightDeck was already "
+                "waiting for; it was not recorded as a second manual filing.")
+        elif outcome == "already_linked":
+            source_text = "It was already linked, so nothing was duplicated."
+        else:
+            source_text = (
+                "It is marked as manually filed through Telegram, not as a "
+                "complaint submitted by FlightDeck.")
+        if not complaint.get("text"):
+            source_text += (
+                " You did not supply the original complaint text, so the "
+                "dashboard says that explicitly instead of inventing it.")
+        self.notify(
+            f"✅ Attached airline complaint {saved.get('reference')} to "
+            f"{self._flight_label(flight)}. {source_text} The GACA timer uses "
+            f"the filing date and is due {due_text} if there is no substantive "
+            "airline response.")
 
     def _status_text(self) -> str:
         counts = db.counts()
@@ -821,8 +1271,9 @@ class TelegramCoordinator:
         elif self.ai.enabled:
             ai_status = f" {self.ai.name} AI is configured on {self.ai.model}."
             if self.ai.settings.get("extract_profile_evidence", True):
-                ai_status += (" Guarded ticket/PDF review is enabled for "
-                              "missing passenger-profile fields.")
+                ai_status += (
+                    " Guarded Telegram ticket/PDF import and passenger-profile "
+                    "review are enabled.")
         else:
             ai_status = " AI assistance is off."
         captcha_status = (" 2Captcha is configured with Telegram fallback."
@@ -1981,6 +2432,16 @@ class TelegramCoordinator:
             if waiter:
                 waiter.response = data.split(":", 1)[1]
                 waiter.event.set()
+            return
+        if data.startswith("ticket_confirm:"):
+            self._confirm_ticket_import(data.split(":", 1)[1])
+            return
+        if data.startswith("ticket_cancel:"):
+            token = data.split(":", 1)[1]
+            draft = db.get_ticket_import(token)
+            if draft and str(draft.get("chat_id")) == self.chat_id:
+                db.update_ticket_import(token, status="cancelled")
+                self.notify("Cancelled that ticket import. Nothing was added.")
             return
         action, _, value = data.partition(":")
         if not value.isdigit():

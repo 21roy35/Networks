@@ -70,9 +70,32 @@ def _group_emails(emails: list[dict]) -> list[list[dict]]:
         for flight_no in email.get("flight_numbers") or []:
             if date:
                 by_key[("flight", flight_no, date)].append(i)
-    for indices in by_key.values():
-        for other in indices[1:]:
-            uf.union(indices[0], other)
+    for key, indices in by_key.items():
+        if key[0] != "flight":
+            for other in indices[1:]:
+                uf.union(indices[0], other)
+            continue
+        # The same physical flight can contain several members of one family,
+        # each with a different PNR/ticket/passenger.  Never let the broad
+        # flight+date key collapse those people into the newest email.  A
+        # flight/date notice without a PNR may still join when there is only
+        # one booking represented.
+        distinct_pnrs = {
+            str(emails[index].get("pnr") or "")
+            for index in indices if emails[index].get("pnr")
+        }
+        if len(distinct_pnrs) <= 1:
+            for other in indices[1:]:
+                uf.union(indices[0], other)
+            continue
+        by_pnr = defaultdict(list)
+        for index in indices:
+            pnr = str(emails[index].get("pnr") or "")
+            if pnr:
+                by_pnr[pnr].append(index)
+        for pnr_indices in by_pnr.values():
+            for other in pnr_indices[1:]:
+                uf.union(pnr_indices[0], other)
 
     groups = defaultdict(list)
     for i, email in enumerate(emails):

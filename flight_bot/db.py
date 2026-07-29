@@ -6,7 +6,7 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .config import DB_PATH, passenger_profile_key
 
@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS complaints (
     requested_resolution_summary TEXT,
     provider_response_text TEXT,
     response_summary TEXT,
+    submission_source TEXT NOT NULL DEFAULT 'automation',
     escalate_parent_on_success INTEGER NOT NULL DEFAULT 0,
     attachments TEXT DEFAULT '[]',
     status TEXT NOT NULL,        -- 'sent' | 'filed'
@@ -165,6 +166,22 @@ CREATE TABLE IF NOT EXISTS telegram_messages (
     reply_to_message_id INTEGER,
     created_at TEXT DEFAULT (datetime('now', 'localtime')),
     UNIQUE(direction, message_id)
+);
+
+CREATE TABLE IF NOT EXISTS telegram_ticket_imports (
+    token TEXT PRIMARY KEY,
+    chat_id TEXT NOT NULL,
+    source_message_id INTEGER,
+    source_kind TEXT NOT NULL,
+    source_file TEXT,
+    source_text TEXT,
+    extracted TEXT NOT NULL DEFAULT '{}',
+    imported_flight_keys TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL,
+    error TEXT,
+    created_at TEXT DEFAULT (datetime('now', 'localtime')),
+    updated_at TEXT DEFAULT (datetime('now', 'localtime')),
+    UNIQUE(chat_id, source_message_id)
 );
 
 CREATE TABLE IF NOT EXISTS portal_jobs (
@@ -282,6 +299,8 @@ CREATE INDEX IF NOT EXISTS idx_telegram_surveys_status
     ON telegram_surveys(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_telegram_messages_created
     ON telegram_messages(created_at, id);
+CREATE INDEX IF NOT EXISTS idx_telegram_ticket_imports_status
+    ON telegram_ticket_imports(chat_id, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_portal_jobs_updated
     ON portal_jobs(updated_at, id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_gaca_account_reference_unique
@@ -342,6 +361,7 @@ def init_db():
             "requested_resolution_summary": "TEXT",
             "provider_response_text": "TEXT",
             "response_summary": "TEXT",
+            "submission_source": "TEXT NOT NULL DEFAULT 'automation'",
             "escalate_parent_on_success": "INTEGER NOT NULL DEFAULT 0",
         }
         for name, declaration in complaint_migrations.items():
@@ -1225,7 +1245,9 @@ def add_complaint(flight_key: str, kind: str, to_addr: str | None,
                    parent_complaint_id: int | None = None,
                    original_text: str | None = None,
                    issue_summary: str | None = None,
-                   requested_resolution_summary: str | None = None):
+                   requested_resolution_summary: str | None = None,
+                   submission_source: str = "automation",
+                   created_at: str | None = None) -> int:
     with connect() as conn:
         parent = None
         if parent_complaint_id:
@@ -1247,18 +1269,125 @@ def add_complaint(flight_key: str, kind: str, to_addr: str | None,
                (flight_key, kind, parent_complaint_id, root_complaint_id,
                 generation, to_addr, subject, status, reference, details,
                 original_text, attachments, submitted_text, portal_category,
-                issue_summary, requested_resolution_summary)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                issue_summary, requested_resolution_summary,
+                submission_source, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       COALESCE(?, datetime('now', 'localtime')))""",
             (flight_key, kind, parent_complaint_id, root_id, generation,
              to_addr, subject, status, reference, details,
              immutable_original, json.dumps(attachments or []),
              submitted_text, portal_category, issue_summary,
-             requested_resolution_summary))
+             requested_resolution_summary,
+             str(submission_source or "automation")[:30],
+             created_at))
         if not parent:
             conn.execute(
                 "UPDATE complaints SET root_complaint_id = ? WHERE id = ?",
                 (int(cursor.lastrowid), int(cursor.lastrowid)),
             )
+        return int(cursor.lastrowid)
+
+
+def record_manual_airline_complaint(
+        flight_key: str,
+        reference: str,
+        *,
+        details: str = "",
+        category: str = "",
+        filed_at: str | None = None,
+) -> tuple[dict, str]:
+    """Attach an externally filed airline case without creating duplicates.
+
+    Returns ``(complaint, outcome)`` where outcome is ``created``,
+    ``already_linked``, or ``completed_existing``.  The latter is used when
+    FlightDeck already filed the same case and was only waiting for its
+    official reference.
+    """
+    reference = str(reference or "").strip()
+    if not reference:
+        raise ValueError("A manual complaint reference is required.")
+    if filed_at:
+        try:
+            parsed_filed = datetime.fromisoformat(str(filed_at))
+        except ValueError as exc:
+            raise ValueError("The manual complaint date is invalid.") from exc
+        if parsed_filed > datetime.now() + timedelta(minutes=5):
+            raise ValueError("The manual complaint date cannot be in the future.")
+        created_at = parsed_filed.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        created_at = None
+    statement = str(details or "").strip()
+    if not statement:
+        statement = (
+            "Manual airline complaint imported through Telegram. "
+            "The original complaint text was not supplied."
+        )
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        duplicate = conn.execute(
+            """SELECT * FROM complaints
+               WHERE kind = 'airline'
+                 AND lower(trim(reference)) = lower(trim(?))
+               LIMIT 1""",
+            (reference,),
+        ).fetchone()
+        if duplicate:
+            if str(duplicate["flight_key"]) != str(flight_key):
+                raise ValueError(
+                    "That complaint reference is already linked to another flight.")
+            return dict(duplicate), "already_linked"
+        active = conn.execute(
+            """SELECT * FROM complaints
+               WHERE flight_key = ? AND kind = 'airline'
+                 AND status IN ('filing', 'submitted', 'filed', 'sent',
+                                'accepted_pending_reference')
+               ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (str(flight_key),),
+        ).fetchone()
+        if active:
+            if (active["status"] == "accepted_pending_reference"
+                    and not str(active["reference"] or "").strip()):
+                conn.execute(
+                    """UPDATE complaints
+                       SET status='submitted', reference=?
+                       WHERE id=?""",
+                    (reference, int(active["id"])),
+                )
+                row = conn.execute(
+                    "SELECT * FROM complaints WHERE id=?",
+                    (int(active["id"]),),
+                ).fetchone()
+                return dict(row), "completed_existing"
+            raise ValueError(
+                "This flight already has an active airline complaint. "
+                "I did not create a second case.")
+        cursor = conn.execute(
+            """INSERT INTO complaints
+                   (flight_key, kind, root_complaint_id, generation, subject,
+                    status, reference, details, original_text, submitted_text,
+                    portal_category, issue_summary, submission_source,
+                    created_at)
+               VALUES (?, 'airline', NULL, 0, ?, 'submitted', ?, ?, ?, ?, ?,
+                       ?, 'manual_telegram',
+                       COALESCE(?, datetime('now', 'localtime')))""",
+            (
+                str(flight_key), "Manually filed airline complaint",
+                reference, statement, statement,
+                str(details or "").strip() or None,
+                str(category or "").strip() or None,
+                statement,
+                created_at,
+            ),
+        )
+        complaint_id = int(cursor.lastrowid)
+        conn.execute(
+            "UPDATE complaints SET root_complaint_id=? WHERE id=?",
+            (complaint_id, complaint_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM complaints WHERE id=?", (complaint_id,)
+        ).fetchone()
+        return dict(row), "created"
 
 
 def active_complaint_for_flight(flight_key: str, kind: str) -> dict | None:
@@ -1633,6 +1762,109 @@ def list_telegram_messages(limit: int = 20) -> list[dict]:
             """SELECT * FROM telegram_messages
                ORDER BY created_at DESC, id DESC LIMIT ?""", (limit,)).fetchall()
     return [dict(row) for row in reversed(rows)]
+
+
+def create_ticket_import(
+        token: str,
+        chat_id: str,
+        source_message_id: int,
+        source_kind: str,
+        *,
+        source_file: str = "",
+        source_text: str = "",
+) -> dict:
+    """Create or return the durable draft for one Telegram source message."""
+    with connect() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO telegram_ticket_imports
+                   (token, chat_id, source_message_id, source_kind,
+                    source_file, source_text, status)
+               VALUES (?, ?, ?, ?, ?, ?, 'processing')""",
+            (
+                str(token), str(chat_id), int(source_message_id),
+                str(source_kind or "text")[:30],
+                str(source_file or "") or None,
+                str(source_text or "")[:60_000],
+            ),
+        )
+        row = conn.execute(
+            """SELECT * FROM telegram_ticket_imports
+               WHERE chat_id = ? AND source_message_id = ?""",
+            (str(chat_id), int(source_message_id)),
+        ).fetchone()
+    return _ticket_import_row(row)
+
+
+def _ticket_import_row(row) -> dict | None:
+    if not row:
+        return None
+    item = dict(row)
+    for key, fallback in (("extracted", {}), ("imported_flight_keys", [])):
+        try:
+            item[key] = json.loads(item.get(key) or json.dumps(fallback))
+        except (TypeError, ValueError):
+            item[key] = fallback
+    return item
+
+
+def get_ticket_import(token: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM telegram_ticket_imports WHERE token = ?",
+            (str(token),),
+        ).fetchone()
+    return _ticket_import_row(row)
+
+
+def latest_pending_ticket_import(chat_id: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT * FROM telegram_ticket_imports
+               WHERE chat_id = ?
+                 AND status IN ('processing', 'awaiting_details', 'ready')
+               ORDER BY updated_at DESC, created_at DESC LIMIT 1""",
+            (str(chat_id),),
+        ).fetchone()
+    return _ticket_import_row(row)
+
+
+def update_ticket_import(
+        token: str,
+        *,
+        status: str | None = None,
+        source_file: str | None = None,
+        source_text: str | None = None,
+        extracted: dict | None = None,
+        imported_flight_keys: list[str] | None = None,
+        error: str | None = None,
+) -> bool:
+    """Update a draft while preserving fields omitted by the caller."""
+    assignments = ["updated_at=datetime('now', 'localtime')"]
+    values: list = []
+    for column, value in (
+        ("status", status),
+        ("source_file", source_file),
+        ("source_text", source_text),
+        ("extracted", (
+            json.dumps(extracted, ensure_ascii=False)
+            if extracted is not None else None)),
+        ("imported_flight_keys", (
+            json.dumps(imported_flight_keys, ensure_ascii=False)
+            if imported_flight_keys is not None else None)),
+        ("error", error),
+    ):
+        if value is None:
+            continue
+        assignments.append(f"{column} = ?")
+        values.append(value)
+    values.append(str(token))
+    with connect() as conn:
+        cursor = conn.execute(
+            f"""UPDATE telegram_ticket_imports SET {', '.join(assignments)}
+                WHERE token = ?""",
+            values,
+        )
+    return bool(cursor.rowcount)
 
 
 def save_portal_job(job: dict) -> None:

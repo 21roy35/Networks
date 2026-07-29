@@ -273,6 +273,7 @@
               <span>{{ item.status|replace('_', ' ')|title }}</span>
               <span>Category: {{ item.portal_category or 'Not recorded' }}</span>
               {% if item.reference %}<span>Reference: {{ item.reference }}</span>{% endif %}
+              <span>Filed via: {{ 'Telegram manual import' if item.submission_source == 'manual_telegram' else 'FlightDeck automation' }}</span>
               <span>Generation: {{ item.generation or 0 }}</span>
               {% if item.parent_reference %}<span>Parent: {{ item.parent_reference }}</span>{% endif %}
               <span>Root: {{ item.root_reference }}</span>
@@ -297,7 +298,7 @@
               <pre class="complaint-text" dir="auto">{{ item.provider_response_text }}</pre>
             </div>{% endif %}
             <div class="complaint-block">
-              <div class="complaint-block-head"><h3>{% if item.status in ['submitted', 'filed', 'sent', 'accepted_pending_reference'] %}Exact text sent to portal{% else %}Portal text prepared for this attempt{% endif %}</h3>{% if item.submitted_text %}<button type="button" class="copy" onclick="copyFrom(this, 'complaint-submitted-{{ item.id }}')">Copy</button>{% endif %}</div>
+              <div class="complaint-block-head"><h3>{% if item.submission_source == 'manual_telegram' %}Complaint text supplied with manual import{% elif item.status in ['submitted', 'filed', 'sent', 'accepted_pending_reference'] %}Exact text sent to portal{% else %}Portal text prepared for this attempt{% endif %}</h3>{% if item.submitted_text %}<button type="button" class="copy" onclick="copyFrom(this, 'complaint-submitted-{{ item.id }}')">Copy</button>{% endif %}</div>
               {% if item.submitted_text %}<pre class="complaint-text" dir="auto" id="complaint-submitted-{{ item.id }}">{{ item.submitted_text }}</pre>{% else %}<p class="small muted" style="margin:0">This exact expanded portal text was not retained by the older FlightDeck version. The original statement is shown above without guessing the missing wording.</p>{% endif %}
             </div>
             {% if item.child_complaints %}<div class="complaint-block">

@@ -1667,3 +1667,95 @@ def test_grid_answers_are_numbered_for_telegram():
     annotated = _annotate_grid(source.getvalue(), 9)
     assert annotated.startswith(b"\x89PNG")
     assert _parse_cells("1, 4 and 9", 9) == [1, 4, 9]
+
+
+def test_telegram_ticket_preview_confirm_and_manual_reference(
+        coordinator):
+    bot, api = coordinator
+    bot.handle_update({"message": {
+        "message_id": 1901,
+        "chat": {"id": 42},
+        "text": (
+            "/ticket Airline: Saudia\n"
+            "Passenger: Muhannad Albu Asais\n"
+            "PNR: TG7ABC\n"
+            "E-ticket number: 065-1234567890\n"
+            "Flight number: SV520\n"
+            "Flight date: 2026-07-15\n"
+            "Route: RUH to BAH\n"
+            "Departure: 2026-07-15 10:15\n"
+            "Arrival: 2026-07-15 11:30\n"
+            "Manual complaint C_2779999 filed 2026-07-20 "
+            "about the seat screen was broken."
+        ),
+    }})
+    deadline = time.time() + 3
+    draft = None
+    while time.time() < deadline:
+        draft = db.latest_pending_ticket_import("42")
+        if draft and draft["status"] == "ready":
+            break
+        time.sleep(.01)
+    assert draft and draft["status"] == "ready"
+    preview = api.messages[-1]
+    buttons = preview["reply_markup"]["inline_keyboard"][0]
+    assert buttons[0]["text"] == "Add to dashboard"
+    assert "Muhannad Albu Asais" in preview["text"]
+    assert "C_2779999" in preview["text"]
+
+    bot.handle_update({"callback_query": {
+        "id": "ticket-confirm-1",
+        "data": f"ticket_confirm:{draft['token']}",
+        "message": {"chat": {"id": 42}},
+    }})
+
+    flights = db.list_flights()
+    assert len(flights) == 1
+    assert flights[0]["passenger"] == "Muhannad Albu Asais"
+    assert flights[0]["flight_number"] == "SV520"
+    complaint = db.list_complaints()[0]
+    assert complaint["reference"] == "C_2779999"
+    assert complaint["submission_source"] == "manual_telegram"
+    assert complaint["created_at"] == "2026-07-20 00:00:00"
+    assert "screen was broken" in complaint["submitted_text"]
+    assert db.get_ticket_import(draft["token"])["status"] == "imported"
+
+
+def test_manual_reference_refuses_ambiguous_family_flights(
+        coordinator):
+    bot, api = coordinator
+    raw = [
+        {
+            "message_id": "<family-one>",
+            "subject": "E-ticket SV1671",
+            "sender": "tickets@saudia.com",
+            "date": datetime(2026, 7, 1),
+            "body": (
+                "Passenger: Mansour Albu Asais\nPNR: MAN123\n"
+                "Ticket number: 065-1111111111\nFlight SV1671\n"
+                "Flight date: 15 July 2026\nRUH to AHB"),
+        },
+        {
+            "message_id": "<family-two>",
+            "subject": "E-ticket SV1671",
+            "sender": "tickets@saudia.com",
+            "date": datetime(2026, 7, 1),
+            "body": (
+                "Passenger: Muhannad Albu Asais\nPNR: MUH123\n"
+                "Ticket number: 065-2222222222\nFlight SV1671\n"
+                "Flight date: 15 July 2026\nRUH to AHB"),
+        },
+    ]
+    ingest(raw, log=lambda *_args, **_kwargs: None)
+    telegram_bot.rebuild_flights(log=lambda *_args, **_kwargs: None)
+
+    bot.handle_update({"message": {
+        "message_id": 1902,
+        "chat": {"id": 42},
+        "text": (
+            "/complaintref C_2788888 flight SV1671 date 2026-07-15 "
+            "filed 2026-07-20 about damaged baggage"),
+    }})
+
+    assert db.list_complaints() == []
+    assert "more than one possible family flight" in api.messages[-1]["text"]
