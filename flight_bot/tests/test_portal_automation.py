@@ -2214,6 +2214,13 @@ def test_gaca_internal_survey_details_id_is_not_a_public_reference():
         "details?detailsId=2642710") == ""
 
 
+def test_gaca_confirmation_text_extracts_single_letter_reference():
+    assert _extract_reference(
+        "Your request has been successfully submitted. "
+        "Your complaint number is C076506."
+    ) == "C076506"
+
+
 def test_gaca_category_native_select_is_verified_after_selection(monkeypatch):
     class Checked:
         def inner_text(self):

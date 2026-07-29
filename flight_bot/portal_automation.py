@@ -4212,7 +4212,7 @@ def _prepare_generic(page, payload: dict, update):
 
 def _extract_reference(text: str) -> str:
     patterns = (
-        r"(?:(?:complaint|request|case)\s+)?(?:reference|case|complaint|request)\s*(?:number|no\.?|id|#)?\s*(?:is\s*)?[:#-]?\s*([A-Z]{2,10}-?\d{4,})",
+        r"(?:(?:complaint|request|case)\s+)?(?:reference|case|complaint|request)\s*(?:number|no\.?|id|#)?\s*(?:is\s*)?[:#-]?\s*([A-Z][A-Z_-]{0,9}\d{4,})",
         r"(?:المرجع|رقم\s*(?:الطلب|الشكوى))\s*[:#-]?\s*([A-Z0-9-]{6,})",
     )
     for pattern in patterns:
