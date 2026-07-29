@@ -27,7 +27,8 @@ _SUBJECT_KEYWORDS = [
     "case", "customer relations", "feedback", "reference",
 ]
 
-_SKIP_TAGS = {"script", "style", "head", "title", "meta", "link"}
+_SKIP_TAGS = {"script", "style", "head", "title"}
+_VOID_SKIP_TAGS = {"meta", "link"}
 _BREAK_TAGS = {"br", "p", "div", "tr", "li", "table", "ul", "ol",
                "h1", "h2", "h3", "h4", "h5", "h6"}
 
@@ -41,6 +42,8 @@ class _TextExtractor(HTMLParser):
         self._skip = 0
 
     def handle_starttag(self, tag, attrs):
+        if tag in _VOID_SKIP_TAGS:
+            return
         if tag in _SKIP_TAGS:
             self._skip += 1
         elif tag in _BREAK_TAGS:
@@ -184,6 +187,75 @@ def message_to_raw(msg: email.message.EmailMessage,
         "date": date,
         "body": body,
     }
+
+
+def fetch_recent_verification_message(
+        config: dict,
+        *,
+        since: datetime | None = None,
+        limit: int = 20) -> dict | None:
+    """Return the newest recent OTP/verification email without storing it."""
+    imap_cfg = config.get("imap") or {}
+    if not imap_cfg.get("user") or not imap_cfg.get("password"):
+        return None
+    since = since or datetime.now().astimezone()
+    search_since = (since - timedelta(seconds=30)).strftime("%d-%b-%Y")
+    conn = imaplib.IMAP4_SSL(
+        imap_cfg.get("host") or "imap.gmail.com",
+        int(imap_cfg.get("port") or 993))
+    try:
+        conn.login(imap_cfg["user"], imap_cfg["password"])
+        status, _ = conn.select("INBOX", readonly=True)
+        if status != "OK":
+            return None
+        uids: set[bytes] = set()
+        for query in (
+                f'(SINCE {search_since} SUBJECT "OTP")',
+                f'(SINCE {search_since} SUBJECT "verification")',
+                f'(SINCE {search_since} FROM "gaca.gov.sa")'):
+            try:
+                status, data = conn.uid("SEARCH", None, query)
+            except imaplib.IMAP4.error:
+                continue
+            if status == "OK" and data and data[0]:
+                uids.update(data[0].split())
+        newest = sorted(
+            uids, key=lambda value: int(value), reverse=True)[
+                :max(1, min(int(limit), 50))]
+        for uid in newest:
+            status, data = conn.uid("FETCH", uid, "(RFC822)")
+            if (status != "OK" or not data or not isinstance(data[0], tuple)
+                    or len(data[0]) < 2):
+                continue
+            raw_bytes = data[0][1]
+            msg = email.message_from_bytes(
+                raw_bytes, policy=email.policy.default)
+            raw = message_to_raw(msg, raw_bytes=raw_bytes)
+            sent_at = raw.get("date")
+            if isinstance(sent_at, datetime):
+                threshold = since - timedelta(seconds=30)
+                if sent_at.tzinfo is None and threshold.tzinfo is not None:
+                    threshold = threshold.replace(tzinfo=None)
+                elif sent_at.tzinfo is not None and threshold.tzinfo is None:
+                    threshold = threshold.replace(tzinfo=sent_at.tzinfo)
+                if sent_at < threshold:
+                    continue
+            context = " ".join((
+                str(raw.get("subject") or ""),
+                str(raw.get("sender") or ""),
+                str(raw.get("body") or ""),
+            ))
+            if re.search(
+                    r"otp|verification|one[ -]?time|passcode|security code|"
+                    r"رمز\s*(?:التحقق|التأكيد|الدخول)",
+                    context, re.I):
+                return raw
+        return None
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
 
 
 def _search_queries(since: str, first_uid: int | None = None) -> list[str]:

@@ -23,17 +23,40 @@ from . import db
 from .ai_assistant import ClaudeAssistant
 from .airlines import AIRLINES
 from .captcha_solver import TwoCaptchaSolver
+from .case_strategy import recommend_case
 from .complaints import complaint_payload, missing_portal_fields
 from .config import TELEGRAM_EVIDENCE_DIR, passenger_profile_key
-from .flight_status import live_landed, parse_flight_time, schedule_has_finished
+from .flight_status import (get_flight_status, live_landed, parse_flight_time,
+                            refresh_flight_status, schedule_has_finished)
+from .mail_client import fetch_recent_verification_message
 from .pipeline import scan_mailbox
 from .portal_automation import (PortalResult, _extract_reference, set_ai_handler,
                                 set_captcha_solver, set_verification_handler,
-                                start_portal_job)
+                                resume_due_portal_jobs, start_portal_job)
 from .web_access import create_web_token
 
 
 logger = logging.getLogger(__name__)
+
+
+def _verification_code_from_text(value: str) -> str:
+    """Rank short numbers by proximity to verification language."""
+    value = str(value or "")
+    context_matches = list(re.finditer(
+        r"otp|verification|one[ -]?time|passcode|security code|"
+        r"رمز\s*(?:التحقق|التأكيد|الدخول)",
+        value, re.I))
+    ranked = []
+    for match in re.finditer(r"(?<!\d)(\d{4,8})(?!\d)", value):
+        distance = min((
+            min(abs(match.start() - item.end()),
+                abs(item.start() - match.end()))
+            for item in context_matches
+        ), default=1000)
+        score = max(0, 200 - distance)
+        score += 10 if len(match.group(1)) == 4 else 0
+        ranked.append((score, match.group(1)))
+    return max(ranked, default=(0, ""))[1]
 
 
 def _buttons(rows: list[list[tuple[str, str]]]) -> dict:
@@ -53,8 +76,17 @@ def _airline_confirmation_reference(subject: str, body: str) -> str:
     so itinerary and e-ticket messages cannot be attached to a complaint.
     """
     blob = " ".join((subject or "", body or ""))
+    # Prefer the carrier's explicit C_ reference before generic phrases such
+    # as "Voucher no." or "Ticket number"; those may contain 13-digit
+    # e-ticket/EMD identifiers that are not complaint references.
+    explicit = re.search(
+        r"(?<![A-Z0-9])C[_-](\d{6,})(?!\d)", blob, re.I)
+    if explicit:
+        return f"C_{explicit.group(1)}"
     reference = _extract_reference(blob)
-    if reference:
+    if reference and not (
+        reference.isdigit() and len(reference) > 9
+    ):
         return reference
     if not re.search(
             r"SAUDIA-Guest Relations|Registered with us|Under Investigation|"
@@ -82,6 +114,103 @@ def _telegram_sms_reference(value: str) -> str:
         r"(?:number|no\.?|id)?\s*(?:is\s*)?[:#-]?\s*(\d{6,9})\b",
         value or "", re.I)
     return f"C_{contextual.group(1)}" if contextual else ""
+
+
+def _gaca_confirmation_reference(subject: str, body: str) -> str:
+    """Accept only GACA's public C-number, never an internal detailsId."""
+    blob = " ".join((subject or "", body or ""))
+    match = re.search(r"(?<![A-Z0-9_])(C\d{6,})(?!\d)", blob, re.I)
+    return match.group(1).upper() if match else ""
+
+
+def _gaca_case_fact_score(blob: str, complaint: dict) -> int:
+    flight = complaint.get("flight_data") or {}
+    compact_blob = re.sub(r"[^a-z0-9]", "", str(blob or "").casefold())
+
+    def compact(value) -> str:
+        return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+    score = 0
+    pnr = compact(flight.get("pnr"))
+    if len(pnr) >= 5 and pnr in compact_blob:
+        score += 100
+    tickets = list(flight.get("ticket_numbers") or [])
+    if flight.get("ticket_number"):
+        tickets.append(flight["ticket_number"])
+    if any(
+        len(compact(ticket)) >= 8 and compact(ticket) in compact_blob
+        for ticket in tickets
+    ):
+        score += 100
+    numbers = list(flight.get("flight_numbers") or [])
+    if flight.get("flight_number"):
+        numbers.append(flight["flight_number"])
+    if any(
+        len(compact(number)) >= 4 and compact(number) in compact_blob
+        for number in numbers
+    ):
+        score += 45
+    return score
+
+
+def reconcile_gaca_mail_events(events: list[dict], notify=None) -> int:
+    """Attach regulator email references to the exact emailed escalation."""
+    pending = [
+        complaint
+        for complaint in db.list_complaints()
+        if complaint.get("kind") == "gaca"
+        and complaint.get("status") == "accepted_pending_reference"
+        and not complaint.get("reference")
+    ]
+    reconciled = 0
+    for event in events:
+        marker = f"gaca-reference-captured:{event.get('id')}"
+        if db.event_seen(marker):
+            continue
+        sender_domain = parseaddr(event.get("sender") or "")[1].rsplit(
+            "@", 1)[-1].casefold()
+        if not (
+            sender_domain == "gaca.gov.sa"
+            or sender_domain.endswith(".gaca.gov.sa")
+        ):
+            continue
+        reference = _gaca_confirmation_reference(
+            event.get("subject") or "", event.get("body") or "")
+        if not reference:
+            continue
+        blob = " ".join((
+            event.get("subject") or "",
+            event.get("body") or "",
+        ))
+        scored = [
+            (_gaca_case_fact_score(blob, complaint), complaint)
+            for complaint in pending
+        ]
+        matches = [
+            complaint for score, complaint in scored if score > 0
+        ]
+        if len(matches) == 1:
+            complaint = matches[0]
+        elif len(pending) == 1:
+            complaint = pending[0]
+        else:
+            continue
+        if not db.reconcile_portal_confirmation(
+            int(complaint["id"]), reference
+        ):
+            continue
+        db.mark_event_seen(marker)
+        pending = [
+            item for item in pending
+            if int(item["id"]) != int(complaint["id"])
+        ]
+        reconciled += 1
+        if notify:
+            notify(
+                "Captured the GACA complaint reference from its official "
+                f"email: {reference}."
+            )
+    return reconciled
 
 
 class TelegramAPI:
@@ -147,6 +276,8 @@ class TelegramAPI:
     def set_commands(self):
         commands = [
             {"command": "status", "description": "Show FlightDeck status"},
+            {"command": "flightstatus", "description": "Refresh a flight status"},
+            {"command": "recommend", "description": "Best complaint next step"},
             {"command": "web", "description": "Open the private dashboard"},
             {"command": "cancel", "description": "Cancel pending issue intake"},
         ]
@@ -182,6 +313,7 @@ class PendingIntake:
     flight_key: str
     incident: str = ""
     attachments: list[str] = field(default_factory=list)
+    parent_complaint_id: int | None = None
     timer: threading.Timer | None = None
 
 
@@ -203,9 +335,11 @@ class TelegramCoordinator:
         self._mail_scan_thread: threading.Thread | None = None
         self._mail_scan_error = ""
         self._status_cache: dict[str, tuple[float, bool | None]] = {}
+        self._used_verification_emails: set[str] = set()
         self._ai_chat_lock = threading.Lock()
         self._ai_chat_thread: threading.Thread | None = None
         self._ai_context: dict[str, object] = {}
+        # Legacy floor kept for migrations/tests; FIFO response matching is disabled.
         self._fifo_response_floor = db.initialize_fifo_response_floor()
 
     @property
@@ -224,11 +358,24 @@ class TelegramCoordinator:
             int(self.ai.settings.get("max_portal_attempts", 3)))
         set_captcha_solver(
             self.captcha.solve if self.captcha.enabled else None)
+        recovered = db.recover_interrupted_portal_jobs()
+        if recovered["retry_wait"] or recovered["quarantined"]:
+            self.notify(
+                "FlightDeck recovered interrupted portal work: "
+                f"{recovered['retry_wait']} pre-submit job(s) were safely "
+                f"requeued and {recovered['quarantined']} Submit-stage job(s) "
+                "were quarantined for reference reconciliation.")
+        resume_due_portal_jobs(self.portal_progress_handler)
         threading.Thread(
             target=self._register_commands, name="telegram-commands",
             daemon=True).start()
         threading.Thread(target=self._poll_loop, name="telegram-updates",
                          daemon=True).start()
+        threading.Thread(
+            target=self._portal_resume_loop,
+            name="portal-job-resume",
+            daemon=True,
+        ).start()
         threading.Thread(target=self._monitor_loop, name="telegram-monitor",
                          daemon=True).start()
         return self
@@ -249,8 +396,16 @@ class TelegramCoordinator:
         set_captcha_solver(None)
 
     def notify(self, text: str, buttons=None, force_reply: bool = False) -> dict:
-        result = self.api.send_message(
-            self.chat_id, text, reply_markup=buttons, force_reply=force_reply)
+        try:
+            result = self.api.send_message(
+                self.chat_id, text, reply_markup=buttons,
+                force_reply=force_reply)
+        except Exception as exc:
+            # A temporary Telegram outage must not abort an already-safe
+            # provider/regulator workflow before the official portal opens.
+            logger.warning(
+                "Telegram notification could not be delivered: %s", exc)
+            result = {}
         try:
             db.record_telegram_message(
                 "outgoing", result.get("message_id") if result else None,
@@ -261,8 +416,13 @@ class TelegramCoordinator:
 
     def _send_photo(self, image: bytes, caption: str,
                     buttons: dict | None = None) -> dict:
-        result = self.api.send_photo(
-            self.chat_id, image, caption, reply_markup=buttons)
+        try:
+            result = self.api.send_photo(
+                self.chat_id, image, caption, reply_markup=buttons)
+        except Exception as exc:
+            logger.warning(
+                "Telegram screenshot could not be delivered: %s", exc)
+            result = {}
         try:
             db.record_telegram_message(
                 "outgoing", result.get("message_id") if result else None,
@@ -288,10 +448,12 @@ class TelegramCoordinator:
             "confirmation_unknown": "checking the airline confirmation",
             "needs_attention": "waiting for your attention",
             "error": "stopped with an error",
+            "retry_wait": "queued for a safe retry",
+            "quarantined": "quarantined pending reconciliation",
         }
         terminal = {
             "submitted", "accepted_pending_reference", "confirmation_unknown",
-            "needs_attention", "error",
+            "needs_attention", "error", "retry_wait", "quarantined",
         }
 
         def deliver():
@@ -314,8 +476,7 @@ class TelegramCoordinator:
             key = (status, message)
             previous = state["stage"]
             if (key == state["key"]
-                    or (status in terminal and previous == status)
-                    or (status == previous and not image)):
+                    or (status in terminal and previous == status)):
                 return
             current_label = labels.get(status, status.replace("_", " "))
             if status == "submitted":
@@ -357,7 +518,43 @@ class TelegramCoordinator:
         else:
             self.notify(prompt, buttons=markup, force_reply=not choices)
         timeout = int(self.settings.get("verification_timeout_minutes", 10)) * 60
-        waiter.event.wait(timeout)
+        started = datetime.now().astimezone()
+        deadline = time.monotonic() + timeout
+        next_email_check = 0.0
+        while not waiter.event.is_set() and time.monotonic() < deadline:
+            if waiter.kind == "otp" and time.monotonic() >= next_email_check:
+                next_email_check = time.monotonic() + 8
+                try:
+                    message = fetch_recent_verification_message(
+                        self.config, since=started)
+                    message_id = str(
+                        (message or {}).get("message_id") or "")
+                    if (message and message_id
+                            and message_id in self._used_verification_emails):
+                        message = None
+                    if message:
+                        blob = "\n".join((
+                            str(message.get("subject") or ""),
+                            str(message.get("body") or ""),
+                        ))
+                        code = _verification_code_from_text(blob)
+                        if not code and self.ai.enabled:
+                            distilled = self.ai.distill_sms(
+                                str(message.get("sender") or "email"), blob)
+                            code = re.sub(
+                                r"\D", "",
+                                str((distilled or {}).get("otp") or ""))
+                        if code and self.accept_verification_code(
+                                code, source="email"):
+                            if message_id:
+                                self._used_verification_emails.add(message_id)
+                            self.notify(
+                                "FlightDeck received the current portal code "
+                                "from email and entered it automatically.")
+                except Exception:
+                    logger.exception(
+                        "Automatic verification-email check failed")
+            waiter.event.wait(min(1.0, max(0.0, deadline - time.monotonic())))
         with self._lock:
             if self._verification is waiter:
                 self._verification = None
@@ -366,26 +563,67 @@ class TelegramCoordinator:
             return None
         return waiter.response
 
+    def accept_verification_code(self, code: str,
+                                 *, source: str = "shortcut") -> bool:
+        """Deliver a trusted short-lived code to the active portal waiter."""
+        code = re.sub(r"\D", "", str(code or ""))
+        if not re.fullmatch(r"\d{4,8}", code):
+            return False
+        with self._lock:
+            waiter = self._verification
+            if not waiter or waiter.kind != "otp" or waiter.event.is_set():
+                return False
+            waiter.response = code
+            waiter.event.set()
+        logger.info("Portal OTP supplied from %s without storing its body", source)
+        return True
+
     def _poll_loop(self):
         timeout = int(self.settings.get("poll_timeout_seconds", 25))
+        consecutive_failures = 0
         while not self.stop_event.is_set():
             try:
                 for update in self.api.updates(self.offset, timeout):
                     self.offset = max(self.offset, int(update["update_id"]) + 1)
                     self.handle_update(update)
+                consecutive_failures = 0
+            except Exception as exc:
+                consecutive_failures += 1
+                # Telegram long polling occasionally times out or drops a
+                # connection. Updates remain queued at the saved offset, so use
+                # a short bounded backoff without flooding the error log.
+                if consecutive_failures == 1 or consecutive_failures % 10 == 0:
+                    logger.warning(
+                        "Telegram polling temporarily unavailable (attempt %s): %s",
+                        consecutive_failures, exc)
+                self.stop_event.wait(min(30, 2 ** min(consecutive_failures, 5)))
+
+    def _portal_resume_loop(self):
+        """Lease due portal jobs independently of slower mailbox sweeps."""
+        while not self.stop_event.is_set():
+            try:
+                resume_due_portal_jobs(self.portal_progress_handler, limit=1)
             except Exception:
-                logger.exception("Telegram update polling failed")
-                self.stop_event.wait(3)
+                logger.exception("Dedicated portal resume cycle failed")
+            self.stop_event.wait(15)
 
     def _monitor_loop(self):
         interval = max(15, int(self.settings.get("monitor_interval_seconds", 60)))
         while not self.stop_event.is_set():
             try:
                 self._maybe_scan_mailbox()
+                self.refresh_watched_flights()
                 self.send_due_surveys()
                 self.check_complaint_responses()
                 self.ask_for_pending_references()
+                self.resume_pending_parent_escalations()
                 self.auto_escalate_due_complaints()
+                # The dedicated resume loop and this slower monitor loop both
+                # use a one-job lease.  The portal worker's global browser
+                # lock then guarantees that only one official-site request
+                # workflow can run at a time.
+                resume_due_portal_jobs(
+                    self.portal_progress_handler, limit=1)
             except Exception:
                 logger.exception("Telegram monitor cycle failed")
             self.stop_event.wait(interval)
@@ -413,6 +651,24 @@ class TelegramCoordinator:
         response = message.get("text") or message.get("caption") or ""
         if not response.strip():
             return True
+        safe_labels = {
+            "otp": "[OTP response received]",
+            "recaptcha": "[CAPTCHA response received]",
+            "hcaptcha": "[CAPTCHA response received]",
+            "captcha": "[CAPTCHA response received]",
+            "text_captcha": "[CAPTCHA response received]",
+            "field_input": "[Required field response received]",
+            "login": "[Portal login response received]",
+            "approval": "[Portal approval response received]",
+        }
+        try:
+            db.record_telegram_message(
+                "incoming", message.get("message_id"),
+                safe_labels.get(waiter.kind, "[Verification response received]"),
+                "photo" if message.get("photo") else "text",
+                (message.get("reply_to_message") or {}).get("message_id"))
+        except Exception:
+            logger.exception("Could not journal Telegram verification response")
         waiter.response = response.strip()
         waiter.event.set()
         if waiter.kind == "otp":
@@ -473,6 +729,15 @@ class TelegramCoordinator:
             return
         if text == "/status":
             self._send_status()
+            return
+        if text and text.split(maxsplit=1)[0].lower() == "/flightstatus":
+            query = text.partition(" ")[2].strip()
+            self._send_live_status({"query": query, "latest": not query}, force=True)
+            return
+        if text and text.split(maxsplit=1)[0].lower() == "/recommend":
+            query = text.partition(" ")[2].strip()
+            self._send_case_recommendation(
+                {"query": query, "latest": not query}, question=text)
             return
         if text and text.split(maxsplit=1)[0].lower() == "/web":
             self._send_web_link()
@@ -563,10 +828,27 @@ class TelegramCoordinator:
                 f"{mailbox.get('folders') or 0} folder(s).")
         else:
             mailbox_status = " Gmail incremental sync is waiting to start."
+        status_settings = self.config.get("flight_status") or {}
+        status_sources = []
+        if status_settings.get("flightaware_api_key"):
+            status_sources.append("FlightAware")
+        if status_settings.get("airplanes_live_enabled", True):
+            status_sources.append("Airplanes.live")
+        if status_settings.get("adsb_lol_enabled", True):
+            status_sources.append("adsb.lol")
+        if status_settings.get("weather_enabled", True):
+            status_sources.append("aviation weather")
+        status_counts = db.flight_status_counts()
+        tracking_status = (
+            f" Live flight evidence is on through {', '.join(status_sources)}; "
+            f"{status_counts['snapshots']} flight status snapshot(s) and "
+            f"{status_counts['observations']} source observation(s) are persisted."
+            if status_sources else
+            " Live flight evidence is using booking and schedule data only.")
         return (
             f"FlightDeck is running. {counts['flights']} flights, "
             f"{counts['complaints']} complaints, {counts['emails']} parsed emails."
-            + mailbox_status + ai_status + captcha_status
+            + mailbox_status + tracking_status + ai_status + captcha_status
             + f" GACA auto-escalation is on after {auto_days} days "
               "without a substantive airline response.")
 
@@ -678,7 +960,10 @@ class TelegramCoordinator:
             "complaint_details", "complaint_responses", "show_evidence",
             "search_email",
         }
-        flight_actions = {"flight_details", "list_flights"}
+        flight_actions = {
+            "flight_details", "list_flights", "flight_status",
+            "case_recommendation", "complaint_readiness",
+        }
         if name in complaint_actions and self._ai_context.get("reference"):
             result["reference"] = self._ai_context["reference"]
         elif name in complaint_actions:
@@ -694,8 +979,16 @@ class TelegramCoordinator:
         return result
 
     def _ai_catalog(self) -> dict:
+        all_complaints = db.list_complaints()
+        complaints_by_flight: dict[str, list[dict]] = {}
+        for item in reversed(all_complaints):
+            complaints_by_flight.setdefault(item.get("flight_key") or "", []).append(item)
         flights = []
         for flight in db.list_flights()[:20]:
+            snapshot = db.get_flight_status_snapshot(flight.get("flight_key") or "") or {}
+            strategy = recommend_case(
+                flight, snapshot, complaints_by_flight.get(
+                    flight.get("flight_key") or "", []))
             flights.append({
                 "flight_number": self._effective_flight_value(
                     flight, "flight_number") or ", ".join(
@@ -706,8 +999,13 @@ class TelegramCoordinator:
                     flight, "destination") or "",
                 "pnr": self._effective_flight_value(flight, "pnr") or "",
                 "passenger": self._flight_passenger(flight),
+                "live_status": snapshot.get("status") or "not checked",
+                "status_confidence": snapshot.get("confidence"),
+                "status_provider": snapshot.get("provider") or "",
+                "status_updated_at": snapshot.get("updated_at") or "",
+                "recommended_action": strategy.get("recommended_action"),
+                "complaint_readiness": strategy.get("readiness_score"),
             })
-        all_complaints = db.list_complaints()
         complaints = []
         for complaint in all_complaints[:20]:
             flight = complaint.get("flight_data") or {}
@@ -716,6 +1014,8 @@ class TelegramCoordinator:
                 "kind": complaint.get("kind") or "",
                 "status": complaint.get("status") or "",
                 "created_at": complaint.get("created_at") or "",
+                "portal_category": complaint.get("portal_category") or "",
+                "issue": _clean_excerpt(complaint.get("details") or "", 240),
                 "flight_number": self._effective_flight_value(
                     flight, "flight_number") or ", ".join(
                         flight.get("flight_numbers") or []),
@@ -905,6 +1205,7 @@ class TelegramCoordinator:
                 str(value or "") for value in (
                     item.get("reference"), item.get("kind"), item.get("status"),
                     item.get("subject"), item.get("details"),
+                    item.get("portal_category"), item.get("submitted_text"),
                     self._flight_label(item.get("flight_data") or {}),
                     self._flight_passenger(item.get("flight_data") or {}),
                 )).casefold()]
@@ -956,6 +1257,118 @@ class TelegramCoordinator:
         self.notify(text)
         return True
 
+    def _selected_flight(self, action: dict) -> dict | None:
+        flights = self._matching_flights(action)
+        if action.get("latest") and flights:
+            flights = flights[:1]
+        if not flights:
+            self.notify("I found no stored flight matching those exact details.")
+            return None
+        if len(flights) > 1:
+            self.notify("I found several flights. Name the flight number or PNR:\n" +
+                        "\n".join(f"• {self._flight_summary(item)}"
+                                  for item in flights[:8]))
+            return None
+        return db.get_flight(flights[0]["id"]) or flights[0]
+
+    def _send_live_status(self, action: dict, force: bool = True) -> bool:
+        flight = self._selected_flight(action)
+        if not flight:
+            return True
+        self.notify(f"Checking live sources for {self._flight_label(flight)}…")
+        snapshot = refresh_flight_status(
+            self.config, flight, force=force, now=self._flight_status_now())
+        self._remember_ai_context(flight=flight)
+        sources = snapshot.get("sources") or []
+        source_text = ", ".join(
+            f"{item.get('provider')} ({item.get('status')})" for item in sources[:5])
+        lines = [
+            f"Flight status: {self._flight_summary(flight)}",
+            f"Current state: {snapshot.get('label') or 'Unknown'}",
+            f"Confidence/source: {int(float(snapshot.get('confidence') or 0) * 100)}% / "
+            f"{snapshot.get('provider') or 'none'}",
+            f"Last checked: {snapshot.get('updated_at') or 'unknown'}",
+        ]
+        for label, key in (("Estimated departure", "estimated_departure"),
+                           ("Actual departure", "actual_departure"),
+                           ("Estimated arrival", "estimated_arrival"),
+                           ("Actual arrival", "actual_arrival")):
+            if snapshot.get(key):
+                lines.append(f"{label}: {snapshot[key]}")
+        position = snapshot.get("position") or {}
+        if position:
+            lines.append("Position: " + ", ".join(
+                f"{key}={value}" for key, value in position.items()))
+        if source_text:
+            lines.append(f"Evidence: {source_text}")
+        if snapshot.get("contradictions"):
+            lines.append("Warning: " + " ".join(snapshot["contradictions"]))
+        if snapshot.get("errors"):
+            lines.append("Unavailable sources: " + "; ".join(snapshot["errors"]))
+        if snapshot.get("provider") == "schedule":
+            lines.append("Schedule-only means the bot has not independently verified movement or arrival.")
+        self.notify("\n".join(lines))
+        return True
+
+    def _strategy_for_flight(self, flight: dict, *, refresh: bool = False) -> dict:
+        snapshot = get_flight_status(
+            self.config, flight, refresh=refresh, now=self._flight_status_now())
+        complaints = db.complaints_for_flight(flight.get("flight_key") or "")
+        complaint_ids = {item["id"] for item in complaints}
+        responses = [item for item in db.complaint_response_details(50)
+                     if item.get("complaint_id") in complaint_ids]
+        return recommend_case(
+            flight, snapshot, complaints, responses,
+            now=self._flight_local_now(),
+            gaca_days=max(1, int(self.settings.get("gaca_auto_escalate_days", 7))))
+
+    def _send_case_recommendation(self, action: dict, *, readiness: bool = False,
+                                  question: str = "") -> bool:
+        flight = self._selected_flight(action)
+        if not flight:
+            return True
+        strategy = self._strategy_for_flight(flight, refresh=True)
+        self._remember_ai_context(flight=flight)
+        if readiness:
+            lines = [
+                f"Complaint readiness for {self._flight_label(flight)}: "
+                f"{strategy['readiness_score']}%",
+            ]
+            if strategy.get("missing_facts"):
+                lines.append("Missing facts:\n• " + "\n• ".join(strategy["missing_facts"]))
+            lines.append("Evidence checklist:\n• " +
+                         "\n• ".join(strategy["evidence_checklist"]))
+            self.notify("\n".join(lines))
+            return True
+
+        explanation = None
+        if self.ai.enabled:
+            explanation = self.ai.explain_case_recommendation(
+                question or str(action.get("query") or "What should I do?"),
+                flight, strategy)
+        lines = [
+            f"Best course for {self._flight_label(flight)}: "
+            f"{strategy['label']}",
+            f"Status evidence: {(strategy.get('status') or {}).get('label') or 'Unknown'} "
+            f"via {(strategy.get('status') or {}).get('provider') or 'none'}",
+        ]
+        if explanation:
+            lines.append(explanation.get("summary") or "")
+            lines.extend(f"• {reason}" for reason in explanation.get("why") or [])
+            if explanation.get("next_question"):
+                lines.append("Question: " + explanation["next_question"])
+        else:
+            lines.extend(f"• {reason}" for reason in strategy.get("reasons") or [])
+            if strategy.get("missing_facts"):
+                lines.append("Most important missing fact: " + strategy["missing_facts"][0])
+        lines.append("Recommended remedy: " + strategy["requested_remedy"])
+        if strategy.get("next_review_at"):
+            lines.append("Next review: " + strategy["next_review_at"])
+        if strategy.get("filing_deadline"):
+            lines.append("GACA incident filing deadline: " + strategy["filing_deadline"])
+        self.notify("\n".join(line for line in lines if line))
+        return True
+
     def _send_complaint_details(self, action: dict) -> bool:
         complaints = self._matching_complaints(action)
         if action.get("latest") and complaints:
@@ -990,7 +1403,11 @@ class TelegramCoordinator:
             f"Type/status: {complaint.get('kind') or 'unknown'} / {complaint.get('status') or 'unknown'}",
             f"Flight: {self._flight_summary(flight)}",
             f"Created: {complaint.get('created_at') or 'unknown'}",
+            f"Portal category: {complaint.get('portal_category') or 'not recorded'}",
             f"Issue: {_clean_excerpt(complaint.get('details') or 'not recorded', 900)}",
+            "Text sent to portal: " + _clean_excerpt(
+                complaint.get("submitted_text") or
+                "not recorded by the older filing version", 1800),
             f"Evidence files: {len(complaint.get('attachments') or [])}",
             f"Matched airline responses: {len(responses)}",
             f"GACA auto-escalation due: {due_text}",
@@ -1168,6 +1585,13 @@ class TelegramCoordinator:
                     f"â€¢ {self._flight_summary(item)}"
                     for item in flights[:limit]))
             return True
+        if name == "flight_status":
+            return self._send_live_status(action, force=True)
+        if name == "case_recommendation":
+            return self._send_case_recommendation(
+                action, question=str(action.get("query") or ""))
+        if name == "complaint_readiness":
+            return self._send_case_recommendation(action, readiness=True)
         if name in {"list_complaints", "complaint_details"}:
             if name == "complaint_details":
                 return self._send_complaint_details(action)
@@ -1208,7 +1632,8 @@ class TelegramCoordinator:
             self.notify(
                 "Ask naturally about flights, PNRs, passengers, complaint "
                 "references, airline responses, stored email, evidence photos, "
-                "portal screenshots, status, or a fresh Gmail sync. Existing "
+                "portal screenshots, live flight status, complaint readiness, the "
+                "best next action, or a fresh Gmail sync. Existing "
                 "/status, /web, /cancel, post-flight, verification, and complaint "
                 "flows keep priority.")
             return True
@@ -1405,11 +1830,46 @@ class TelegramCoordinator:
                              prompt["message_id"], "awaiting_details")
         elif action == "escalate":
             self._launch_gaca(flight)
+        elif action == "reopen_case":
+            self._start_reopen_intake(flight)
         elif action == "close_case":
+            airline = self._latest_airline_complaint(flight)
+            if airline:
+                db.close_complaint(airline["id"], "closed")
+                db.clear_event_seen(f"airline-responded:{airline['id']}")
+                db.clear_event_seen(f"auto-gaca:{airline['id']}")
             db.mark_event_seen(f"closed:{flight['flight_key']}")
-            self.notify("Case kept closed. I won’t escalate it to GACA.")
+            self.notify(
+                "Case kept closed. I won’t escalate it to GACA. You can still "
+                "reopen a fresh airline complaint later if needed.")
         elif action == "submit_issue":
             self._finalize_intake(flight["flight_key"])
+
+    def _start_reopen_intake(self, flight: dict) -> None:
+        """Allow a new airline filing after a closed/resolved cycle."""
+        airline = self._latest_airline_complaint(flight)
+        if airline:
+            db.close_complaint(airline["id"], "closed")
+            db.clear_event_seen(f"airline-responded:{airline['id']}")
+            db.clear_event_seen(f"auto-gaca:{airline['id']}")
+            db.clear_event_seen(
+                f"auto-gaca-waiting-reference:{airline['id']}")
+        db.clear_event_seen(f"closed:{flight['flight_key']}")
+        with self._lock:
+            previous = self._intakes.pop(flight["flight_key"], None)
+            if previous and previous.timer:
+                previous.timer.cancel()
+            self._intakes[flight["flight_key"]] = PendingIntake(
+                flight_key=flight["flight_key"],
+                parent_complaint_id=(int(airline["id"]) if airline else None),
+            )
+        prompt = self.notify(
+            f"Reopening the airline complaint for {self._flight_label(flight)}. "
+            "Tell me what is still unresolved and send any photos. I will file "
+            "a fresh complaint after the last message.",
+            force_reply=True)
+        db.record_survey(flight["flight_key"], self.chat_id,
+                         prompt["message_id"], "awaiting_details")
 
     def _flight_label(self, flight: dict) -> str:
         number = flight.get("flight_number") or ", ".join(
@@ -1539,12 +1999,28 @@ class TelegramCoordinator:
                 self._intakes[flight_key] = intake
             db.update_survey_status(flight_key, "awaiting_details")
             return
+        strategy = self._strategy_for_flight(flight)
+        status_context = strategy.get("status") or {}
+        rights_context = strategy.get("rights") or {}
+        case_context = {
+            "status": status_context.get("status"),
+            "status_confidence": status_context.get("confidence"),
+            "status_provider": status_context.get("provider"),
+            "actual_arrival": status_context.get("actual_arrival"),
+            "rights_verdict": rights_context.get("verdict"),
+            "rights_reasons": rights_context.get("reasons"),
+            "recommended_action": strategy.get("recommended_action"),
+            "missing_facts": strategy.get("missing_facts"),
+            "requested_remedy": strategy.get("requested_remedy"),
+        }
         ai_analysis = None
         if (self.ai.enabled
+                and hasattr(self.ai, "analyze_incident")
                 and self.ai.settings.get("analyze_incidents", True)):
             self.notify(f"{self.ai.name} is organizing the issue and checking the safest next stepâ€¦")
             ai_analysis = self.ai.analyze_incident(
-                intake.incident, flight, intake.attachments)
+                intake.incident, flight, intake.attachments,
+                case_context=case_context)
             if ai_analysis is None:
                 reason = self.ai.last_error or "AI request unavailable"
                 self.notify(
@@ -1589,7 +2065,15 @@ class TelegramCoordinator:
             return
         complaint_id = db.begin_complaint(
             flight_key, "airline", payload["subject"], intake.incident,
-            intake.attachments)
+            intake.attachments,
+            submitted_text=payload.get("description") or "",
+            parent_complaint_id=intake.parent_complaint_id,
+            issue_summary=str(
+                (ai_analysis or {}).get("summary") or intake.incident),
+            requested_resolution_summary=str(
+                (ai_analysis or {}).get("requested_remedy") or
+                strategy.get("requested_remedy") or ""),
+        )
         if complaint_id is None:
             existing = db.active_complaint_for_flight(flight_key, "airline")
             if existing and existing.get("status") in {
@@ -1605,20 +2089,26 @@ class TelegramCoordinator:
                     "A complaint for this flight is already being filed. "
                     "I will not start a duplicate job.")
             return
+        payload["portal_complaint_id"] = complaint_id
         db.update_survey_status(flight_key, "filing")
         self.notify(f"Filing with {payload['airline_name']} on its official website now…")
 
+        def finish_record(status: str, reference_value: str | None = None):
+            db.finish_complaint(
+                complaint_id, status, reference_value,
+                submitted_text=payload.get("description") or None,
+                portal_category=(
+                    payload.get("selected_complaint_category") or None))
+
         def complete(result: PortalResult):
             if result.status == "submitted":
-                db.finish_complaint(
-                    complaint_id, "submitted", result.reference or None)
+                finish_record("submitted", result.reference or None)
                 db.update_survey_status(flight_key, "filed")
                 reference = f" Reference: {result.reference}." if result.reference else ""
                 self.notify("Complaint submitted on the official airline portal."
                             + reference + " I’ll watch for the airline’s response.")
             elif result.status == "accepted_pending_reference":
-                db.finish_complaint(
-                    complaint_id, "accepted_pending_reference")
+                finish_record("accepted_pending_reference")
                 db.update_survey_status(flight_key, "needs_attention")
                 self.notify(
                     "Saudia accepted the complaint without returning its "
@@ -1626,13 +2116,13 @@ class TelegramCoordinator:
                     "reference is still missing after the mailbox scan, I will "
                     "ask you for the SMS in Telegram. I will not submit a duplicate.")
             elif result.status == "confirmation_unknown":
-                db.finish_complaint(complaint_id, "failed")
+                finish_record("failed")
                 db.update_survey_status(flight_key, "needs_attention")
                 self.notify(
                     "The airline did not return readable confirmation. The "
                     "attempt is recorded as failed, not submitted.")
             else:
-                db.finish_complaint(complaint_id, "failed")
+                finish_record("failed")
                 db.update_survey_status(flight_key, "needs_attention")
                 self.notify(f"Portal filing needs attention: {result.message}")
 
@@ -1641,25 +2131,299 @@ class TelegramCoordinator:
             on_update=self.portal_progress_handler())
 
     def _latest_airline_complaint(self, flight: dict) -> dict | None:
+        preferred = None
         for item in reversed(flight.get("complaints") or []):
-            if item.get("kind") == "airline" and item.get("status") == "submitted":
+            if item.get("kind") != "airline":
+                continue
+            if item.get("status") == "submitted" and item.get("reference"):
                 return item
-        return None
+            if (preferred is None
+                    and item.get("reference")
+                    and item.get("status") in {
+                        "submitted", "accepted_pending_reference",
+                        "closed", "resolved"}):
+                preferred = item
+        return preferred
+
+    @staticmethod
+    def _followup_incident(prior: dict, analysis: dict | None) -> str:
+        original = str(
+            prior.get("original_text") or prior.get("details") or ""
+        ).strip()
+        reference = str(prior.get("reference") or "").strip()
+        response_summary = str(
+            (analysis or {}).get("summary") or ""
+        ).strip()
+        context = (
+            f"I previously raised this issue with the airline under reference "
+            f"{reference}. " if reference else
+            "I previously raised this issue with the airline. "
+        )
+        if response_summary:
+            context += response_summary.rstrip(".") + ". "
+        context += (
+            "The complaint was closed without a satisfactory solution, and "
+            "the original issue and requested resolution remain unresolved."
+        )
+        return "\n\n".join(part for part in (original, context) if part)
+
+    def _launch_airline_followup(
+            self,
+            flight: dict,
+            prior: dict,
+            response_analysis: dict | None = None) -> bool:
+        """Open one reference-aware airline child, then escalate its parent."""
+        siblings = db.complaints_for_flight(flight["flight_key"])
+        existing = next((
+            item for item in siblings
+            if item.get("kind") == "airline"
+            and int(item.get("parent_complaint_id") or 0) == int(prior["id"])
+            and item.get("status") in {
+                "filing", "submitted", "filed", "sent",
+                "accepted_pending_reference",
+            }
+        ), None)
+        if existing:
+            return True
+
+        incident = self._followup_incident(prior, response_analysis)
+        strategy = self._strategy_for_flight(flight)
+        ai_analysis = None
+        if (self.ai.enabled
+                and hasattr(self.ai, "analyze_incident")
+                and self.ai.settings.get("analyze_incidents", True)):
+            try:
+                ai_analysis = self.ai.analyze_incident(
+                    incident,
+                    flight,
+                    prior.get("attachments") or [],
+                    case_context={
+                        "recommended_action": "reopen_airline_then_escalate",
+                        "requested_remedy": strategy.get("requested_remedy"),
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "Ghala could not prepare the airline follow-up text")
+        try:
+            payload = complaint_payload(
+                flight,
+                self.config["user"],
+                "airline",
+                incident,
+                attachments=prior.get("attachments") or [],
+                ai_analysis=ai_analysis,
+                passenger_profiles=self.config.get("passengers") or {},
+            )
+        except ValueError as exc:
+            self.notify(f"Could not prepare the airline follow-up: {exc}")
+            return False
+        missing = missing_portal_fields(payload)
+        if missing:
+            self.notify(
+                "The airline follow-up is queued conceptually, but the saved "
+                "profile still needs: " + ", ".join(missing) + ".")
+            return False
+
+        db.close_complaint(int(prior["id"]), "closed")
+        complaint_id = db.begin_complaint(
+            flight["flight_key"],
+            "airline",
+            payload["subject"],
+            incident,
+            prior.get("attachments") or [],
+            submitted_text=payload.get("description") or "",
+            parent_complaint_id=int(prior["id"]),
+            issue_summary=str(
+                (ai_analysis or {}).get("summary") or incident),
+            requested_resolution_summary=str(
+                (ai_analysis or {}).get("requested_remedy") or
+                strategy.get("requested_remedy") or ""),
+            escalate_parent_on_success=True,
+        )
+        if complaint_id is None:
+            return False
+        payload.update(
+            portal_complaint_id=complaint_id,
+            parent_complaint_id=int(prior["id"]),
+            followup_then_gaca=True,
+        )
+        self.notify(
+            f"The airline response to {prior.get('reference') or 'the prior case'} "
+            "was not satisfactory. I am opening one reference-aware airline "
+            "follow-up now; after it is accepted, I will escalate the original "
+            "case to GACA automatically.")
+
+        def finish_record(status: str, reference_value: str | None = None):
+            db.finish_complaint(
+                complaint_id,
+                status,
+                reference_value,
+                submitted_text=payload.get("description") or None,
+                portal_category=(
+                    payload.get("selected_complaint_category") or None),
+            )
+
+        def complete(result: PortalResult):
+            if result.status == "submitted":
+                finish_record("submitted", result.reference or None)
+                self.notify(
+                    "The airline follow-up was submitted."
+                    + (f" Reference: {result.reference}."
+                       if result.reference else ""))
+                self.resume_pending_parent_escalations()
+            elif result.status == "accepted_pending_reference":
+                finish_record("accepted_pending_reference")
+                self.notify(
+                    "The airline accepted the follow-up; its reference is "
+                    "still being recovered from email/SMS. I am continuing "
+                    "with the original case's GACA escalation.")
+                self.resume_pending_parent_escalations()
+            else:
+                finish_record("failed")
+                self.notify(
+                    "The airline follow-up needs attention: "
+                    f"{result.message}")
+
+        start_portal_job(
+            payload,
+            on_complete=complete,
+            on_update=self.portal_progress_handler(),
+        )
+        return True
+
+    def resume_pending_parent_escalations(self) -> None:
+        """Continue the durable provider-child → regulator-parent sequence."""
+        for child in db.pending_parent_escalations():
+            parent = db.get_complaint(int(child["parent_complaint_id"]))
+            if not parent or not parent.get("reference"):
+                continue
+            flight = db.get_flight_by_key(child["flight_key"])
+            if not flight:
+                continue
+            root_id = int(parent.get("root_complaint_id") or parent["id"])
+            related_gaca = next((
+                item for item in db.complaints_for_flight(child["flight_key"])
+                if item.get("kind") == "gaca"
+                and int(item.get("root_complaint_id") or item["id"]) == root_id
+                and item.get("status") in {
+                    "filing", "submitted", "filed", "sent",
+                    "accepted_pending_reference",
+                }
+            ), None)
+            if related_gaca:
+                db.clear_parent_escalation_flag(int(child["id"]))
+                continue
+            if self._launch_gaca(
+                    flight,
+                    incident_suffix=(
+                        "The airline has also accepted a new follow-up "
+                        + (f"under reference {child['reference']}. "
+                           if child.get("reference") else "")
+                        + "because the original complaint was closed without "
+                          "a satisfactory solution."
+                    ),
+                    prior_complaint=parent):
+                db.clear_parent_escalation_flag(int(child["id"]))
 
     def _launch_gaca(self, flight: dict, incident_suffix: str = "",
-                     automatic: bool = False) -> bool:
-        prior = self._latest_airline_complaint(flight)
+                     automatic: bool = False,
+                     prior_complaint: dict | None = None) -> bool:
+        prior = prior_complaint or self._latest_airline_complaint(flight)
         if not prior or not prior.get("reference"):
             self.notify("GACA requires the airline complaint reference, which has not been captured yet.")
             return False
+        now = self._flight_local_now()
+        incident_day = parse_flight_time(
+            self._effective_flight_value(flight, "flight_date")
+        )
+        if incident_day and (now.date() - incident_day.date()).days > 60:
+            marker = f"gaca-blocked-60days:{prior['id']}"
+            if not db.event_seen(marker):
+                self.notify(
+                    "This incident is more than 60 days old, so FlightDeck "
+                    "will not send a GACA form that the official portal will "
+                    "reject."
+                )
+                db.mark_event_seen(marker)
+            return False
+        root_id = int(prior.get("root_complaint_id") or prior["id"])
+        confirmation_unknown = db.gaca_confirmation_unknown_complaint_ids()
+        ambiguous = next((
+            item
+            for item in reversed(
+                db.complaints_for_flight(flight["flight_key"])
+            )
+            if item.get("kind") == "gaca"
+            and int(item["id"]) in confirmation_unknown
+            and int(item.get("root_complaint_id") or item["id"]) == root_id
+        ), None)
+        if ambiguous:
+            marker = f"gaca-awaiting-confirmation:{ambiguous['id']}"
+            if not db.event_seen(marker):
+                self.notify(
+                    "A GACA form for this issue was already sent once, but "
+                    "the portal did not reveal its reference. I am monitoring "
+                    "SMS and email for the regulator reference and will not "
+                    "risk a duplicate submission.")
+                db.mark_event_seen(marker)
+            return False
+        try:
+            delay_days = max(1, int(self.settings.get(
+                "gaca_auto_escalate_days", 7)))
+        except (TypeError, ValueError):
+            delay_days = 7
+        created = parse_flight_time(prior.get("created_at"))
+        due = created + timedelta(days=delay_days) if created else None
+        if not due or now < due:
+            marker = f"gaca-waiting-period:{prior['id']}"
+            if not db.event_seen(marker):
+                due_text = (
+                    due.strftime("%Y-%m-%d %H:%M")
+                    if due else "after the airline filing date is verified"
+                )
+                self.notify(
+                    f"GACA's {delay_days}-day airline handling window has not "
+                    f"finished yet. This escalation is held safely until "
+                    f"{due_text}; no premature complaint will be submitted.")
+                db.mark_event_seen(marker)
+            return False
+        db.clear_event_seen(f"gaca-waiting-period:{prior['id']}")
         incident = prior.get("details") or "The airline response was unsatisfactory."
         if incident_suffix:
             incident = incident.rstrip() + "\n\n" + incident_suffix.strip()
         ai_analysis = None
+        strategy = self._strategy_for_flight(flight)
+        status_context = strategy.get("status") or {}
+        rights_context = strategy.get("rights") or {}
         if (self.ai.enabled
                 and self.ai.settings.get("analyze_incidents", True)):
-            ai_analysis = self.ai.analyze_incident(
-                incident, flight, prior.get("attachments") or [])
+            try:
+                ai_analysis = self.ai.analyze_incident(
+                    incident, flight, prior.get("attachments") or [],
+                    case_context={
+                        "status": status_context.get("status"),
+                        "status_confidence": status_context.get("confidence"),
+                        "status_provider": status_context.get("provider"),
+                        "actual_arrival": status_context.get("actual_arrival"),
+                        "rights_verdict": rights_context.get("verdict"),
+                        "rights_reasons": rights_context.get("reasons"),
+                        "recommended_action": strategy.get("recommended_action"),
+                        "missing_facts": strategy.get("missing_facts"),
+                        "requested_remedy": strategy.get("requested_remedy"),
+                        "portal_destination": "gaca",
+                        "exclude_structured_form_fields": True,
+                    })
+            except Exception:
+                logger.exception(
+                    "Ghala incident analysis failed during GACA filing")
+                ai_analysis = None
+            if ai_analysis is None:
+                reason = self.ai.last_error or "AI request unavailable"
+                self.notify(
+                    f"{self.ai.name} could not analyze this escalation "
+                    f"({reason}). I am continuing with the saved complaint "
+                    "text and deterministic portal automation.")
         try:
             payload = complaint_payload(
                 flight, self.config["user"], "gaca", incident,
@@ -1676,13 +2440,32 @@ class TelegramCoordinator:
             return False
         complaint_id = db.begin_complaint(
             flight["flight_key"], "gaca", payload["subject"], incident,
-            prior.get("attachments") or [])
+            prior.get("attachments") or [],
+            submitted_text=payload.get("description") or "",
+            parent_complaint_id=int(prior["id"]),
+            issue_summary=str(
+                (ai_analysis or {}).get("summary") or incident),
+            requested_resolution_summary=str(
+                (ai_analysis or {}).get("requested_remedy") or
+                strategy.get("requested_remedy") or ""),
+        )
         if complaint_id is None:
             self.notify(
                 "A GACA escalation for this flight is already underway or on "
                 "record. I will not submit it again.")
             return False
+        airline_id = prior["id"]
+        auto_key = f"auto-gaca:{airline_id}"
+        inflight_key = f"auto-gaca-inflight:{airline_id}"
+        payload.update(
+            portal_complaint_id=complaint_id,
+            portal_auto_key=auto_key if automatic else "",
+            portal_inflight_key=inflight_key if automatic else "",
+        )
         if automatic:
+            # Prevent duplicate auto launches while the portal job runs; the
+            # durable auto-gaca marker is written only after a real success.
+            db.mark_event_seen(inflight_key)
             self.notify(
                 "Seven days have passed without a substantive airline response. "
                 "I am automatically escalating this complaint through GACA's "
@@ -1690,19 +2473,51 @@ class TelegramCoordinator:
         else:
             self.notify("Escalating to GACA's official E-Services portal now...")
 
+        def finish_record(status: str, reference_value: str | None = None):
+            db.finish_complaint(
+                complaint_id, status, reference_value,
+                submitted_text=payload.get("description") or None,
+                portal_category=(
+                    payload.get("selected_complaint_category") or None))
+
         def complete(result: PortalResult):
+            db.clear_event_seen(inflight_key)
+            message = str(result.message or "")
+            hard_block = bool(re.search(
+                r"blocked the VPS browser|this page can'?t be displayed|"
+                r"more than 60 days|incident id\s*:|"
+                r"contact support for additional information",
+                message, re.I))
             if result.status == "submitted":
-                db.finish_complaint(
-                    complaint_id, "submitted", result.reference or None)
+                finish_record("submitted", result.reference or None)
+                if automatic:
+                    db.mark_event_seen(auto_key)
                 suffix = f" Reference: {result.reference}." if result.reference else ""
                 self.notify("GACA escalation submitted." + suffix)
+            elif result.status == "accepted_pending_reference":
+                finish_record("accepted_pending_reference")
+                if automatic:
+                    db.mark_event_seen(auto_key)
+                self.notify(
+                    "GACA accepted the escalation. Its confirmation page did "
+                    "not show the regulator reference, so FlightDeck is waiting "
+                    "for the matching email or SMS and will not submit it again.")
             elif result.status == "confirmation_unknown":
-                db.finish_complaint(complaint_id, "failed")
+                finish_record("failed")
+                db.clear_event_seen(auto_key)
                 self.notify(
                     "GACA returned no readable confirmation. The escalation "
                     "attempt is recorded as failed, not submitted.")
             else:
-                db.finish_complaint(complaint_id, "needs_attention")
+                finish_record("needs_attention")
+                if automatic and hard_block:
+                    # WAF / 60-day portal rejection: do not auto-retry every
+                    # monitor cycle (that created dozens of empty filings).
+                    db.mark_event_seen(auto_key)
+                    if re.search(r"more than 60 days", message, re.I):
+                        db.mark_event_seen(f"gaca-blocked-60days:{airline_id}")
+                else:
+                    db.clear_event_seen(auto_key)
                 self.notify(f"GACA escalation needs attention: {result.message}")
 
         start_portal_job(
@@ -1726,7 +2541,10 @@ class TelegramCoordinator:
                 continue
             complaint_id = complaint["id"]
             scheduled_key = f"auto-gaca:{complaint_id}"
+            inflight_key = f"auto-gaca-inflight:{complaint_id}"
             if (db.event_seen(scheduled_key)
+                    or db.event_seen(inflight_key)
+                    or db.event_seen(f"gaca-blocked-60days:{complaint_id}")
                     or db.event_seen(f"airline-responded:{complaint_id}")):
                 continue
             created = parse_flight_time(complaint.get("created_at"))
@@ -1749,17 +2567,14 @@ class TelegramCoordinator:
             flight = db.get_flight(int(flight_id)) if flight_id else None
             if not flight:
                 continue
-            if self._launch_gaca(
-                    flight,
-                    incident_suffix=(
-                        f"Seven days have passed since the airline complaint was "
-                        f"submitted on {(complaint.get('created_at') or '')[:10]}. "
-                        "The airline did not provide a substantive response or "
-                        "resolution within that period."),
-                    automatic=True):
-                # One automatic attempt only. Any portal issue is surfaced for
-                # human attention instead of risking duplicate submissions.
-                db.mark_event_seen(scheduled_key)
+            self._launch_gaca(
+                flight,
+                incident_suffix=(
+                    f"Seven days have passed since the airline complaint was "
+                    f"submitted on {(complaint.get('created_at') or '')[:10]}. "
+                    "The airline did not provide a substantive response or "
+                    "resolution within that period."),
+                automatic=True)
 
     def _live_landed_cached(self, flight: dict) -> bool | None:
         key = flight.get("flight_key") or str(flight.get("id"))
@@ -1776,6 +2591,42 @@ class TelegramCoordinator:
         self._status_cache[key] = (now, value)
         return value
 
+    def refresh_watched_flights(self) -> None:
+        """Refresh only near-term flights and announce exact-flight disruptions."""
+        now = self._flight_local_now()
+        for summary in db.list_flights():
+            flight = db.get_flight(summary["id"]) or summary
+            marker = (parse_flight_time(self._effective_flight_value(
+                flight, "departure")) or parse_flight_time(
+                    self._effective_flight_value(flight, "flight_date")))
+            if not marker or not (now - timedelta(hours=18)
+                                  <= marker <= now + timedelta(days=2)):
+                continue
+            key = flight.get("flight_key") or ""
+            previous = db.get_flight_status_snapshot(key) or {}
+            try:
+                current = refresh_flight_status(
+                    self.config, flight, now=self._flight_status_now(), force=False)
+            except Exception:
+                logger.exception("Flight status refresh failed for %s", key)
+                continue
+            status = current.get("status")
+            if (status not in {"cancelled", "delayed", "diverted"}
+                    or previous.get("status") == status):
+                continue
+            event_key = f"flight-status-alert:{key}:{status}"
+            if db.event_seen(event_key):
+                continue
+            strategy = self._strategy_for_flight(flight)
+            reason = (strategy.get("reasons") or [""])[0]
+            self.notify(
+                f"Flight update for {self._post_flight_label(flight)}: "
+                f"{current.get('label') or status}. "
+                f"Source: {current.get('provider') or 'unknown'} "
+                f"({int(float(current.get('confidence') or 0) * 100)}% confidence).\n"
+                f"Recommended next step: {strategy.get('label')}. {reason}")
+            db.mark_event_seen(event_key)
+
     def _flight_local_now(self) -> datetime:
         """Return naive local wall time matching stored itinerary timestamps."""
         timezone_name = str(self.settings.get("timezone") or "Asia/Riyadh")
@@ -1786,6 +2637,14 @@ class TelegramCoordinator:
                 "Unknown Telegram flight timezone %s; using server time",
                 timezone_name)
             return datetime.now()
+
+    def _flight_status_now(self) -> datetime:
+        """Return an aware clock so provider timestamps remain genuine UTC."""
+        timezone_name = str(self.settings.get("timezone") or "Asia/Riyadh")
+        try:
+            return datetime.now(ZoneInfo(timezone_name))
+        except ZoneInfoNotFoundError:
+            return datetime.now().astimezone()
 
     def send_due_surveys(self, now: datetime | None = None):
         now = now or self._flight_local_now()
@@ -1880,9 +2739,15 @@ class TelegramCoordinator:
 
     def check_complaint_responses(self):
         events = db.list_mail_events()
+        reconcile_gaca_mail_events(events, notify=self.notify)
         substantive = re.compile(
             r"resolved|resolution|decision|outcome|approved|declined|denied|"
-            r"refund|compensation|reimburse|closed|تعويض|استرداد|مرفوض|إغلاق|حل",
+            r"refund|compensation|reimburse|closed|closure|processed|finalized|"
+            r"تعويض|استرداد|مرفوض|إغلاق|حل|تم المعالجة",
+            re.I)
+        closure_notice = re.compile(
+            r"\b(?:closed|closure|processed|finalized|ticket[\s-]*closed)\b|"
+            r"إغلاق|تم المعالجة|تم الإغلاق|service ticket\s*[-–]?\s*closure",
             re.I)
         response_candidate = re.compile(
             r"review|regarding|with regard|update|decision|response|reply|"
@@ -1896,6 +2761,11 @@ class TelegramCoordinator:
                 and complaint.get("status") in {
                     "submitted", "accepted_pending_reference"})
         ]
+        known_references = {
+            str(complaint.get("reference") or "").strip().casefold()
+            for complaint in db.list_complaints()
+            if str(complaint.get("reference") or "").strip()
+        }
 
         # First recover references from acknowledgement messages. Keep the
         # existing newest-pending-first behavior because a confirmation email
@@ -1925,10 +2795,17 @@ class TelegramCoordinator:
                     event.get("subject") or "", event.get("body") or "")
                 if not captured_reference:
                     continue
+                if captured_reference.casefold() in known_references:
+                    # A delayed/duplicated acknowledgement can be imported
+                    # again after a restart. Never copy its already-owned
+                    # reference onto another pending complaint.
+                    db.mark_event_seen(capture_key)
+                    continue
                 db.finish_complaint(
                     complaint["id"], "submitted", captured_reference)
                 db.mark_event_seen(capture_key)
                 complaint["reference"] = captured_reference
+                known_references.add(captured_reference.casefold())
                 self.notify(
                     "Captured the airline complaint reference from its "
                     f"confirmation email: {captured_reference}.")
@@ -1986,7 +2863,11 @@ class TelegramCoordinator:
             blob = " ".join((event.get("subject") or "",
                              event.get("body") or ""))
             deterministic = bool(substantive.search(blob))
+            is_closure = bool(closure_notice.search(blob))
             analysis = None
+            # Only spend an AI call once the email is already strongly tied to
+            # this complaint (exact reference or booking facts). That stops Ghala
+            # from analyzing unrelated mail against the wrong open tickets.
             if (self.ai.enabled
                     and self.ai.settings.get("analyze_responses", True)
                     and (deterministic or response_candidate.search(blob))):
@@ -2001,29 +2882,64 @@ class TelegramCoordinator:
                     "subject": event.get("subject") or "",
                     "body": event.get("body") or "",
                 }, ensure_ascii=False, sort_keys=True)
-                cache_key = "response-v1:" + hashlib.sha256(
+                cache_key = "response-v2:" + hashlib.sha256(
                     cache_material.encode("utf-8")).hexdigest()
                 analysis = db.get_ai_analysis_cache(cache_key, model)
                 if analysis is None:
-                    analysis = self.ai.analyze_response(
-                        event.get("subject") or "", event.get("body") or "",
-                        complaint.get("reference") or "",
-                        info.get("name") or flight.get("airline_name") or "Airline")
+                    try:
+                        analysis = self.ai.analyze_response(
+                            event.get("subject") or "", event.get("body") or "",
+                            complaint.get("reference") or "",
+                            info.get("name") or flight.get("airline_name")
+                            or "Airline")
+                    except Exception:
+                        logger.exception(
+                            "Ghala response analysis failed; using deterministic rules")
+                        analysis = None
                     if analysis is not None:
                         db.save_ai_analysis_cache(
                             cache_key, "airline_response", model, analysis)
             if analysis is not None:
-                return bool(analysis.get("substantive")), analysis
+                analysis = dict(analysis)
+                actionable = (
+                    bool(analysis.get("substantive"))
+                    or bool(analysis.get("closed_needs_followup"))
+                    or is_closure)
+                if is_closure:
+                    analysis["closed_needs_followup"] = True
+                    analysis["substantive"] = True
+                    if str(analysis.get("recommendation") or "").casefold() in {
+                            "", "wait", "accept"}:
+                        analysis["recommendation"] = "escalate"
+                return actionable, analysis
+            if is_closure:
+                return True, {
+                    "summary": "The airline closed or finalized this complaint.",
+                    "outcome": "unknown",
+                    "amounts_or_deadlines": [],
+                    "recommendation": "escalate",
+                    "rationale": (
+                        "Closure/processed notices require a reopen or GACA "
+                        "decision even when no remedy details are included."),
+                    "substantive": True,
+                    "closed_needs_followup": True,
+                }
             return deterministic, None
 
         def notify_response(complaint: dict, info: dict, event: dict,
                             analysis: dict | None, match_method: str) -> None:
             flight = complaint.get("flight_data") or {}
+            needs_followup = bool(
+                (analysis or {}).get("closed_needs_followup"))
             if analysis:
                 amounts = "; ".join(analysis.get("amounts_or_deadlines") or [])
                 amount_line = f"\nAmounts/deadlines: {amounts}" if amounts else ""
+                default_summary = (
+                    "The airline closed this complaint without a clear remedy."
+                    if needs_followup else
+                    "A substantive response was received.")
                 response_text = (
-                    f"{analysis.get('summary') or 'A substantive response was received.'}"
+                    f"{analysis.get('summary') or default_summary}"
                     f"\nOutcome: {str(analysis.get('outcome') or 'unknown').replace('_', ' ')}"
                     f"{amount_line}\n{self.ai.name} recommends: "
                     f"{str(analysis.get('recommendation') or 'review').replace('_', ' ')}"
@@ -2033,27 +2949,66 @@ class TelegramCoordinator:
                     event.get("body") or event.get("subject") or "")
             if match_method == "exact_reference":
                 matched_by = "Matched by the complaint reference in the email."
-            elif match_method == "case_facts":
+            else:
                 matched_by = (
                     "The email omitted the reference; I matched its booking facts "
                     "(such as PNR, ticket, flight, date, or passenger) in code.")
-            else:
-                matched_by = (
-                    "The email omitted the reference, so I matched it to the "
-                    "oldest unresolved ticket for this airline, preserving filing order.")
+            prompt = (
+                "The airline marked this ticket closed or processed. Do you want "
+                "me to escalate to GACA or reopen a fresh airline complaint?"
+                if needs_followup else
+                "Do you want me to escalate this to GACA?")
             self.notify(
                 f"{info.get('name') or 'The airline'} responded to complaint "
                 f"{complaint.get('reference') or ''} for "
                 f"{self._post_flight_label(flight)}.\n{matched_by}\n\n"
-                f"{response_text}\n\n"
-                "Do you want me to escalate this to GACA?",
-                buttons=_buttons([[
-                    ("Escalate to GACA", f"escalate:{complaint['flight_id']}"),
-                    ("No, close", f"close_case:{complaint['flight_id']}"),
-                ]]))
+                f"{response_text}\n\n{prompt}",
+                buttons=_buttons([
+                    [("Escalate to GACA", f"escalate:{complaint['flight_id']}"),
+                     ("Reopen with airline",
+                      f"reopen_case:{complaint['flight_id']}")],
+                    [("No, close", f"close_case:{complaint['flight_id']}")],
+                ]))
 
-        # Reference-bearing responses are authoritative and always win over
-        # receipt order. Process emails chronologically for deterministic state.
+        def retain_and_auto_handle(
+                complaint: dict,
+                event: dict,
+                analysis: dict | None) -> None:
+            raw_response = str(
+                event.get("body") or event.get("subject") or "")
+            db.set_complaint_response(
+                int(complaint["id"]),
+                response_text=raw_response,
+                response_summary=str(
+                    (analysis or {}).get("summary") or
+                    _clean_excerpt(raw_response)),
+            )
+            recommendation = str(
+                (analysis or {}).get("recommendation") or "").casefold()
+            outcome = str(
+                (analysis or {}).get("outcome") or "").casefold()
+            unsatisfactory = (
+                bool((analysis or {}).get("closed_needs_followup"))
+                or recommendation in {"escalate", "reopen"}
+                or outcome in {"declined", "partially_approved"}
+            )
+            if not unsatisfactory:
+                return
+            action_key = (
+                f"auto-airline-followup:{complaint['id']}:{event['id']}")
+            if db.event_seen(action_key):
+                return
+            db.mark_event_seen(action_key)
+            flight_id = complaint.get("flight_id")
+            flight = db.get_flight(int(flight_id)) if flight_id else None
+            if not flight:
+                return
+            self._launch_airline_followup(
+                flight, complaint, response_analysis=analysis)
+
+        # Reference-bearing responses are authoritative. Process emails
+        # chronologically for deterministic state. FIFO fallback is disabled:
+        # only exact references and strong booking-fact matches may link mail.
         ordered_events = sorted(
             events, key=lambda event: (
                 parse_flight_time(event.get("date")) or datetime.min,
@@ -2092,11 +3047,9 @@ class TelegramCoordinator:
                 db.mark_event_seen(f"airline-responded:{complaint['id']}")
                 notify_response(
                     complaint, info, event, analysis, "exact_reference")
+                retain_and_auto_handle(complaint, event, analysis)
                 break
 
-        # Some final-resolution templates omit the ticket number. Match those
-        # messages FIFO within the airline, never globally, and persist the
-        # assignment so restarts or rescans cannot reshuffle it.
         known_references = {
             str(complaint.get("reference") or "").casefold()
             for complaint in ordered_complaints if complaint.get("reference")
@@ -2109,14 +3062,11 @@ class TelegramCoordinator:
             blob_folded = blob.casefold()
             if any(reference in blob_folded for reference in known_references):
                 continue
-            # A different explicit case reference must never consume our FIFO.
             if _airline_confirmation_reference(
                     event.get("subject") or "", event.get("body") or ""):
                 continue
 
-            # Prefer a unique deterministic booking-fact match over filing
-            # order. This handles family passengers and multiple flights
-            # without spending an AI call or trusting a probabilistic answer.
+            # Strong booking-fact matches only (PNR/ticket, or flight+passenger).
             fact_matches = []
             for complaint in ordered_complaints:
                 if (db.event_seen(f"airline-responded:{complaint['id']}")
@@ -2130,47 +3080,24 @@ class TelegramCoordinator:
                 if not valid_sender:
                     continue
                 score = case_fact_score(blob, complaint)
-                if score >= 45:
+                if score >= 100:
                     fact_matches.append((score, complaint, info))
             fact_matches.sort(key=lambda item: item[0], reverse=True)
-            if (fact_matches and (len(fact_matches) == 1
-                                  or fact_matches[0][0] > fact_matches[1][0])):
-                _score, complaint, info = fact_matches[0]
-                is_substantive, analysis = response_analysis(
-                    event, complaint, info)
-                if is_substantive and db.link_complaint_response(
-                        complaint["id"], event["id"], "case_facts"):
-                    db.mark_event_seen(
-                        f"complaint-response:{complaint['id']}:{event['id']}")
-                    db.mark_event_seen(
-                        f"airline-responded:{complaint['id']}")
-                    notify_response(
-                        complaint, info, event, analysis, "case_facts")
+            if not (fact_matches and (len(fact_matches) == 1
+                                      or fact_matches[0][0] > fact_matches[1][0])):
                 continue
-
-            for complaint in ordered_complaints:
-                if (db.event_seen(f"airline-responded:{complaint['id']}")
-                        or db.event_seen(f"closed:{complaint['flight_key']}")):
-                    continue
-                created = parse_flight_time(complaint.get("created_at"))
-                event_date = parse_flight_time(event.get("date"))
-                if created and event_date and event_date < created:
-                    continue
-                valid_sender, info = event_is_from_airline(event, complaint)
-                if not valid_sender:
-                    continue
-                is_substantive, analysis = response_analysis(
-                    event, complaint, info)
-                if not is_substantive:
-                    break
-                if not db.link_complaint_response(
-                        complaint["id"], event["id"], "fifo_airline"):
-                    break
+            _score, complaint, info = fact_matches[0]
+            is_substantive, analysis = response_analysis(
+                event, complaint, info)
+            if is_substantive and db.link_complaint_response(
+                    complaint["id"], event["id"], "case_facts"):
                 db.mark_event_seen(
                     f"complaint-response:{complaint['id']}:{event['id']}")
-                db.mark_event_seen(f"airline-responded:{complaint['id']}")
-                notify_response(complaint, info, event, analysis, "fifo_airline")
-                break
+                db.mark_event_seen(
+                    f"airline-responded:{complaint['id']}")
+                notify_response(
+                    complaint, info, event, analysis, "case_facts")
+                retain_and_auto_handle(complaint, event, analysis)
 
 _COORDINATOR: TelegramCoordinator | None = None
 _COORDINATOR_LOCK = threading.Lock()

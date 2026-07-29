@@ -1,11 +1,13 @@
 """Local Flask interface for inbox-derived flights and passenger claims."""
 
 import hashlib
+import hmac
 import json
 import math
 import re
 import secrets
 import threading
+import unicodedata
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
@@ -14,18 +16,22 @@ from flask import (Flask, Response, abort, flash, jsonify, redirect, render_temp
                    request, session, url_for)
 
 from . import db
+from .airlines import AIRLINES, airline_for_name
 from .ai_assistant import ClaudeAssistant
+from .case_strategy import recommend_case
 from .captcha_solver import TwoCaptchaSolver
 from .compensation import (ELIGIBLE, POSSIBLY, assess, effective)
 from .complaints import (airline_complaint, complaint_payload, gaca_complaint,
                          missing_portal_fields)
+from .flight_status import refresh_flight_status
 from .mail_client import eta_text
 from .config import (passenger_profile_key, save_passenger_profile,
                      save_user_profile)
 from .pipeline import (load_demo, rebuild_flights, reparse_emails,
                        scan_mailbox)
 from .portal_automation import (PortalResult, portal_job_status, set_ai_handler,
-                                set_captcha_solver, start_portal_job)
+                                set_captcha_solver, set_category_handler,
+                                start_portal_job)
 from .telegram_bot import start_telegram
 from .web_access import verify_web_token
 
@@ -33,6 +39,21 @@ _ACTIVE_PHASES = {"starting", "connecting", "searching", "fetching", "linking"}
 _scan_progress: dict = {}
 _scan_lock = threading.Lock()
 _ai_profile_lock = threading.Lock()
+
+_OTP_CONTEXT_RE = re.compile(
+    r"(?:otp|one[ -]?time(?:\s+(?:password|code))?|verification\s+code|"
+    r"authentication\s+code|security\s+code|login\s+code|passcode|"
+    r"temporary\s+(?:password|pin)|"
+    r"رمز\s*(?:التحقق|التأكيد|الدخول|المصادقة|الأمان))",
+    re.I,
+)
+_SHORT_CODE_RE = re.compile(r"(?<!\d)(\d{4,8})(?!\d)")
+_REFERENCE_RE = re.compile(
+    r"(?:(?:complaint|case|request)(?:\s+reference)?|reference)\s*"
+    r"(?:number|no\.?|id)?\s*"
+    r"(?:is\s*)?[:#-]?\s*([A-Z0-9][A-Z0-9_-]{3,79})",
+    re.I,
+)
 
 _TEMPLATES = Path(__file__).resolve().parent / "templates"
 _REQUIRED_TEMPLATES = (
@@ -43,6 +64,121 @@ _REQUIRED_TEMPLATES = (
 
 def _scan_running() -> bool:
     return _scan_progress.get("phase") in _ACTIVE_PHASES
+
+
+def _ascii_digits(value: str) -> str:
+    output = []
+    for char in value:
+        if not char.isdigit():
+            continue
+        try:
+            output.append(str(unicodedata.digit(char)))
+        except (TypeError, ValueError):
+            continue
+    return "".join(output)
+
+
+def _extract_sms_otp(body: str) -> str:
+    if not _OTP_CONTEXT_RE.search(body):
+        return ""
+    ranked = []
+    for match in _SHORT_CODE_RE.finditer(body):
+        candidate = _ascii_digits(match.group(1))
+        context = body[max(0, match.start() - 80):match.end() + 80]
+        score = (100 if _OTP_CONTEXT_RE.search(context) else 0)
+        score += 10 if len(candidate) == 4 else 0
+        ranked.append((score, candidate))
+    return max(ranked, default=(0, ""))[1]
+
+
+def _extract_sms_reference(body: str, sender: str = "") -> str:
+    # Saudia uses C_1234567. Do not treat HRSD/SAMA "C2607..." as airline refs.
+    match = re.search(r"(?<![A-Z0-9])C[_-](\d{6,})(?!\d)", body, re.I)
+    if match:
+        return f"C_{match.group(1)}"
+    # GACA CARE currently sends public complaint IDs such as C076100 without
+    # an underscore. Restrict this shape to GACA context so unrelated
+    # government/customer-service IDs are not attached to aviation cases.
+    gaca_context = bool(re.search(
+        r"\bGACA\b|هيئة\s+الطيران", f"{sender}\n{body}", re.I))
+    if gaca_context:
+        match = re.search(r"(?<![A-Z0-9])(C\d{6,})(?!\d)", body, re.I)
+        if match:
+            return match.group(1).upper()
+    match = _REFERENCE_RE.search(body)
+    if not match:
+        return ""
+    candidate = match.group(1).upper()
+    if re.fullmatch(r"C\d{6,}", candidate) and not gaca_context:
+        return ""
+    return candidate
+
+
+def _normalize_sms_sender_body(sender: str, body: str) -> tuple[str, str]:
+    sender = (sender or "").strip()
+    body = (body or "").strip()
+    looks_like_body = (
+        len(sender) > 80
+        or "\n" in sender
+        or "\r" in sender
+        or bool(re.search(r"\b(?:GR|EC|C_)\s*[-:]?\s*\d{5,}", sender, re.I))
+    )
+    if looks_like_body:
+        if not body or body == sender or sender in body or body in sender:
+            body = body or sender.lstrip("\r\n")
+            folded = sender[:40].casefold()
+            if "saudia" in folded:
+                sender = "Saudia"
+            elif "gaca" in folded or "طيران" in folded:
+                sender = "GACA"
+            elif re.search(r"(?i)\bcst\b|citc|هيئة\s*الاتصالات", folded):
+                sender = "CST"
+            else:
+                sender = ""
+        else:
+            sender = re.sub(r"[\r\n]+", " ", sender).strip()[:80]
+    if sender and body and sender == body:
+        sender = ""
+    return sender, body
+
+
+def _is_telecom_cst_sms(sender: str, body: str) -> bool:
+    blob = f"{sender}\n{body}"
+    if re.search(r"\bGR\s*[-:]?\s*\d{6,}\b", blob, re.I) and re.search(
+            r"(?i)cst|citc|هيئة|بلاغ", blob):
+        return True
+    return bool(re.fullmatch(r"(?i)cst|citc", (sender or "").strip()))
+
+
+def _is_aviation_sms(sender: str, body: str, reference: str = "") -> bool:
+    """Keep the shared shortcut feed scoped to airlines and aviation claims."""
+    blob = f"{sender}\n{body}"
+    _, info = airline_for_name(blob)
+    if info:
+        return True
+    folded = re.sub(r"\s+", " ", blob.casefold())
+    if re.search(r"(?i)\bgaca\b|هيئة\s*الطيران|الطيران\s*المدني", blob):
+        return True
+    if re.search(
+        r"\bflight\b|boarding\s*pass|airport|baggage|luggage|\bpnr\b|"
+        r"guest\s+relations|comment\s+ref|رحلة|مطار|أمتعة|امتعة",
+        folded,
+        re.I,
+    ):
+        return True
+    # Saudia's acknowledgement format is carrier-specific even when the
+    # shortcut omits the sender label.
+    return bool(re.fullmatch(r"(?i)C_\d{6,}", str(reference or "").strip()))
+
+
+def _is_gaca_sms(sender: str, body: str) -> bool:
+    blob = f"{sender}\n{body}"
+    return bool(re.search(
+        r"(?i)\bgaca\b|"
+        r"الهيئة\s*العامة\s*للطيران\s*المدني|"
+        r"هيئة\s*الطيران|الطيران\s*المدني",
+        blob,
+    ))
 
 
 def _run_scan(config: dict):
@@ -302,14 +438,18 @@ def create_app(config: dict) -> Flask:
     set_ai_handler(
         assistant.portal_decision if assistant.enabled else None,
         int(assistant.settings.get("max_portal_attempts", 3)))
+    set_category_handler(
+        getattr(assistant, "choose_complaint_category", None)
+        if assistant.enabled else None)
     captcha = TwoCaptchaSolver(config)
     set_captcha_solver(
         captcha.solve_recaptcha if captcha.enabled else None)
     telegram = start_telegram(config)
+    sms_secret = str((config.get("sms") or {}).get("ingest_secret") or "")
 
     @app.before_request
     def require_private_web_link():
-        if request.path == "/healthz" or not access_secret:
+        if request.path in {"/healthz", "/api/internal/sms"} or not access_secret:
             return None
         supplied = request.args.get("access", "")
         if supplied:
@@ -331,6 +471,225 @@ def create_app(config: dict) -> Flask:
                 "Private FlightDeck access required. Send /web to the Telegram bot for a fresh link.",
                 status=401, content_type="text/plain")
         return None
+
+    def sms_sender_email(sender: str, body: str) -> str:
+        """Map an SMS sender label to a trusted airline domain for matching."""
+        blob = f"{sender} {body}"
+        _, info = airline_for_name(blob)
+        if not info:
+            folded = re.sub(r"[^a-z0-9]", "", blob.casefold())
+            for candidate, candidate_info in AIRLINES.items():
+                aliases = {
+                    re.sub(r"[^a-z0-9]", "", candidate.casefold()),
+                    re.sub(r"[^a-z0-9]", "", candidate_info["name"].casefold()),
+                    re.sub(r"[^a-z0-9]", "", candidate_info.get("icao", "").casefold()),
+                }
+                if any(alias and alias in folded for alias in aliases):
+                    info = candidate_info
+                    break
+        if not info:
+            body_folded = body.casefold()
+            for complaint in db.list_complaints():
+                reference = str(complaint.get("reference") or "").casefold()
+                if reference and reference in body_folded:
+                    flight = complaint.get("flight_data") or {}
+                    info = AIRLINES.get(flight.get("airline_code"))
+                    break
+        domains = (info or {}).get("domains") or []
+        return f"sms@{domains[0]}" if domains else "sms@unknown.invalid"
+
+    def attach_sms_reference(reference: str, trusted_sender: str,
+                             body: str, event_id: int) -> int | None:
+        """Attach an acknowledgement reference to the newest matching filing."""
+        reference = str(reference or "").strip()
+        if not reference:
+            return None
+        complaints = db.list_complaints()
+        if any(str(item.get("reference") or "").casefold()
+               == reference.casefold() for item in complaints):
+            return None
+        if _is_gaca_sms(trusted_sender, body):
+            eligible_ids = db.gaca_confirmation_unknown_complaint_ids()
+            pending = [
+                item for item in complaints
+                if item.get("kind") == "gaca"
+                and int(item.get("id") or 0) in eligible_ids
+                and not item.get("reference")
+            ]
+            # Retain only the newest ambiguous attempt for each flight. Older
+            # attempts are historical diagnostics, not separate claims.
+            newest_by_flight = {}
+            for item in pending:
+                newest_by_flight.setdefault(item.get("flight_key"), item)
+            pending = list(newest_by_flight.values())
+            compact_body = re.sub(r"[^a-z0-9]", "", body.casefold())
+            fact_matches = []
+            for complaint in pending:
+                flight = complaint.get("flight_data") or {}
+                overrides = flight.get("overrides") or {}
+                values = [
+                    flight.get("pnr"),
+                    flight.get("flight_number"),
+                    overrides.get("flight_number"),
+                ]
+                values.extend(flight.get("flight_numbers") or [])
+                values.extend(flight.get("ticket_numbers") or [])
+                tokens = [
+                    re.sub(r"[^a-z0-9]", "", str(value).casefold())
+                    for value in values if value
+                ]
+                if any(
+                    len(token) >= 4 and token in compact_body
+                    for token in tokens
+                ):
+                    fact_matches.append(complaint)
+            if len(fact_matches) == 1:
+                pending = fact_matches
+            if len(pending) != 1:
+                return None
+            complaint = pending[0]
+            if not db.reconcile_portal_confirmation(
+                int(complaint["id"]), reference
+            ):
+                return None
+            db.mark_event_seen(f"reference-captured:{event_id}")
+            return int(complaint["id"])
+        domain = trusted_sender.rsplit("@", 1)[-1].casefold()
+        pending = []
+        for complaint in complaints:
+            if (complaint.get("kind") != "airline"
+                    or complaint.get("status") != "accepted_pending_reference"
+                    or complaint.get("reference")):
+                continue
+            flight = complaint.get("flight_data") or {}
+            info = AIRLINES.get(flight.get("airline_code"), {})
+            domains = [str(value).casefold()
+                       for value in info.get("domains") or []]
+            if domains and not any(
+                    domain == value or domain.endswith("." + value)
+                    for value in domains):
+                continue
+            pending.append(complaint)
+        if not pending:
+            return None
+
+        # Prefer explicit booking/flight facts when the carrier includes them.
+        # Otherwise list_complaints() is newest-first, which mirrors the email
+        # acknowledgement matcher for a just-submitted complaint.
+        compact_body = re.sub(r"[^a-z0-9]", "", body.casefold())
+        fact_matches = []
+        for complaint in pending:
+            flight = complaint.get("flight_data") or {}
+            overrides = flight.get("overrides") or {}
+            values = [flight.get("pnr"), flight.get("flight_number"),
+                      overrides.get("flight_number")]
+            values.extend(flight.get("flight_numbers") or [])
+            values.extend(flight.get("ticket_numbers") or [])
+            tokens = [re.sub(r"[^a-z0-9]", "", str(value).casefold())
+                      for value in values if value]
+            if any(len(token) >= 4 and token in compact_body for token in tokens):
+                fact_matches.append(complaint)
+        complaint = fact_matches[0] if len(fact_matches) == 1 else pending[0]
+        db.finish_complaint(complaint["id"], "submitted", reference)
+        db.mark_event_seen(f"reference-captured:{event_id}")
+        return int(complaint["id"])
+
+    @app.post("/api/internal/sms")
+    def ingest_sms():
+        supplied = request.headers.get("X-SMS-Secret", "")
+        if not sms_secret or not hmac.compare_digest(supplied, sms_secret):
+            abort(404)
+        value = request.get_json(silent=True)
+        if not isinstance(value, dict):
+            return jsonify(ok=False, error="JSON object required"), 400
+        body = str(value.get("text") or value.get("body") or "").strip()
+        sender = str(value.get("sender") or "")
+        sender, body = _normalize_sms_sender_body(sender, body)
+        if not body:
+            return jsonify(ok=False, error="SMS text is required"), 400
+        if len(body) > 20000:
+            return jsonify(ok=False, error="SMS text is too long"), 413
+        if _is_telecom_cst_sms(sender, body):
+            return jsonify(ok=True, ignored=True, reason="telecom-cst")
+        received_at = str(value.get("received_at") or "")[:100]
+        message_id = str(value.get("message_id") or "")[:250]
+        fingerprint = message_id or hashlib.sha256(
+            f"{sender.casefold()}\x1f{received_at}\x1f{body}".encode("utf-8")
+        ).hexdigest()
+        otp = _extract_sms_otp(body)
+        reference = _extract_sms_reference(body, sender)
+        if not _is_aviation_sms(sender, body, reference):
+            return jsonify(ok=True, ignored=True, reason="non-aviation")
+        looks_distillable = bool(
+            _SHORT_CODE_RE.search(body)
+            or re.search(
+                r"otp|verification|passcode|complaint|case|request|reference|ticket|"
+                r"gaca|saudia|comment\s*ref",
+                body, re.I,
+            )
+        )
+        if assistant.enabled and looks_distillable and (not otp or not reference):
+            distilled = assistant.distill_sms(sender, body) or {}
+            otp = otp or str(distilled.get("otp") or "")
+            reference = reference or str(distilled.get("reference") or "")
+        if otp:
+            receipt = hmac.new(
+                sms_secret.encode("utf-8"),
+                f"{sender.casefold()}\x1f{otp}".encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            is_new = db.remember_otp_receipt(receipt)
+            accept_code = getattr(
+                telegram, "accept_verification_code", None) if telegram else None
+            consumed = bool(
+                accept_code and accept_code(otp, source="SMS shortcut"))
+            if is_new and telegram:
+                telegram.notify(
+                    f"🔐 FlightDeck verification code from "
+                    f"{sender or 'unknown sender'}: {otp}\n"
+                    + ("It was entered into the active portal automatically. "
+                       if consumed else "")
+                    + "The SMS body was not stored."
+                )
+            return jsonify(
+                ok=True, ignored=True, reason="otp", otp=otp,
+                duplicate=not is_new, consumed=consumed,
+            )
+        sms_id, created = db.save_sms_message({
+            "fingerprint": fingerprint, "sender": sender,
+            "received_at": received_at, "body": body,
+            "source": str(value.get("source") or "telecombot-shortcut")[:100],
+        })
+        if not created:
+            return jsonify(ok=True, duplicate=True)
+        trusted_sender = sms_sender_email(sender, body)
+        event_id = db.save_mail_event({
+            "message_id": f"<sms-{fingerprint}@flightdeck.local>",
+            "subject": (
+                f"SMS from {sender or 'airline'}"
+                + (f" · Complaint reference: {reference}" if reference else "")
+            ),
+            "sender": trusted_sender,
+            "date": received_at or datetime.now().isoformat(),
+            "body": body,
+        })
+        db.link_sms_mail_event(sms_id, event_id)
+        attached_complaint_id = attach_sms_reference(
+            reference, trusted_sender, body, event_id)
+        if telegram:
+            if attached_complaint_id:
+                telegram.notify(
+                    f"Captured aviation complaint reference {reference} from "
+                    f"SMS and attached it to complaint #{attached_complaint_id}.")
+            else:
+                telegram.check_complaint_responses()
+            telegram.notify(
+                f"📱 FlightDeck received an airline SMS from {sender or 'unknown sender'} "
+                "and checked it against active complaints.")
+        return jsonify(
+            ok=True, duplicate=False, mail_event_id=event_id,
+            reference=reference, attached_complaint_id=attached_complaint_id,
+        )
 
     @app.context_processor
     def template_context():
@@ -406,7 +765,7 @@ def create_app(config: dict) -> Flask:
         if request.method == "POST":
             fields = (
                 "first_name", "middle_name", "last_name", "email", "phone",
-                "national_id", "title", "nationality", "country_code",
+                "national_id", "title", "gender", "nationality", "country_code",
                 "alfursan_id",
             )
             values = {field: request.form.get(field, "").strip()
@@ -551,11 +910,34 @@ def create_app(config: dict) -> Flask:
         flight = db.get_flight(flight_id)
         if not flight:
             abort(404)
+        status_snapshot = (db.get_flight_status_snapshot(
+            flight.get("flight_key") or "") or {
+                "status": "not_checked", "label": "Not checked yet",
+                "confidence": 0, "provider": "none", "sources": [],
+            })
+        complaint_ids = {item["id"] for item in flight.get("complaints") or []}
+        responses = [item for item in db.complaint_response_details(50)
+                     if item.get("complaint_id") in complaint_ids]
+        strategy = recommend_case(
+            flight, status_snapshot, flight.get("complaints") or [], responses,
+            gaca_days=max(1, int((config.get("telegram") or {}).get(
+                "gaca_auto_escalate_days", 7))))
         flight = _flight_view(flight)
         return render_template(
             "flight.html", flight=flight,
             field_groups=_copyable_field_groups(flight),
-            assessment=flight["assessment"])
+            assessment=flight["assessment"], live_status=status_snapshot,
+            strategy=strategy)
+
+    @app.route("/flight/<int:flight_id>/status/refresh", methods=["POST"])
+    def flight_status_refresh(flight_id):
+        flight = db.get_flight(flight_id)
+        if not flight:
+            abort(404)
+        snapshot = refresh_flight_status(config, flight, force=True)
+        flash("Flight status refreshed: " + str(
+            snapshot.get("label") or snapshot.get("status") or "unknown"))
+        return redirect(url_for("flight_detail", flight_id=flight_id))
 
     @app.route("/flight/<int:flight_id>/override", methods=["POST"])
     def flight_override(flight_id):
@@ -692,7 +1074,15 @@ def create_app(config: dict) -> Flask:
         subject = payload["subject"]
         complaint_id = db.begin_complaint(
             flight_key, kind, subject, incident,
-            payload.get("attachments") or [])
+            payload.get("attachments") or [],
+            submitted_text=payload.get("description") or "",
+            parent_complaint_id=(
+                int(prior["id"]) if kind == "gaca" and prior else None),
+            issue_summary=str(
+                (ai_analysis or {}).get("summary") or incident),
+            requested_resolution_summary=str(
+                (ai_analysis or {}).get("requested_remedy") or ""),
+        )
         if complaint_id is None:
             existing = db.active_complaint_for_flight(flight_key, kind)
             status = (existing or {}).get("status") or "filing"
@@ -700,11 +1090,18 @@ def create_app(config: dict) -> Flask:
                 f"This {kind.upper()} complaint is already {status.replace('_', ' ')}. "
                 "FlightDeck will not submit it again.")
             return redirect(url_for("flight_detail", flight_id=flight_id))
+        payload["portal_complaint_id"] = complaint_id
+
+        def finish_record(status: str, reference_value: str | None = None):
+            db.finish_complaint(
+                complaint_id, status, reference_value,
+                submitted_text=payload.get("description") or None,
+                portal_category=(
+                    payload.get("selected_complaint_category") or None))
 
         def record_result(result: PortalResult):
             if result.status == "submitted":
-                db.finish_complaint(
-                    complaint_id, "submitted", result.reference or None)
+                finish_record("submitted", result.reference or None)
                 if telegram:
                     suffix = (f" Reference: {result.reference}."
                               if result.reference else "")
@@ -712,8 +1109,7 @@ def create_app(config: dict) -> Flask:
                         f"{kind.upper()} complaint submitted through the official portal."
                         + suffix)
             elif result.status == "accepted_pending_reference":
-                db.finish_complaint(
-                    complaint_id, "accepted_pending_reference")
+                finish_record("accepted_pending_reference")
                 if telegram:
                     telegram.notify(
                         f"{kind.upper()} was accepted without returning its "
@@ -721,13 +1117,13 @@ def create_app(config: dict) -> Flask:
                         "reference is still missing after the mailbox scan, I will "
                         "ask for the SMS in Telegram. No duplicate will be filed.")
             elif result.status == "confirmation_unknown":
-                db.finish_complaint(complaint_id, "failed")
+                finish_record("failed")
                 if telegram:
                     telegram.notify(
                         f"{kind.upper()} returned no readable confirmation and "
                         "is recorded as failed, not submitted.")
             else:
-                db.finish_complaint(complaint_id, "failed")
+                finish_record("failed")
                 if telegram:
                     telegram.notify(
                         f"{kind.upper()} portal submission needs attention: {result.message}")

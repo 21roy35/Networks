@@ -82,7 +82,7 @@ class TwoCaptchaSolver:
         return self.solve_recaptcha(challenge)
 
     def solve_recaptcha(self, challenge: dict) -> dict:
-        """Return a reCAPTCHA v2 token and non-secret task metadata."""
+        """Return a reCAPTCHA token and non-secret task metadata."""
         if not self.enabled:
             raise CaptchaSolverError("2Captcha is not configured.")
         website_url = str(challenge.get("website_url") or "").strip()
@@ -90,20 +90,39 @@ class TwoCaptchaSolver:
         if not website_url or not site_key:
             raise CaptchaSolverError("The reCAPTCHA site key is unavailable.")
 
-        task = {
-            "type": ("RecaptchaV2EnterpriseTaskProxyless"
-                     if challenge.get("is_enterprise")
-                     else "RecaptchaV2TaskProxyless"),
-            "websiteURL": website_url,
-            "websiteKey": site_key,
-            "isInvisible": bool(challenge.get("is_invisible")),
-        }
-        user_agent = str(challenge.get("user_agent") or "").strip()
-        if user_agent:
-            task["userAgent"] = user_agent
+        is_v3 = bool(challenge.get("is_v3"))
+        if is_v3:
+            task = {
+                "type": "RecaptchaV3TaskProxyless",
+                "websiteURL": website_url,
+                "websiteKey": site_key,
+                "minScore": float(challenge.get("min_score") or 0.3),
+            }
+            page_action = str(
+                challenge.get("page_action") or "submit").strip()
+            if page_action:
+                task["pageAction"] = page_action
+            if challenge.get("is_enterprise"):
+                task["isEnterprise"] = True
+        else:
+            task = {
+                "type": ("RecaptchaV2EnterpriseTaskProxyless"
+                         if challenge.get("is_enterprise")
+                         else "RecaptchaV2TaskProxyless"),
+                "websiteURL": website_url,
+                "websiteKey": site_key,
+                "isInvisible": bool(challenge.get("is_invisible")),
+            }
+            user_agent = str(challenge.get("user_agent") or "").strip()
+            if user_agent:
+                task["userAgent"] = user_agent
         api_domain = str(challenge.get("api_domain") or "").strip()
         if api_domain in {"google.com", "recaptcha.net"}:
             task["apiDomain"] = api_domain
+        if not is_v3:
+            data_s = str(challenge.get("data_s") or "").strip()
+            if data_s:
+                task["recaptchaDataSValue"] = data_s
 
         return self._solve_task(task, ("gRecaptchaResponse", "token"))
 

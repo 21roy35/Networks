@@ -40,9 +40,12 @@
     "mailbox_scan_minutes": 10
   },
   "flight_status": {
-    "provider": "schedule",
+    "provider": "auto",
     "flightaware_api_key": "",
-    "poll_minutes": 10
+    "poll_minutes": 10,
+    "airplanes_live_enabled": true,
+    "adsb_lol_enabled": true,
+    "weather_enabled": true
   },
   "captcha": {
     "enabled": false,

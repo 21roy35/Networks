@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime
 
@@ -28,6 +29,22 @@ CREATE TABLE IF NOT EXISTS mail_events (
     body TEXT
 );
 
+CREATE TABLE IF NOT EXISTS sms_messages (
+    id INTEGER PRIMARY KEY,
+    fingerprint TEXT UNIQUE NOT NULL,
+    sender TEXT,
+    received_at TEXT,
+    body TEXT NOT NULL,
+    source TEXT,
+    mail_event_id INTEGER REFERENCES mail_events(id),
+    created_at TEXT DEFAULT (datetime('now', 'localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS otp_receipts (
+    fingerprint TEXT PRIMARY KEY,
+    first_seen_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS mailbox_cursors (
     folder TEXT PRIMARY KEY,
     uidvalidity TEXT NOT NULL,
@@ -52,10 +69,21 @@ CREATE TABLE IF NOT EXISTS complaints (
     id INTEGER PRIMARY KEY,
     flight_key TEXT NOT NULL,    -- survives re-linking (flight ids change)
     kind TEXT NOT NULL,          -- 'airline' | 'gaca'
+    parent_complaint_id INTEGER REFERENCES complaints(id),
+    root_complaint_id INTEGER REFERENCES complaints(id),
+    generation INTEGER NOT NULL DEFAULT 0,
     to_addr TEXT,
     subject TEXT,
     reference TEXT,
     details TEXT,
+    original_text TEXT,
+    submitted_text TEXT,
+    portal_category TEXT,
+    issue_summary TEXT,
+    requested_resolution_summary TEXT,
+    provider_response_text TEXT,
+    response_summary TEXT,
+    escalate_parent_on_success INTEGER NOT NULL DEFAULT 0,
     attachments TEXT DEFAULT '[]',
     status TEXT NOT NULL,        -- 'sent' | 'filed'
     created_at TEXT DEFAULT (datetime('now', 'localtime'))
@@ -65,7 +93,7 @@ CREATE TABLE IF NOT EXISTS complaint_responses (
     complaint_id INTEGER NOT NULL REFERENCES complaints(id) ON DELETE CASCADE,
     mail_event_id INTEGER NOT NULL UNIQUE
         REFERENCES mail_events(id) ON DELETE CASCADE,
-    match_method TEXT NOT NULL,  -- exact_reference | case_facts | fifo_airline
+    match_method TEXT NOT NULL,  -- exact_reference | case_facts
     matched_at TEXT DEFAULT (datetime('now', 'localtime')),
     PRIMARY KEY (complaint_id, mail_event_id)
 );
@@ -106,13 +134,21 @@ CREATE TABLE IF NOT EXISTS portal_jobs (
     airline_code TEXT,
     flight_number TEXT,
     flight_key TEXT,
+    complaint_id INTEGER,
+    payload TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL,
     message TEXT,
     reference TEXT,
     screenshot_file TEXT,
     terminal INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 100000,
+    next_attempt_at REAL,
+    lease_until REAL,
+    last_error TEXT,
     created_at TEXT DEFAULT (datetime('now', 'localtime')),
-    updated_at TEXT DEFAULT (datetime('now', 'localtime'))
+    updated_at TEXT DEFAULT (datetime('now', 'localtime')),
+    FOREIGN KEY (complaint_id) REFERENCES complaints(id)
 );
 
 CREATE TABLE IF NOT EXISTS ai_profile_cache (
@@ -131,8 +167,30 @@ CREATE TABLE IF NOT EXISTS ai_analysis_cache (
     updated_at TEXT DEFAULT (datetime('now', 'localtime'))
 );
 
+CREATE TABLE IF NOT EXISTS flight_status_observations (
+    id INTEGER PRIMARY KEY,
+    flight_key TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    provider_flight_id TEXT,
+    status TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    observed_at TEXT NOT NULL,
+    source_timestamp TEXT,
+    raw_hash TEXT NOT NULL,
+    data TEXT NOT NULL,
+    UNIQUE (flight_key, provider, raw_hash)
+);
+
+CREATE TABLE IF NOT EXISTS flight_status_current (
+    flight_key TEXT PRIMARY KEY,
+    snapshot TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_mail_events_date
     ON mail_events(date, id);
+CREATE INDEX IF NOT EXISTS idx_sms_messages_date
+    ON sms_messages(received_at, id);
 CREATE INDEX IF NOT EXISTS idx_emails_date
     ON emails(date, id);
 CREATE INDEX IF NOT EXISTS idx_complaints_open
@@ -145,15 +203,17 @@ CREATE INDEX IF NOT EXISTS idx_telegram_messages_created
     ON telegram_messages(created_at, id);
 CREATE INDEX IF NOT EXISTS idx_portal_jobs_updated
     ON portal_jobs(updated_at, id);
+CREATE INDEX IF NOT EXISTS idx_flight_status_observations_lookup
+    ON flight_status_observations(flight_key, observed_at DESC, id DESC);
 """
 
 
 @contextmanager
 def connect():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA busy_timeout = 30000")
     try:
         yield conn
         conn.commit()
@@ -164,7 +224,7 @@ def connect():
 def init_db():
     with connect() as conn:
         conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA busy_timeout = 30000")
         conn.executescript(_SCHEMA)
         columns = {row["name"] for row in
                    conn.execute("PRAGMA table_info(complaints)")}
@@ -175,6 +235,124 @@ def init_db():
         if "attachments" not in columns:
             conn.execute(
                 "ALTER TABLE complaints ADD COLUMN attachments TEXT DEFAULT '[]'")
+        if "submitted_text" not in columns:
+            conn.execute(
+                "ALTER TABLE complaints ADD COLUMN submitted_text TEXT")
+        if "portal_category" not in columns:
+            conn.execute(
+                "ALTER TABLE complaints ADD COLUMN portal_category TEXT")
+        complaint_migrations = {
+            "parent_complaint_id": "INTEGER REFERENCES complaints(id)",
+            "root_complaint_id": "INTEGER REFERENCES complaints(id)",
+            "generation": "INTEGER NOT NULL DEFAULT 0",
+            "original_text": "TEXT",
+            "issue_summary": "TEXT",
+            "requested_resolution_summary": "TEXT",
+            "provider_response_text": "TEXT",
+            "response_summary": "TEXT",
+            "escalate_parent_on_success": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, declaration in complaint_migrations.items():
+            if name not in columns:
+                conn.execute(
+                    f"ALTER TABLE complaints ADD COLUMN {name} {declaration}")
+        conn.execute(
+            """UPDATE complaints
+               SET original_text = COALESCE(
+                       NULLIF(original_text, ''),
+                       NULLIF(details, ''),
+                       NULLIF(submitted_text, ''),
+                       ''),
+                   root_complaint_id = COALESCE(root_complaint_id, id),
+                   generation = COALESCE(generation, 0)""")
+        # A provider reference identifies one complaint. This database-level
+        # guard prevents delayed duplicate SMS/email acknowledgements from
+        # ever being copied to a different complaint, including across restarts.
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS
+                   idx_complaints_kind_reference_unique
+               ON complaints(kind, lower(trim(reference)))
+               WHERE reference IS NOT NULL
+                 AND length(trim(reference)) > 0""")
+        portal_columns = {
+            row["name"] for row in conn.execute(
+                "PRAGMA table_info(portal_jobs)")
+        }
+        portal_migrations = {
+            "complaint_id": "INTEGER REFERENCES complaints(id)",
+            "payload": "TEXT NOT NULL DEFAULT '{}'",
+            "attempts": "INTEGER NOT NULL DEFAULT 0",
+            "max_attempts": "INTEGER NOT NULL DEFAULT 100000",
+            "next_attempt_at": "REAL",
+            "lease_until": "REAL",
+            "last_error": "TEXT",
+        }
+        for name, declaration in portal_migrations.items():
+            if name not in portal_columns:
+                conn.execute(
+                    f"ALTER TABLE portal_jobs ADD COLUMN {name} {declaration}")
+        conn.execute(
+            """UPDATE portal_jobs
+               SET max_attempts = 100000
+               WHERE terminal = 0 AND max_attempts < 100000""")
+        # GACA does not leave Submit attempts in a permanent "unknown" or
+        # quarantine state.  The latest attempt for each flight becomes the
+        # single durable retry; older same-flight attempts are superseded so a
+        # restart can never launch duplicate jobs.
+        ambiguous_gaca = conn.execute(
+            """SELECT id, complaint_id, flight_key
+               FROM portal_jobs
+               WHERE kind='gaca'
+                 AND status IN ('confirmation_unknown', 'quarantined')
+               ORDER BY flight_key, created_at DESC, id DESC"""
+        ).fetchall()
+        canonical_by_flight: dict[str, str] = {}
+        retry_at = time.time() + 15 * 60
+        for row in ambiguous_gaca:
+            flight_key = str(row["flight_key"] or "")
+            if flight_key not in canonical_by_flight:
+                canonical_by_flight[flight_key] = str(row["id"])
+                conn.execute(
+                    """UPDATE portal_jobs
+                       SET status='retry_wait', terminal=0, lease_until=NULL,
+                           next_attempt_at=?, last_error=?,
+                           message=?,
+                           updated_at=datetime('now', 'localtime')
+                       WHERE id=?""",
+                    (
+                        retry_at,
+                        "legacy GACA ambiguity reconciled as not submitted",
+                        "No GACA acceptance/reference was verified. Email and "
+                        "SMS remain monitored; this canonical job is queued for "
+                        "one safe retry.",
+                        str(row["id"]),
+                    ),
+                )
+                if row["complaint_id"] is not None:
+                    conn.execute(
+                        "UPDATE complaints SET status='filing' WHERE id=?",
+                        (int(row["complaint_id"]),),
+                    )
+            else:
+                conn.execute(
+                    """UPDATE portal_jobs
+                       SET status='superseded', terminal=1, lease_until=NULL,
+                           next_attempt_at=NULL, last_error=?,
+                           message=?,
+                           updated_at=datetime('now', 'localtime')
+                       WHERE id=?""",
+                    (
+                        "newer same-flight GACA retry is canonical",
+                        "Superseded by the latest durable GACA job for this "
+                        "flight; this row was not submitted.",
+                        str(row["id"]),
+                    ),
+                )
+                if row["complaint_id"] is not None:
+                    conn.execute(
+                        "UPDATE complaints SET status='failed' WHERE id=?",
+                        (int(row["complaint_id"]),),
+                    )
         # Older builds incorrectly treated an unreadable portal confirmation
         # as a protected success. Such rows are failures and must never unlock
         # a GACA escalation or suppress a safe retry.
@@ -203,6 +381,50 @@ def save_mail_event(raw: dict) -> int:
         return conn.execute(
             "SELECT id FROM mail_events WHERE message_id = ?",
             (raw.get("message_id"),)).fetchone()["id"]
+
+
+def save_sms_message(record: dict) -> tuple[int, bool]:
+    """Persist an SMS and report whether this delivery was new."""
+    with connect() as conn:
+        cursor = conn.execute(
+            """INSERT OR IGNORE INTO sms_messages
+                   (fingerprint, sender, received_at, body, source)
+               VALUES (?, ?, ?, ?, ?)""",
+            (record["fingerprint"], record.get("sender"),
+             record.get("received_at"), record.get("body") or "",
+             record.get("source") or "telecombot-shortcut"),
+        )
+        row = conn.execute(
+            "SELECT id FROM sms_messages WHERE fingerprint = ?",
+            (record["fingerprint"],)).fetchone()
+        return int(row["id"]), cursor.rowcount == 1
+
+
+def link_sms_mail_event(sms_id: int, mail_event_id: int) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE sms_messages SET mail_event_id = ? WHERE id = ?",
+            (mail_event_id, sms_id))
+
+
+def list_sms_messages(limit: int = 100) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM sms_messages ORDER BY id DESC LIMIT ?",
+            (max(1, min(int(limit), 500)),)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def remember_otp_receipt(fingerprint: str) -> bool:
+    """Deduplicate OTP deliveries without persisting their code or message body."""
+    with connect() as conn:
+        conn.execute(
+            "DELETE FROM otp_receipts "
+            "WHERE first_seen_at < datetime('now', '-10 minutes')")
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO otp_receipts(fingerprint) VALUES (?)",
+            (fingerprint,))
+        return cursor.rowcount == 1
 
 
 def list_mail_events() -> list[dict]:
@@ -252,6 +474,22 @@ def link_complaint_response(complaint_id: int, mail_event_id: int,
                VALUES (?, ?, ?)""",
             (complaint_id, mail_event_id, match_method))
         return cursor.rowcount == 1
+
+
+def unlink_complaint_response(complaint_id: int,
+                              mail_event_id: int | None = None) -> int:
+    """Remove a false or superseded response link for one complaint."""
+    with connect() as conn:
+        if mail_event_id is None:
+            cursor = conn.execute(
+                "DELETE FROM complaint_responses WHERE complaint_id = ?",
+                (complaint_id,))
+        else:
+            cursor = conn.execute(
+                """DELETE FROM complaint_responses
+                   WHERE complaint_id = ? AND mail_event_id = ?""",
+                (complaint_id, mail_event_id))
+        return int(cursor.rowcount or 0)
 
 
 def list_complaint_responses() -> list[dict]:
@@ -317,6 +555,101 @@ def initialize_fifo_response_floor() -> int:
             "INSERT INTO complaint_response_state (state_key, state_value) "
             "VALUES (?, ?)", (key, str(latest)))
         return latest
+
+
+_GACA_PORTAL_CIRCUIT_KEY = "gaca_portal_rate_limit_until_v1"
+
+
+def gaca_portal_circuit_until() -> float:
+    """Return the shared GACA portal cooldown deadline, if one is active."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT state_value FROM complaint_response_state "
+            "WHERE state_key = ?",
+            (_GACA_PORTAL_CIRCUIT_KEY,),
+        ).fetchone()
+    try:
+        return float(row["state_value"]) if row else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def clear_gaca_portal_circuit() -> None:
+    """Close the shared GACA cooldown after its network session is replaced."""
+    with connect() as conn:
+        conn.execute(
+            "DELETE FROM complaint_response_state WHERE state_key = ?",
+            (_GACA_PORTAL_CIRCUIT_KEY,),
+        )
+
+
+def defer_gaca_portal_jobs(
+        current_job_id: str, error: str, *,
+        delay: int = 24 * 3600, spacing: int = 6 * 3600) -> float:
+    """Open one shared GACA circuit after the portal rate-limits an identity.
+
+    GACA applies its Step 2 quota across the complainant's submissions, not
+    independently per complaint. Deferring only the current job lets sibling
+    complaints keep POSTing the same personal information and continually
+    refresh the block. Move every active GACA job behind one durable deadline
+    and stagger the jobs so only one re-enters the portal at a time.
+    """
+    delay = max(3600, min(int(delay), 7 * 24 * 3600))
+    spacing = max(15 * 60, min(int(spacing), 24 * 3600))
+    first_due = time.time() + delay
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """INSERT INTO complaint_response_state (state_key, state_value)
+               VALUES (?, ?)
+               ON CONFLICT(state_key) DO UPDATE SET
+                   state_value=MAX(
+                       CAST(complaint_response_state.state_value AS REAL),
+                       CAST(excluded.state_value AS REAL)
+                   )""",
+            (_GACA_PORTAL_CIRCUIT_KEY, str(first_due)),
+        )
+        rows = conn.execute(
+            """SELECT id FROM portal_jobs
+               WHERE kind='gaca' AND terminal=0
+                 AND status NOT IN ('submitted', 'superseded', 'cancelled')
+               ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END,
+                        COALESCE(next_attempt_at, 0), created_at, id""",
+            (str(current_job_id),),
+        ).fetchall()
+        for index, row in enumerate(rows):
+            due = first_due + index * spacing
+            conn.execute(
+                """UPDATE portal_jobs
+                   SET status='retry_wait', terminal=0, lease_until=NULL,
+                       next_attempt_at=?, last_error=?, message=?,
+                       updated_at=datetime('now', 'localtime')
+                   WHERE id=?""",
+                (
+                    due,
+                    str(error)[:2000],
+                    "GACA's shared submission quota is active. All GACA "
+                    "jobs are serialized behind one cooldown so sibling "
+                    "complaints cannot prolong the restriction.",
+                    str(row["id"]),
+                ),
+            )
+    return first_due
+
+
+def hold_portal_job(job_id: str, reason: str) -> bool:
+    """Keep an unsubmitted job durable without allowing the scheduler to run it."""
+    with connect() as conn:
+        cursor = conn.execute(
+            """UPDATE portal_jobs
+               SET status='held', terminal=0, lease_until=NULL,
+                   next_attempt_at=NULL, message=?, last_error=?,
+                   updated_at=datetime('now', 'localtime')
+               WHERE id=? AND terminal=0
+                 AND status NOT IN ('submitted', 'superseded', 'cancelled')""",
+            (str(reason)[:2000], str(reason)[:2000], str(job_id)),
+        )
+    return bool(cursor.rowcount)
 
 
 def get_ai_analysis_cache(cache_key: str, model: str) -> dict | None:
@@ -613,6 +946,78 @@ def list_flights() -> list[dict]:
     return flights
 
 
+def save_flight_status_observation(observation: dict) -> int:
+    """Persist one normalized provider result without duplicating retries."""
+    payload = dict(observation.get("data") or {})
+    raw_hash = str(observation.get("raw_hash") or "").strip()
+    if not raw_hash:
+        raise ValueError("A flight-status observation requires raw_hash.")
+    with connect() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO flight_status_observations
+               (flight_key, provider, provider_flight_id, status, confidence,
+                observed_at, source_timestamp, raw_hash, data)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (observation["flight_key"], observation["provider"],
+             observation.get("provider_flight_id"), observation["status"],
+             float(observation.get("confidence") or 0),
+             observation["observed_at"], observation.get("source_timestamp"),
+             raw_hash, json.dumps(payload, default=str, sort_keys=True)))
+        row = conn.execute(
+            """SELECT id FROM flight_status_observations
+               WHERE flight_key = ? AND provider = ? AND raw_hash = ?""",
+            (observation["flight_key"], observation["provider"], raw_hash),
+        ).fetchone()
+    return int(row["id"])
+
+
+def list_flight_status_observations(flight_key: str,
+                                    limit: int = 50) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM flight_status_observations
+               WHERE flight_key = ? ORDER BY observed_at DESC, id DESC LIMIT ?""",
+            (flight_key, max(1, min(int(limit), 500))),
+        ).fetchall()
+    results = []
+    for row in rows:
+        item = dict(row)
+        item["data"] = json.loads(item.get("data") or "{}")
+        results.append(item)
+    return results
+
+
+def save_flight_status_snapshot(flight_key: str, snapshot: dict) -> None:
+    updated_at = str(snapshot.get("updated_at") or datetime.now().isoformat())
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO flight_status_current (flight_key, snapshot, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(flight_key) DO UPDATE SET
+                 snapshot=excluded.snapshot, updated_at=excluded.updated_at""",
+            (flight_key, json.dumps(snapshot, default=str, sort_keys=True),
+             updated_at))
+
+
+def get_flight_status_snapshot(flight_key: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT snapshot FROM flight_status_current WHERE flight_key = ?",
+            (flight_key,),
+        ).fetchone()
+    return json.loads(row["snapshot"]) if row else None
+
+
+def flight_status_counts() -> dict[str, int]:
+    with connect() as conn:
+        return {
+            "snapshots": conn.execute(
+                "SELECT COUNT(*) FROM flight_status_current").fetchone()[0],
+            "observations": conn.execute(
+                "SELECT COUNT(*) FROM flight_status_observations").fetchone()[0],
+        }
+
+
 def get_flight(flight_id: int) -> dict | None:
     with connect() as conn:
         row = conn.execute("SELECT * FROM flights WHERE id = ?",
@@ -649,18 +1054,49 @@ def delete_email(email_id: int):
 
 
 def add_complaint(flight_key: str, kind: str, to_addr: str | None,
-                  subject: str | None, status: str,
-                  reference: str | None = None,
-                  details: str | None = None,
-                  attachments: list[str] | None = None):
+                   subject: str | None, status: str,
+                   reference: str | None = None,
+                   details: str | None = None,
+                   attachments: list[str] | None = None,
+                   submitted_text: str | None = None,
+                   portal_category: str | None = None,
+                   parent_complaint_id: int | None = None,
+                   original_text: str | None = None,
+                   issue_summary: str | None = None,
+                   requested_resolution_summary: str | None = None):
     with connect() as conn:
-        conn.execute(
+        parent = None
+        if parent_complaint_id:
+            parent = conn.execute(
+                "SELECT * FROM complaints WHERE id = ?",
+                (int(parent_complaint_id),),
+            ).fetchone()
+        root_id = (
+            int(parent["root_complaint_id"] or parent["id"])
+            if parent else None
+        )
+        generation = int(parent["generation"] or 0) + 1 if parent else 0
+        immutable_original = (
+            str(parent["original_text"] or parent["details"] or "")
+            if parent else str(original_text or details or "")
+        )
+        cursor = conn.execute(
             """INSERT INTO complaints
-               (flight_key, kind, to_addr, subject, status, reference, details,
-                attachments)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (flight_key, kind, to_addr, subject, status, reference, details,
-             json.dumps(attachments or [])))
+               (flight_key, kind, parent_complaint_id, root_complaint_id,
+                generation, to_addr, subject, status, reference, details,
+                original_text, attachments, submitted_text, portal_category,
+                issue_summary, requested_resolution_summary)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (flight_key, kind, parent_complaint_id, root_id, generation,
+             to_addr, subject, status, reference, details,
+             immutable_original, json.dumps(attachments or []),
+             submitted_text, portal_category, issue_summary,
+             requested_resolution_summary))
+        if not parent:
+            conn.execute(
+                "UPDATE complaints SET root_complaint_id = ? WHERE id = ?",
+                (int(cursor.lastrowid), int(cursor.lastrowid)),
+            )
 
 
 def active_complaint_for_flight(flight_key: str, kind: str) -> dict | None:
@@ -680,9 +1116,25 @@ def active_complaint_for_flight(flight_key: str, kind: str) -> dict | None:
     return item
 
 
+def close_complaint(complaint_id: int, status: str = "closed") -> None:
+    """Mark a prior filing closed/resolved so a reopen can start cleanly."""
+    status = status if status in {"closed", "resolved"} else "closed"
+    with connect() as conn:
+        conn.execute(
+            "UPDATE complaints SET status = ? WHERE id = ?",
+            (status, complaint_id))
+
+
 def begin_complaint(flight_key: str, kind: str, subject: str | None,
-                    details: str | None = None,
-                    attachments: list[str] | None = None) -> int | None:
+                     details: str | None = None,
+                     attachments: list[str] | None = None,
+                     submitted_text: str | None = None,
+                     portal_category: str | None = None,
+                     *, reopen: bool = False,
+                     parent_complaint_id: int | None = None,
+                     issue_summary: str | None = None,
+                     requested_resolution_summary: str | None = None,
+                     escalate_parent_on_success: bool = False) -> int | None:
     """Atomically reserve one official filing per flight and destination."""
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -698,27 +1150,159 @@ def begin_complaint(flight_key: str, kind: str, subject: str | None,
                 """SELECT 1 WHERE ? = 'filing'
                    AND datetime(?) < datetime('now', 'localtime', '-45 minutes')""",
                 (current["status"], current["created_at"])).fetchone()
-            if not stale:
+            if stale:
+                conn.execute(
+                    "UPDATE complaints SET status = 'interrupted' WHERE id = ?",
+                    (current["id"],))
+            elif reopen and current["status"] in {
+                    "submitted", "filed", "sent", "accepted_pending_reference"}:
+                # Explicit reopen after a closed/resolved cycle: retire the
+                # prior active row so a fresh filing can be reserved.
+                conn.execute(
+                    "UPDATE complaints SET status = 'closed' WHERE id = ?",
+                    (current["id"],))
+            else:
                 return None
-            conn.execute(
-                "UPDATE complaints SET status = 'interrupted' WHERE id = ?",
-                (current["id"],))
+        parent = None
+        if parent_complaint_id:
+            parent = conn.execute(
+                "SELECT * FROM complaints WHERE id = ? AND flight_key = ?",
+                (int(parent_complaint_id), flight_key),
+            ).fetchone()
+            if not parent:
+                raise ValueError("Complaint parent does not belong to this flight")
+        root_id = (
+            int(parent["root_complaint_id"] or parent["id"])
+            if parent else None
+        )
+        generation = int(parent["generation"] or 0) + 1 if parent else 0
+        original_text = (
+            str(parent["original_text"] or parent["details"] or "")
+            if parent else str(details or "")
+        )
         cursor = conn.execute(
             """INSERT INTO complaints
-               (flight_key, kind, subject, status, details, attachments)
-               VALUES (?, ?, ?, 'filing', ?, ?)""",
-            (flight_key, kind, subject, details,
-             json.dumps(attachments or [])))
-        return int(cursor.lastrowid)
+               (flight_key, kind, parent_complaint_id, root_complaint_id,
+                generation, subject, status, details, original_text,
+                attachments, submitted_text, portal_category, issue_summary,
+                requested_resolution_summary, escalate_parent_on_success)
+               VALUES (?, ?, ?, ?, ?, ?, 'filing', ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (flight_key, kind, parent_complaint_id, root_id, generation,
+             subject, details, original_text,
+             json.dumps(attachments or []), submitted_text, portal_category,
+             issue_summary, requested_resolution_summary,
+             int(bool(escalate_parent_on_success))))
+        complaint_id = int(cursor.lastrowid)
+        if not parent:
+            conn.execute(
+                "UPDATE complaints SET root_complaint_id = ? WHERE id = ?",
+                (complaint_id, complaint_id),
+            )
+        return complaint_id
 
 
 def finish_complaint(complaint_id: int, status: str,
-                     reference: str | None = None) -> None:
+                     reference: str | None = None,
+                     *, submitted_text: str | None = None,
+                     portal_category: str | None = None) -> None:
     with connect() as conn:
+        row = conn.execute(
+            "SELECT flight_key FROM complaints WHERE id = ?",
+            (complaint_id,)).fetchone()
         conn.execute(
             """UPDATE complaints SET status = ?,
-               reference = COALESCE(?, reference) WHERE id = ?""",
-            (status, reference, complaint_id))
+               reference = COALESCE(?, reference),
+               submitted_text = COALESCE(?, submitted_text),
+               portal_category = COALESCE(?, portal_category)
+               WHERE id = ?""",
+            (status, reference, submitted_text, portal_category, complaint_id))
+    if (status == "submitted" and reference and row
+            and row["flight_key"]):
+        mark_portal_jobs_reference_recovered(row["flight_key"], reference)
+
+
+def get_complaint(complaint_id: int) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM complaints WHERE id = ?",
+            (int(complaint_id),),
+        ).fetchone()
+    if not row:
+        return None
+    item = dict(row)
+    item["attachments"] = json.loads(item.get("attachments") or "[]")
+    return item
+
+
+def set_complaint_response(
+        complaint_id: int,
+        *,
+        response_text: str,
+        response_summary: str = "",
+) -> None:
+    """Retain both the provider's raw reply and Ghala's factual summary."""
+    with connect() as conn:
+        conn.execute(
+            """UPDATE complaints
+               SET provider_response_text = ?,
+                   response_summary = ?
+               WHERE id = ?""",
+            (str(response_text or ""), str(response_summary or ""),
+             int(complaint_id)),
+        )
+
+
+def set_complaint_summaries(
+        complaint_id: int,
+        *,
+        issue_summary: str,
+        requested_resolution_summary: str,
+) -> None:
+    """Update dashboard-only summaries; immutable original text is untouched."""
+    with connect() as conn:
+        conn.execute(
+            """UPDATE complaints
+               SET issue_summary = ?,
+                   requested_resolution_summary = ?
+               WHERE id = ?""",
+            (
+                str(issue_summary or "").strip(),
+                str(requested_resolution_summary or "").strip(),
+                int(complaint_id),
+            ),
+        )
+
+
+def clear_parent_escalation_flag(complaint_id: int) -> None:
+    with connect() as conn:
+        conn.execute(
+            """UPDATE complaints
+               SET escalate_parent_on_success = 0
+               WHERE id = ?""",
+            (int(complaint_id),),
+        )
+
+
+def pending_parent_escalations() -> list[dict]:
+    """Airline follow-ups accepted by the provider whose parent needs GACA."""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT c.*
+               FROM complaints c
+               WHERE c.kind = 'airline'
+                 AND c.escalate_parent_on_success = 1
+                 AND c.parent_complaint_id IS NOT NULL
+                 AND c.status IN (
+                     'submitted', 'accepted_pending_reference', 'filed', 'sent'
+                 )
+               ORDER BY c.created_at, c.id"""
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["attachments"] = json.loads(item.get("attachments") or "[]")
+        result.append(item)
+    return result
 
 
 def complaints_for_flight(flight_key: str) -> list[dict]:
@@ -731,7 +1315,37 @@ def complaints_for_flight(flight_key: str) -> list[dict]:
         item = dict(row)
         item["attachments"] = json.loads(item.get("attachments") or "[]")
         results.append(item)
-    return results
+    return _decorate_complaint_lineage(results)
+
+
+def _decorate_complaint_lineage(items: list[dict]) -> list[dict]:
+    by_id = {int(item["id"]): item for item in items}
+    children: dict[int, list[dict]] = {}
+    for item in items:
+        parent_id = int(item.get("parent_complaint_id") or 0)
+        if parent_id:
+            children.setdefault(parent_id, []).append(item)
+    for item in items:
+        parent = by_id.get(int(item.get("parent_complaint_id") or 0))
+        root = by_id.get(int(item.get("root_complaint_id") or item["id"]))
+        item["parent_reference"] = (
+            str(parent.get("reference") or f"case #{parent['id']}")
+            if parent else ""
+        )
+        item["root_reference"] = (
+            str(root.get("reference") or f"case #{root['id']}")
+            if root else f"case #{item['id']}"
+        )
+        item["child_complaints"] = [
+            {
+                "id": int(child["id"]),
+                "kind": child.get("kind"),
+                "status": child.get("status"),
+                "reference": child.get("reference"),
+            }
+            for child in children.get(int(item["id"]), [])
+        ]
+    return items
 
 
 def list_complaints() -> list[dict]:
@@ -752,7 +1366,7 @@ def list_complaints() -> list[dict]:
             json.loads(item.get("flight_overrides") or "{}"))
         item.pop("flight_overrides", None)
         results.append(item)
-    return results
+    return _decorate_complaint_lineage(results)
 
 
 def survey_for_flight(flight_key: str) -> dict | None:
@@ -821,6 +1435,15 @@ def mark_event_seen(event_key: str):
             (event_key,))
 
 
+def clear_event_seen(event_key: str) -> bool:
+    """Forget a one-shot marker so automation can retry after a failed job."""
+    with connect() as conn:
+        cursor = conn.execute(
+            "DELETE FROM telegram_events WHERE event_key = ?",
+            (event_key,))
+        return cursor.rowcount > 0
+
+
 def record_telegram_message(direction: str, message_id: int | None,
                             text: str = "", media_kind: str = "",
                             reply_to_message_id: int | None = None) -> None:
@@ -851,13 +1474,24 @@ def list_telegram_messages(limit: int = 20) -> list[dict]:
 
 
 def save_portal_job(job: dict) -> None:
-    """Persist portal stages so restarts do not erase failure context."""
+    """Persist portal stages, replay payload, and retry state."""
+    payload = job.get("payload")
+    if isinstance(payload, str):
+        payload_json = payload
+    elif payload is None:
+        payload_json = None
+    else:
+        payload_json = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":"))
     with connect() as conn:
         conn.execute(
             """INSERT INTO portal_jobs
                    (id, kind, airline_code, flight_number, flight_key,
-                    status, message, reference, screenshot_file, terminal)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    complaint_id, payload, status, message, reference,
+                    screenshot_file, terminal, attempts, max_attempts,
+                    next_attempt_at, lease_until, last_error)
+               VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, '{}'), ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?)
                ON CONFLICT(id) DO UPDATE SET
                    status=excluded.status,
                    message=excluded.message,
@@ -865,16 +1499,322 @@ def save_portal_job(job: dict) -> None:
                    screenshot_file=COALESCE(excluded.screenshot_file,
                                             portal_jobs.screenshot_file),
                    terminal=excluded.terminal,
+                   complaint_id=COALESCE(excluded.complaint_id,
+                                         portal_jobs.complaint_id),
+                   payload=CASE
+                       WHEN excluded.payload IS NOT NULL
+                            AND excluded.payload != '{}'
+                       THEN excluded.payload ELSE portal_jobs.payload END,
+                   attempts=MAX(portal_jobs.attempts, excluded.attempts),
+                   max_attempts=excluded.max_attempts,
+                   next_attempt_at=excluded.next_attempt_at,
+                   lease_until=excluded.lease_until,
+                   last_error=excluded.last_error,
                    updated_at=datetime('now', 'localtime')""",
             (str(job.get("id") or ""), str(job.get("kind") or ""),
              str(job.get("airline_code") or ""),
              str(job.get("flight_number") or ""),
              str(job.get("flight_key") or ""),
+             job.get("complaint_id"),
+             payload_json,
              str(job.get("status") or "queued"),
              str(job.get("message") or "")[:2000],
              str(job.get("reference") or ""),
              str(job.get("screenshot_file") or "") or None,
-             int(bool(job.get("terminal")))))
+             int(bool(job.get("terminal"))),
+             int(job.get("attempts") or 0),
+             max(1, int(job.get("max_attempts") or 100000)),
+             job.get("next_attempt_at"),
+             job.get("lease_until"),
+             str(job.get("last_error") or "")[:2000] or None))
+
+
+def get_portal_job(job_id: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM portal_jobs WHERE id = ?", (str(job_id),)
+        ).fetchone()
+    if not row:
+        return None
+    job = dict(row)
+    try:
+        job["payload"] = json.loads(job.get("payload") or "{}")
+    except (TypeError, ValueError):
+        job["payload"] = {}
+    return job
+
+
+def gaca_confirmation_unknown_complaint_ids() -> set[int]:
+    """Return GACA complaints accepted or ambiguously sent without a reference.
+
+    These are safe reconciliation targets for a later GACA SMS/email
+    reference, but are deliberately not safe targets for resubmission.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT p.complaint_id
+               FROM portal_jobs p
+               JOIN complaints c ON c.id = p.complaint_id
+               WHERE p.kind = 'gaca'
+                  AND p.status IN (
+                      'confirmation_unknown', 'accepted_pending_reference')
+                 AND c.kind = 'gaca'
+                 AND COALESCE(c.reference, '') = ''
+                 AND NOT EXISTS (
+                     SELECT 1
+                     FROM portal_jobs newer
+                     WHERE newer.complaint_id = p.complaint_id
+                       AND (
+                           newer.created_at > p.created_at
+                           OR (
+                               newer.created_at = p.created_at
+                               AND newer.id > p.id
+                           )
+                       )
+                 )"""
+        ).fetchall()
+    return {
+        int(row["complaint_id"])
+        for row in rows
+        if row["complaint_id"] is not None
+    }
+
+
+def reconcile_portal_confirmation(complaint_id: int, reference: str) -> bool:
+    """Atomically attach a regulator reference to a sent GACA complaint."""
+    reference = str(reference or "").strip()
+    if not reference:
+        return False
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        eligible = conn.execute(
+            """SELECT 1
+               FROM complaints c
+               JOIN portal_jobs p ON p.complaint_id = c.id
+               WHERE c.id = ?
+                 AND c.kind = 'gaca'
+                 AND COALESCE(c.reference, '') = ''
+                 AND p.kind = 'gaca'
+                  AND p.status IN (
+                      'confirmation_unknown', 'accepted_pending_reference')
+               LIMIT 1""",
+            (int(complaint_id),),
+        ).fetchone()
+        if not eligible:
+            return False
+        duplicate = conn.execute(
+            """SELECT 1 FROM complaints
+               WHERE reference = ? COLLATE NOCASE AND id != ?
+               LIMIT 1""",
+            (reference, int(complaint_id)),
+        ).fetchone()
+        if duplicate:
+            return False
+        conn.execute(
+            """UPDATE complaints
+               SET status='submitted', reference=?
+               WHERE id=?""",
+            (reference, int(complaint_id)),
+        )
+        conn.execute(
+            """UPDATE portal_jobs
+               SET status='submitted', terminal=1, reference=?,
+                   next_attempt_at=NULL, lease_until=NULL, last_error=NULL,
+                   message=?,
+                   updated_at=datetime('now', 'localtime')
+               WHERE complaint_id=?
+                 AND kind='gaca'
+                  AND status IN (
+                      'confirmation_unknown', 'accepted_pending_reference')""",
+            (
+                reference,
+                "GACA reference reconciled from an explicit regulator "
+                "acknowledgement; no duplicate submission was made.",
+                int(complaint_id),
+            ),
+        )
+    return True
+
+
+def claim_portal_job(job_id: str, lease_seconds: int = 20 * 60) -> dict | None:
+    """Atomically lease one queued portal job for a browser worker."""
+    now = time.time()
+    with connect() as conn:
+        cursor = conn.execute(
+            """UPDATE portal_jobs
+               SET status='leased', terminal=0, attempts=attempts + 1,
+                   lease_until=?, next_attempt_at=NULL,
+                   updated_at=datetime('now', 'localtime')
+               WHERE id=?
+                 AND attempts < max_attempts
+                 AND status IN ('queued', 'retry_wait')
+                 AND (next_attempt_at IS NULL OR next_attempt_at <= ?)""",
+            (now + max(60, int(lease_seconds)), str(job_id), now))
+        if not cursor.rowcount:
+            return None
+    return get_portal_job(job_id)
+
+
+def list_due_portal_jobs(limit: int = 3) -> list[dict]:
+    now = time.time()
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT id FROM portal_jobs
+               WHERE status IN ('queued', 'retry_wait')
+                 AND terminal=0
+                 AND attempts < max_attempts
+                 AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                 AND (
+                     kind != 'gaca'
+                     OR COALESCE((
+                         SELECT CAST(state_value AS REAL)
+                         FROM complaint_response_state
+                         WHERE state_key=?
+                     ), 0) <= ?
+                 )
+               ORDER BY COALESCE(next_attempt_at, 0), created_at, id
+               LIMIT ?""",
+            (
+                now,
+                _GACA_PORTAL_CIRCUIT_KEY,
+                now,
+                max(1, min(int(limit or 3), 20)),
+            ),
+        ).fetchall()
+    return [
+        job for row in rows
+        if (job := get_portal_job(str(row["id"]))) is not None
+    ]
+
+
+def retry_portal_job(job_id: str, error: str,
+                     minimum_delay: int = 5 * 60,
+                     fixed_delay: int | None = None) -> float | None:
+    """Schedule a confirmed pre-submit failure with exponential backoff."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT attempts,max_attempts FROM portal_jobs WHERE id=?",
+            (str(job_id),)).fetchone()
+        if not row:
+            return None
+        attempts = int(row["attempts"] or 1)
+        if attempts >= int(row["max_attempts"] or 100000):
+            conn.execute(
+                """UPDATE portal_jobs
+                   SET status='quarantined', terminal=1, lease_until=NULL,
+                       last_error=?, message=?,
+                       updated_at=datetime('now', 'localtime')
+                   WHERE id=?""",
+                (str(error)[:2000],
+                 "Safe retry limit reached; manual review is required.",
+                 str(job_id)))
+            return None
+        if fixed_delay is None:
+            delay = min(
+                6 * 3600,
+                max(int(minimum_delay), 60 * (2 ** attempts)),
+            )
+        else:
+            # A confirmed environmental remediation (for example, replacing
+            # a WAF-bound proxy session before Submit) should be retried after
+            # a short settling period instead of inheriting outage backoff
+            # from earlier, unrelated attempts.
+            delay = max(60, min(int(fixed_delay), 6 * 3600))
+        next_attempt = time.time() + delay
+        conn.execute(
+            """UPDATE portal_jobs
+               SET status='retry_wait', terminal=0, lease_until=NULL,
+                   next_attempt_at=?, last_error=?, message=?,
+                   updated_at=datetime('now', 'localtime')
+               WHERE id=?""",
+            (next_attempt, str(error)[:2000],
+             f"Safely queued to retry after a pre-submit failure "
+             f"(attempt {attempts}).",
+             str(job_id)))
+        return next_attempt
+
+
+def quarantine_portal_job(job_id: str, error: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            """UPDATE portal_jobs
+               SET status='quarantined', terminal=1, lease_until=NULL,
+                   next_attempt_at=NULL, last_error=?, message=?,
+                   updated_at=datetime('now', 'localtime')
+               WHERE id=?""",
+            (str(error)[:2000],
+             "The previous run may have reached Submit. It is quarantined "
+             "until email/SMS/portal state is reconciled.",
+             str(job_id)))
+
+
+def recover_interrupted_portal_jobs() -> dict[str, int]:
+    """Recover crashes; GACA Submit interruptions reconcile then retry."""
+    now = time.time()
+    safe_stages = (
+        "leased", "opening", "filling", "reviewing", "verification",
+    )
+    with connect() as conn:
+        placeholders = ",".join("?" for _ in safe_stages)
+        safe = conn.execute(
+            f"""UPDATE portal_jobs
+                SET status='retry_wait', terminal=0, lease_until=NULL,
+                    next_attempt_at=?,
+                    last_error='process stopped before Submit; safe retry queued',
+                    updated_at=datetime('now', 'localtime')
+                WHERE status IN ({placeholders})""",
+            (now + 60, *safe_stages)).rowcount
+        gaca_submit = conn.execute(
+            """UPDATE portal_jobs
+               SET status='retry_wait', terminal=0, lease_until=NULL,
+                   next_attempt_at=?,
+                   last_error='process stopped during GACA Submit; no verified acceptance',
+                   message=?,
+                   updated_at=datetime('now', 'localtime')
+               WHERE status='submitting' AND kind='gaca'""",
+            (
+                now + 15 * 60,
+                "GACA acceptance was not verified. Email/SMS will be "
+                "reconciled before the durable retry.",
+            ),
+        ).rowcount
+        ambiguous = conn.execute(
+            """UPDATE portal_jobs
+               SET status='quarantined', terminal=1, lease_until=NULL,
+                   next_attempt_at=NULL,
+                   last_error='process stopped during Submit; reconcile first',
+                   message='Interrupted during Submit; duplicate-safe quarantine.',
+                   updated_at=datetime('now', 'localtime')
+               WHERE status='submitting' AND kind!='gaca'""").rowcount
+    return {"retry_wait": int(safe or 0) + int(gaca_submit or 0),
+            "quarantined": int(ambiguous or 0)}
+
+
+def mark_portal_jobs_reference_recovered(flight_key: str,
+                                         reference: str) -> int:
+    """Flip stale accepted_pending_reference jobs to success once a ref arrives."""
+    flight_key = str(flight_key or "").strip()
+    reference = str(reference or "").strip()
+    if not flight_key or not reference:
+        return 0
+    message = (
+        f"Airline reference {reference} was recovered after acceptance. "
+        "Portal job updated from accepted_pending_reference to success.")
+    with connect() as conn:
+        cursor = conn.execute(
+            """UPDATE portal_jobs
+               SET status = 'success',
+                   reference = ?,
+                   message = ?,
+                   terminal = 1,
+                   next_attempt_at = NULL,
+                   lease_until = NULL,
+                   last_error = NULL,
+                   updated_at = datetime('now', 'localtime')
+               WHERE flight_key = ?
+                 AND status = 'accepted_pending_reference'""",
+            (reference, message, flight_key))
+        return int(cursor.rowcount or 0)
 
 
 def list_portal_jobs(limit: int = 10) -> list[dict]:
@@ -922,6 +1862,8 @@ def set_overrides(flight_id: int, values: dict):
 
 def reset():
     with connect() as conn:
+        conn.execute("DELETE FROM flight_status_current")
+        conn.execute("DELETE FROM flight_status_observations")
         conn.execute("DELETE FROM complaint_responses")
         conn.execute("DELETE FROM complaint_response_state")
         conn.execute("DELETE FROM flight_emails")

@@ -1,10 +1,14 @@
+import os
+
 import pytest
 
-from flight_bot import portal_automation
+from flight_bot import db, gaca_normal_browser, portal_automation
 from flight_bot.airlines import AIRLINES
 from flight_bot.complaints import complaint_payload, missing_portal_fields
 from flight_bot.portal_automation import (_extract_reference,
-                                          _extract_reference_from_url, _is_official_url)
+                                          _extract_reference_from_url,
+                                          _is_official_url,
+                                          _playwright_proxy_options)
 
 
 def sample_flight():
@@ -34,6 +38,391 @@ def profile():
         "nationality": "Saudi Arabian",
         "country_code": "+966",
     }
+
+
+def test_proxy_credentials_are_passed_separately_to_playwright():
+    assert _playwright_proxy_options(
+        "http://sticky%2Bsession:p%40ss@proxy.example:9000") == {
+            "server": "http://proxy.example:9000",
+            "username": "sticky+session",
+            "password": "p@ss",
+        }
+
+
+def test_proxy_without_credentials_remains_usable():
+    assert _playwright_proxy_options("proxy.example:9000") == {
+        "server": "http://proxy.example:9000",
+    }
+
+
+def test_portal_job_payload_and_retry_survive_restart(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightdeck.db")
+    db.init_db()
+    job = {
+        "id": "durable-1",
+        "kind": "airline",
+        "airline_code": "SV",
+        "flight_number": "SV100",
+        "flight_key": "flight-1",
+        "status": "queued",
+        "message": "queued",
+        "payload": {"kind": "airline", "incident": "broken seat"},
+    }
+    db.save_portal_job(job)
+    claimed = db.claim_portal_job(job["id"])
+    assert claimed["attempts"] == 1
+    assert claimed["payload"]["incident"] == "broken seat"
+
+    next_attempt = db.retry_portal_job(
+        job["id"], "blocked before Submit", minimum_delay=60)
+    restored = db.get_portal_job(job["id"])
+    assert next_attempt is not None
+    assert restored["status"] == "retry_wait"
+    assert restored["payload"] == job["payload"]
+    assert restored["next_attempt_at"] == next_attempt
+
+
+def test_complaint_lineage_keeps_immutable_original_and_child_context(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "lineage.db")
+    db.init_db()
+    root_id = db.begin_complaint(
+        "flight-1", "airline", "Original",
+        "My seat would not recline.",
+        submitted_text="Original expanded portal text",
+        issue_summary="The seat would not recline.",
+        requested_resolution_summary="Repair and a fair resolution.",
+    )
+    db.finish_complaint(root_id, "submitted", "C_100")
+    db.close_complaint(root_id)
+    child_id = db.begin_complaint(
+        "flight-1", "airline", "Follow-up",
+        "I raised this under C_100 and it was closed without a solution.",
+        parent_complaint_id=root_id,
+        escalate_parent_on_success=True,
+    )
+    child = db.get_complaint(child_id)
+    root = db.get_complaint(root_id)
+
+    assert root["root_complaint_id"] == root_id
+    assert child["parent_complaint_id"] == root_id
+    assert child["root_complaint_id"] == root_id
+    assert child["generation"] == 1
+    assert child["original_text"] == "My seat would not recline."
+    assert child["details"].startswith("I raised this under C_100")
+
+
+def test_safe_portal_jobs_use_durable_long_lived_retry_budget(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "retries.db")
+    db.init_db()
+    db.save_portal_job({
+        "id": "durable-safe",
+        "status": "queued",
+        "payload": {"kind": "gaca"},
+        "max_attempts": 100000,
+    })
+    claimed = db.claim_portal_job("durable-safe")
+    assert claimed["max_attempts"] == 100000
+    assert db.retry_portal_job(
+        "durable-safe", "confirmed pre-submit failure",
+        minimum_delay=60) is not None
+    assert db.get_portal_job("durable-safe")["status"] == "retry_wait"
+
+
+def test_remediated_proxy_retry_bypasses_old_exponential_backoff(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "proxy-retry.db")
+    db.init_db()
+    db.save_portal_job({
+        "id": "proxy-remediated",
+        "status": "queued",
+        "payload": {"kind": "gaca"},
+        "max_attempts": 100000,
+    })
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE portal_jobs SET attempts=8 WHERE id=?",
+            ("proxy-remediated",),
+        )
+    before = db.time.time()
+    due = db.retry_portal_job(
+        "proxy-remediated",
+        "GACA residential proxy was rotated before Submit.",
+        fixed_delay=90,
+    )
+
+    assert due is not None
+    assert 85 <= due - before <= 95
+
+
+def test_gaca_rate_limit_defers_and_serializes_all_gaca_jobs(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "gaca-circuit.db")
+    db.init_db()
+    for job_id, kind in (
+            ("gaca-current", "gaca"),
+            ("gaca-sibling", "gaca"),
+            ("airline-job", "airline")):
+        db.save_portal_job({
+            "id": job_id,
+            "kind": kind,
+            "status": "queued",
+            "payload": {"kind": kind},
+            "max_attempts": 100000,
+        })
+    assert db.claim_portal_job("gaca-current") is not None
+    before = db.time.time()
+
+    first_due = db.defer_gaca_portal_jobs(
+        "gaca-current",
+        "GACA reported too many submission attempts.",
+        delay=24 * 3600,
+        spacing=6 * 3600,
+    )
+
+    current = db.get_portal_job("gaca-current")
+    sibling = db.get_portal_job("gaca-sibling")
+    airline = db.get_portal_job("airline-job")
+    assert 24 * 3600 - 5 <= first_due - before <= 24 * 3600 + 5
+    assert current["status"] == "retry_wait"
+    assert current["next_attempt_at"] == first_due
+    assert sibling["status"] == "retry_wait"
+    assert sibling["next_attempt_at"] == first_due + 6 * 3600
+    assert airline["status"] == "queued"
+    assert db.gaca_portal_circuit_until() == first_due
+
+
+def test_new_gaca_job_cannot_bypass_shared_rate_limit_circuit(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "gaca-circuit-new.db")
+    db.init_db()
+    db.save_portal_job({
+        "id": "gaca-original",
+        "kind": "gaca",
+        "status": "queued",
+        "payload": {"kind": "gaca"},
+    })
+    db.defer_gaca_portal_jobs(
+        "gaca-original", "rate limited", delay=3600, spacing=900)
+    db.save_portal_job({
+        "id": "gaca-new",
+        "kind": "gaca",
+        "status": "queued",
+        "payload": {"kind": "gaca"},
+    })
+    db.save_portal_job({
+        "id": "airline-due",
+        "kind": "airline",
+        "status": "queued",
+        "payload": {"kind": "airline"},
+    })
+
+    assert [item["id"] for item in db.list_due_portal_jobs(10)] == [
+        "airline-due",
+    ]
+
+
+def test_legacy_job_restores_routing_fields_before_worker(monkeypatch):
+    captured = {}
+
+    def submit(payload, _update):
+        captured.update(payload)
+        return portal_automation.PortalResult(
+            "error", "safe test stop", retry_safe=True)
+
+    monkeypatch.setattr(portal_automation, "submit_portal_claim", submit)
+    monkeypatch.setattr(
+        portal_automation.db, "retry_portal_job",
+        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        portal_automation.db, "quarantine_portal_job",
+        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        portal_automation.db, "save_portal_job",
+        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        portal_automation, "_finalize_persisted_complaint",
+        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        portal_automation.threading.Thread, "start",
+        lambda thread: thread.run())
+
+    portal_automation._start_portal_worker({
+        "id": "legacy-empty-payload",
+        "kind": "gaca",
+        "airline_code": "SV",
+        "flight_number": "SV1674",
+        "flight_key": "PNR|SV1674|2026-07-09",
+        "complaint_id": 96,
+        "status": "leased",
+        "payload": {},
+    })
+
+    assert captured["kind"] == "gaca"
+    assert captured["airline_code"] == "SV"
+    assert captured["flight_number"] == "SV1674"
+    assert captured["flight_key"] == "PNR|SV1674|2026-07-09"
+    assert captured["portal_complaint_id"] == 96
+
+
+def test_interrupted_submit_is_quarantined_but_opening_is_requeued(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightdeck.db")
+    db.init_db()
+    for job_id, status in (("safe", "opening"), ("ambiguous", "submitting")):
+        db.save_portal_job({
+            "id": job_id,
+            "status": status,
+            "message": status,
+            "payload": {"kind": "airline"},
+        })
+
+    recovered = db.recover_interrupted_portal_jobs()
+
+    assert recovered == {"retry_wait": 1, "quarantined": 1}
+    assert db.get_portal_job("safe")["status"] == "retry_wait"
+    assert db.get_portal_job("ambiguous")["status"] == "quarantined"
+
+
+def test_interrupted_gaca_submit_reconciles_then_requeues(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightdeck.db")
+    db.init_db()
+    db.save_portal_job({
+        "id": "gaca-submit",
+        "kind": "gaca",
+        "status": "submitting",
+        "message": "Submit clicked",
+        "payload": {"kind": "gaca"},
+    })
+
+    recovered = db.recover_interrupted_portal_jobs()
+    job = db.get_portal_job("gaca-submit")
+
+    assert recovered == {"retry_wait": 1, "quarantined": 0}
+    assert job["status"] == "retry_wait"
+    assert job["terminal"] == 0
+    assert job["next_attempt_at"] is not None
+    assert "not verified" in job["message"]
+
+
+def test_legacy_ambiguous_gaca_jobs_become_one_canonical_retry(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightdeck.db")
+    db.init_db()
+    db.add_complaint(
+        "PNR|SV1|2026-07-01", "gaca", None, "Older", "failed")
+    db.add_complaint(
+        "PNR|SV1|2026-07-01", "gaca", None, "Newer", "failed")
+    complaints = db.complaints_for_flight("PNR|SV1|2026-07-01")
+    older, newer = (int(complaints[-2]["id"]), int(complaints[-1]["id"]))
+    db.save_portal_job({
+        "id": "older-unknown",
+        "kind": "gaca",
+        "flight_key": "PNR|SV1|2026-07-01",
+        "complaint_id": older,
+        "status": "confirmation_unknown",
+        "message": "Unreadable confirmation",
+        "terminal": True,
+    })
+    db.save_portal_job({
+        "id": "newer-quarantine",
+        "kind": "gaca",
+        "flight_key": "PNR|SV1|2026-07-01",
+        "complaint_id": newer,
+        "status": "quarantined",
+        "message": "Unreadable confirmation",
+        "terminal": True,
+    })
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE portal_jobs SET created_at='2026-07-01 00:00:00' "
+            "WHERE id='older-unknown'")
+        conn.execute(
+            "UPDATE portal_jobs SET created_at='2026-07-02 00:00:00' "
+            "WHERE id='newer-quarantine'")
+
+    db.init_db()
+
+    assert db.get_portal_job("newer-quarantine")["status"] == "retry_wait"
+    assert db.get_portal_job("older-unknown")["status"] == "superseded"
+    assert db.get_complaint(newer)["status"] == "filing"
+    assert db.get_complaint(older)["status"] == "failed"
+
+
+def test_retry_safety_requires_pre_submit_or_explicit_rejection():
+    generic = portal_automation.PortalResult(
+        "error", "network stopped")
+    rejected = portal_automation.PortalResult(
+        "error", "portal rejected the request", retry_safe=True)
+    assert portal_automation._retry_is_safe(generic, "opening") is True
+    assert portal_automation._retry_is_safe(generic, "submitting") is False
+    assert portal_automation._retry_is_safe(rejected, "submitting") is True
+
+
+def test_ghala_can_verify_gaca_failure_but_not_invent_acceptance(monkeypatch):
+    class Page:
+        url = "https://myeservices.gaca.gov.sa/error"
+
+        def is_closed(self):
+            return False
+
+    monkeypatch.setattr(
+        portal_automation, "_ask_ai",
+        lambda *_args, **_kwargs: {
+            "state": "error", "summary": "The page is a WAF error.",
+            "confidence": 0.98,
+        })
+    monkeypatch.setattr(
+        portal_automation, "_body_text",
+        lambda _page: "This page can't be displayed. Incident ID: 123")
+    monkeypatch.setattr(portal_automation, "_AI_HANDLER", object())
+
+    failed = portal_automation._gaca_ai_submission_result(
+        Page(), {"kind": "gaca"}, "WAF after Submit")
+    assert failed.status == "error"
+    assert failed.retry_safe is True
+
+    monkeypatch.setattr(
+        portal_automation, "_ask_ai",
+        lambda *_args, **_kwargs: {
+            "state": "submitted", "summary": "It may be submitted.",
+            "confidence": 0.99,
+        })
+    assert portal_automation._gaca_ai_submission_result(
+        Page(), {"kind": "gaca"}, "blank page") is None
+
+
+def test_gaca_nafath_outage_uses_long_retry_cooldown():
+    outage = portal_automation.PortalResult(
+        "error",
+        "GACA's Nafath authentication endpoint rejected the login "
+        "(Authentication using Nafath failed).",
+        retry_safe=True,
+    )
+    generic = portal_automation.PortalResult(
+        "error", "The official site timed out.", retry_safe=True)
+    rate_limited = portal_automation.PortalResult(
+        "error",
+        "GACA reported too many submission attempts and requested a "
+        "waiting period before retry.",
+        retry_safe=True,
+    )
+
+    assert portal_automation._retry_minimum_delay(outage) == 3600
+    assert portal_automation._retry_minimum_delay(rate_limited) == 3600
+    assert portal_automation._retry_minimum_delay(generic) == 300
+
+
+def test_gaca_rate_limit_is_identified_for_fixed_retry_delay():
+    message = (
+        "GACA reported too many submission attempts and requested a "
+        "waiting period before retry."
+    )
+    assert portal_automation._retry_minimum_delay(
+        portal_automation.PortalResult(
+            "error", message, retry_safe=True)) == 3600
 
 
 def test_payload_maps_incident_and_every_known_portal_field():
@@ -135,21 +524,88 @@ def test_family_booking_uses_only_that_passengers_saved_profile():
     assert missing_portal_fields(payload) == []
 
 
-def test_ai_analysis_augments_letter_but_preserves_original_incident():
+def test_ai_analysis_writes_a_natural_first_person_complaint():
     original = "My seat was broken and the screen did not work."
     payload = complaint_payload(
         sample_flight(), profile(), "airline", original,
         ai_analysis={
-            "category": "seat", "summary": "Seat and screen were unusable.",
+            "category": "seat",
+            "summary": "I could not use my seat or entertainment screen.",
             "facts": ["The seat was broken", "The screen did not work"],
             "evidence_observations": ["A seat component appears displaced"],
-            "requested_remedy": "Investigate and provide applicable remedies.",
+            "requested_remedy": "Please investigate this and provide a fair resolution.",
         })
     assert payload["incident"] == original
     assert payload["ai_analysis"]["category"] == "seat"
-    assert payload["description"].startswith(original)
-    assert "financial compensation" in payload["description"]
-    assert not payload["description"].startswith("Dear")
+    assert payload["description"].startswith("Hello,")
+    assert "I could not use my seat or entertainment screen." in payload["description"]
+    assert "Please investigate this and provide a fair resolution." in payload["description"]
+    assert "Passenger reports" not in payload["description"]
+    assert "Additional issue summary" not in payload["description"]
+    assert "Facts stated by the passenger" not in payload["description"]
+    assert "financial compensation where applicable" not in payload["description"]
+
+
+def test_gaca_free_text_does_not_repeat_structured_form_fields():
+    flight = sample_flight()
+    payload = complaint_payload(
+        flight,
+        profile(),
+        "gaca",
+        "The airline closed my complaint without fixing the broken screen.",
+        airline_reference="C_2800078",
+        airline_complaint_date="2026-07-15",
+        ai_analysis={
+            "summary": (
+                "During my flight SV100 from RUH to JED, the airline closed "
+                "my complaint C_2800078 without addressing the broken "
+                "entertainment screen or offering a proper remedy."
+            ),
+            "requested_remedy": (
+                "I want the issue reviewed and a fair cash remedy."
+            ),
+        },
+    )
+
+    description = payload["description"]
+    for structured_value in (
+        payload["national_id"],
+        payload["passenger_name"],
+        payload["flight_number"],
+        payload["flight_date"],
+        payload["pnr"],
+        payload["ticket_number"],
+        payload["airline_reference"],
+        payload["airline_complaint_date"],
+    ):
+        assert structured_value not in description
+    assert "broken entertainment screen" in description
+    assert "fair cash remedy" in description
+
+
+def test_old_third_person_analysis_is_safely_naturalized():
+    flight = sample_flight()
+    flight.update({
+        "flight_number": "SV520", "flight_date": "2025-12-06",
+        "origin": "RUH", "destination": "BAH", "pnr": "7MZ63V",
+        "ticket_numbers": ["065-2191703682"],
+    })
+    payload = complaint_payload(
+        flight, profile(), "airline", "no amentity kit was provided",
+        ai_analysis={
+            "category": "service",
+            "summary": "Passenger reports that no amenity kit was provided.",
+            "facts": ["No amenity kit was provided"],
+            "evidence_observations": [],
+            "requested_remedy": (
+                "Passenger requests investigation and an appropriate remedy."),
+        })
+    description = payload["description"]
+    assert "I am writing about my Saudia flight SV520 from RUH to BAH" in description
+    assert "The issue I experienced was that no amenity kit was provided." in description
+    assert "I would appreciate it if you could investigate this and provide an appropriate resolution." in description
+    assert "Passenger reports" not in description
+    assert "Assessment basis" not in description
 
 
 def test_gaca_payload_cannot_skip_the_airline_reference():
@@ -182,6 +638,39 @@ def test_block_page_is_not_mistaken_for_a_form():
     class Page:
         def title(self):
             return "Service unavailable"
+
+        def locator(self, selector):
+            assert selector == "body"
+            return Body()
+
+    assert portal_automation._request_blocked(Page()) is True
+
+
+def test_gaca_waf_error_page_is_detected_as_blocked():
+    class Body:
+        def inner_text(self, timeout=None):
+            return ("Error This page can't be displayed. Contact support "
+                    "for additional information. The incident ID is: N/A.")
+
+    class Page:
+        def title(self):
+            return "Error"
+
+        def locator(self, selector):
+            assert selector == "body"
+            return Body()
+
+    assert portal_automation._request_blocked(Page()) is True
+
+
+def test_gaca_generic_http_403_error_page_is_detected_as_blocked():
+    class Body:
+        def inner_text(self, timeout=None):
+            return "Sorry! There is an error loading this page. Go Back"
+
+    class Page:
+        def title(self):
+            return "GACA"
 
         def locator(self, selector):
             assert selector == "body"
@@ -587,10 +1076,12 @@ def test_2captcha_extracts_site_key_and_applies_token(monkeypatch):
         def __init__(self):
             self.waits = []
             self.injected = ""
+            self.inject_script = ""
 
         def evaluate(self, script, *args):
             if script == "navigator.userAgent":
                 return "Modern Browser"
+            self.inject_script = script
             self.injected = args[0]
             return {"fields": 1, "callbacks": 1}
 
@@ -618,9 +1109,114 @@ def test_2captcha_extracts_site_key_and_applies_token(monkeypatch):
         "api_domain": "recaptcha.net",
     }
     assert page.injected == "automatic-token"
-    assert page.waits == [1500]
+    assert "document.createElement" in page.inject_script
+    assert "g-recaptcha-response" in page.inject_script
+    assert page.waits == [1200]
     assert updates[0][0] == "verification"
     assert updates[-1][0] == "filling"
+
+
+def test_gaca_native_post_requires_the_injected_token():
+    class Form:
+        def __init__(self, result):
+            self.result = result
+            self.script = ""
+
+        def evaluate(self, script):
+            self.script = script
+            return self.result
+
+    accepted = Form(True)
+    assert portal_automation._submit_gaca_form_with_injected_token(
+        accepted) is True
+    assert "checkValidity" in accepted.script
+    assert "HTMLFormElement.prototype.submit.call" in accepted.script
+
+    rejected = Form(False)
+    assert portal_automation._submit_gaca_form_with_injected_token(
+        rejected) is False
+
+
+def test_recaptcha_detects_execute_based_v3_and_action():
+    class Frame:
+        url = ("https://www.google.com/recaptcha/api2/anchor?"
+               "k=gaca-site-key&size=invisible")
+
+    class Page:
+        url = "https://myeservices.gaca.gov.sa/eservices/complaint/step4"
+        frames = [Frame()]
+
+        def evaluate(self, script, *args):
+            if script == "navigator.userAgent":
+                return "Modern Browser"
+            assert "RECAPTCHA_PAGE_CONTEXT" in script
+            assert args == ("gaca-site-key",)
+            return {
+                "is_v3": True,
+                "is_enterprise": False,
+                "page_action": "complaint_submit",
+            }
+
+    assert portal_automation._recaptcha_challenge(Page()) == {
+        "kind": "recaptcha",
+        "website_url": Page.url,
+        "site_key": "gaca-site-key",
+        "is_invisible": True,
+        "is_enterprise": False,
+        "user_agent": "Modern Browser",
+        "api_domain": "google.com",
+        "is_v3": True,
+        "page_action": "complaint_submit",
+        "min_score": 0.9,
+    }
+
+
+def test_recaptcha_v3_key_is_recovered_from_render_script_before_iframe():
+    class Empty:
+        first = None
+
+        def get_attribute(self, _name):
+            return None
+
+    class Scripts:
+        def evaluate_all(self, _script):
+            return [
+                "https://www.google.com/recaptcha/api.js?"
+                "render=gaca-script-site-key",
+            ]
+
+    class Page:
+        url = "https://myeservices.gaca.gov.sa/eservices/complaint/step4"
+        frames = []
+
+        def locator(self, selector):
+            if selector == "script[src*='recaptcha'][src*='render=']":
+                return Scripts()
+            return Empty()
+
+        def evaluate(self, script, *args):
+            if script == "navigator.userAgent":
+                return "Modern Browser"
+            assert "RECAPTCHA_PAGE_CONTEXT" in script
+            assert args == ("gaca-script-site-key",)
+            return {
+                "is_v3": True,
+                "is_enterprise": False,
+                "page_action": "complaint",
+            }
+
+    assert portal_automation._recaptcha_challenge(Page()) == {
+        "kind": "recaptcha",
+        "website_url": Page.url,
+        "site_key": "gaca-script-site-key",
+        "is_invisible": True,
+        "is_enterprise": False,
+        "user_agent": "Modern Browser",
+        "api_domain": "google.com",
+        "is_v3": True,
+        "page_action": "complaint",
+        "min_score": 0.9,
+    }
 
 
 def test_nested_hcaptcha_is_detected_and_sent_to_automatic_solver(monkeypatch):
@@ -1037,6 +1633,93 @@ def test_gaca_screen_issue_uses_exact_three_level_category():
            "In- flight Screens")
 
 
+@pytest.mark.parametrize(("incident", "expected"), [
+    (
+        "The flight was cancelled without a suitable alternative.",
+        ("Flights", "Flight Cancellation", "Flight Cancellation"),
+    ),
+    (
+        "The flight was delayed for five hours.",
+        ("Flights", "Flight Delay", "Flight Delay"),
+    ),
+])
+def test_gaca_disruption_uses_exact_three_level_category(incident, expected):
+    assert portal_automation._gaca_categories({
+        "incident": incident,
+    }) == expected
+
+
+def test_gaca_proxy_rotation_clears_only_gaca_state_once(
+        tmp_path, monkeypatch):
+    class CDPSession:
+        def __init__(self):
+            self.calls = []
+            self.detached = False
+
+        def send(self, method, payload):
+            self.calls.append((method, payload))
+
+        def detach(self):
+            self.detached = True
+
+    class Context:
+        class Page:
+            url = "about:blank"
+
+        def __init__(self):
+            self.pages = []
+            self.cookie_filters = []
+            self.sessions = []
+
+        def clear_cookies(self, **filters):
+            self.cookie_filters.append(filters)
+
+        def new_page(self):
+            page = self.Page()
+            self.pages.append(page)
+            return page
+
+        def new_cdp_session(self, _page):
+            session = CDPSession()
+            self.sessions.append(session)
+            return session
+
+    context = Context()
+    monkeypatch.setenv("FLIGHTBOT_GACA_PROXY_SESSION", "session-one")
+
+    assert gaca_normal_browser._sync_proxy_session_state(
+        context, tmp_path) is True
+    assert len(context.cookie_filters) == 1
+    assert len(context.sessions[0].calls) == 3
+    assert context.sessions[0].detached is True
+
+    assert gaca_normal_browser._sync_proxy_session_state(
+        context, tmp_path) is False
+    assert len(context.cookie_filters) == 1
+
+    monkeypatch.setenv("FLIGHTBOT_GACA_PROXY_SESSION", "session-two")
+    assert gaca_normal_browser._sync_proxy_session_state(
+        context, tmp_path) is True
+    assert len(context.cookie_filters) == 2
+
+
+def test_gaca_proxy_rotation_updates_shared_session_file(
+        tmp_path, monkeypatch):
+    session_file = tmp_path / "proxy-session"
+    session_file.write_text("old-session-value", encoding="ascii")
+    monkeypatch.setenv(
+        "FLIGHTBOT_GACA_PROXY_SESSION_FILE", str(session_file))
+    before = gaca_normal_browser._proxy_session_fingerprint()
+
+    assert gaca_normal_browser.rotate_proxy_session() is True
+    after = gaca_normal_browser._proxy_session_fingerprint()
+
+    assert after
+    assert after != before
+    if os.name != "nt":
+        assert session_file.stat().st_mode & 0o777 == 0o600
+
+
 def test_gaca_normalizes_saudia_and_local_mobile_number():
     assert portal_automation._gaca_airline_label({
         "airline_code": "SV", "airline_name": "Saudia"
@@ -1044,6 +1727,73 @@ def test_gaca_normalizes_saudia_and_local_mobile_number():
     assert portal_automation._gaca_mobile({
         "country_code": "+966", "phone": "+966599491494"
     }) == "599491494"
+
+
+def test_gaca_nafath_walks_tab_and_national_id_screen(monkeypatch):
+    class Page:
+        url = "https://myeservices.gaca.gov.sa/eservices/login"
+
+        def wait_for_timeout(self, _milliseconds):
+            return None
+
+    page = Page()
+    filled = []
+    updates = []
+
+    def click(_page, names):
+        if any("Nafath" in name for name in names):
+            page.url = (
+                "https://myeservices.gaca.gov.sa/eservices/login/nafath")
+            return True
+        if any("Login" in name for name in names):
+            page.url = "https://myeservices.gaca.gov.sa/eservices/dashboard"
+            return True
+        return False
+
+    monkeypatch.setattr(
+        portal_automation, "_is_gaca_login_page",
+        lambda current: "/login" in current.url)
+    monkeypatch.setattr(portal_automation, "_click", click)
+    monkeypatch.setattr(
+        portal_automation, "_fill",
+        lambda _page, labels, value, **_kwargs:
+        filled.append((labels, value)) or True)
+    monkeypatch.setattr(portal_automation, "_body_text", lambda _page: "")
+    monkeypatch.setattr(portal_automation, "_page_screenshot", lambda _page: b"")
+
+    state = portal_automation._start_gaca_nafath(
+        page, {"national_id": "1108337526"},
+        lambda *args: updates.append(args))
+
+    assert state == "authenticated"
+    assert filled[-1][1] == "1108337526"
+    assert any("Opening GACA" in args[1] for args in updates)
+
+
+def test_gaca_nafath_explicit_portal_failure_is_safe(monkeypatch):
+    class Page:
+        url = "https://myeservices.gaca.gov.sa/eservices/login/nafath"
+
+        def wait_for_timeout(self, _milliseconds):
+            return None
+
+    updates = []
+    monkeypatch.setattr(portal_automation, "_is_gaca_login_page", lambda _page: True)
+    monkeypatch.setattr(portal_automation, "_fill", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(portal_automation, "_click", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        portal_automation, "_body_text",
+        lambda _page: "Login error! Authentication using Nafath failed")
+    monkeypatch.setattr(portal_automation, "_page_screenshot", lambda _page: b"")
+
+    state = portal_automation._start_gaca_nafath(
+        Page(), {"national_id": "1108337526"},
+        lambda *args: updates.append(args))
+
+    assert state == "failed"
+    assert any("retry safely" in args[1] for args in updates)
+    assert "outage cooldown" in portal_automation._gaca_login_abort_message(
+        Page())
 
 
 def test_gaca_adapter_walks_all_four_steps(monkeypatch):
@@ -1080,6 +1830,17 @@ def test_gaca_adapter_walks_all_four_steps(monkeypatch):
         lambda _page, labels, choices, **_kwargs:
         selects.append((labels, choices)) or True)
     monkeypatch.setattr(
+        portal_automation, "_select_gaca_gender",
+        lambda _page, _payload: True)
+    monkeypatch.setattr(
+        portal_automation, "_select_gaca_dropdown",
+        lambda _page, label, value: selects.append(([label], [value])) or True)
+    monkeypatch.setattr(
+        portal_automation, "_select_gaca_category_tree",
+        lambda _page, payload: (
+            selects.append((["main"], ["Baggage"])) or
+            ("On Board Services", "Entertainment Services", "In- flight Screens")))
+    monkeypatch.setattr(
         portal_automation, "_selectize_by_label",
         lambda _page, label, query, choices:
         selectize.append((label, query, choices)) or True)
@@ -1103,8 +1864,9 @@ def test_gaca_adapter_walks_all_four_steps(monkeypatch):
         updates.append((stage, message)))
 
     assert len(clicks) == 4  # Apply Now, then Next through steps 1-3.
-    assert any("main category" in labels[0] for labels, _choices in selects)
-    assert any("sub-subcategory" in labels[0] for labels, _choices in selects)
+    assert any(labels == ["main"] for labels, _choices in selects)
+    assert payload.get("selected_complaint_category") == (
+        "On Board Services › Entertainment Services › In- flight Screens")
     assert any(labels == ["airline complaint number",
                           "complaint number with the air carrier"]
                and value == "CAS-123456" for labels, value in fills)
@@ -1118,6 +1880,20 @@ def test_claude_baggage_category_maps_to_saudia_quality_option():
         "incident": "My property was damaged during handling.",
         "ai_analysis": {"category": "baggage"},
     }) == "Quality of services"
+
+
+def test_gaca_category_honors_explicit_baggage_delay_priority():
+    payload = {
+        "incident": "My baggage was delayed and delivered with damage.",
+        "gaca_category": {
+            "main": "Baggage Services",
+            "sub": "Baggage Delay",
+            "detail": "",
+        },
+    }
+
+    assert portal_automation._gaca_categories(payload) == (
+        "Baggage Services", "Baggage Delay", "")
 
 
 def test_reference_is_extracted_from_official_confirmation_text():
@@ -1277,6 +2053,165 @@ def test_submission_reference_rejects_bare_backend_numbers():
     }) == "C_2761389"
 
 
+def test_gaca_internal_survey_details_id_is_not_a_public_reference():
+    assert portal_automation._extract_gaca_reference_from_url(
+        "https://myeservices.gaca.gov.sa/eservices/public/qpe/"
+        "survey?detailsId=4701857") == ""
+    assert portal_automation._extract_gaca_reference_from_url(
+        "https://myeservices.gaca.gov.sa/eservices/public/qpe/"
+        "survey?reference=C076239") == "C076239"
+    assert portal_automation._extract_gaca_reference_from_url(
+        "https://myeservices.gaca.gov.sa/eservices/eservice/"
+        "details?detailsId=2642710") == ""
+
+
+def test_gaca_category_native_select_is_verified_after_selection(monkeypatch):
+    class Checked:
+        def inner_text(self):
+            return "Entertainment Services"
+
+    class Control:
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 1
+
+        def locator(self, selector):
+            assert selector == "option:checked"
+            return Checked()
+
+        def input_value(self):
+            return "entertainment-services"
+
+    class Page:
+        def __init__(self):
+            self.control = Control()
+
+        def locator(self, selector):
+            assert selector == "select#subCategorySelect"
+            return self.control
+
+        def wait_for_timeout(self, _value):
+            pass
+
+    monkeypatch.setattr(
+        portal_automation, "_gaca_live_select_options",
+        lambda _page, _select_id: ["Meals", "Entertainment Services"])
+    monkeypatch.setattr(
+        portal_automation, "_select_native_option",
+        lambda _control, choices: choices == [r"^Entertainment\ Services$"])
+
+    assert portal_automation._select_gaca_category_value(
+        Page(), "subCategorySelect", "Entertainment Services"
+    ) == "Entertainment Services"
+
+
+def test_gaca_split_verification_code_fills_each_digit(monkeypatch):
+    class Field:
+        def __init__(self):
+            self.value = ""
+
+        def is_visible(self):
+            return True
+
+        def fill(self, value):
+            self.value = value
+
+    class Fields:
+        def __init__(self):
+            self.items = [Field() for _ in range(4)]
+            self.first = self.items[0]
+
+        def count(self):
+            return len(self.items)
+
+        def nth(self, index):
+            return self.items[index]
+
+    class Page:
+        url = "https://myeservices.gaca.gov.sa/eservices/public/qpe/verification/email"
+
+        def __init__(self):
+            self.fields = Fields()
+
+        def get_by_role(self, *_args, **_kwargs):
+            return self.fields
+
+        def locator(self, _selector):
+            return self.fields
+
+        def wait_for_timeout(self, _value):
+            pass
+
+    page = Page()
+    monkeypatch.setattr(
+        portal_automation, "_VERIFICATION_HANDLER",
+        lambda _challenge: "1078")
+    monkeypatch.setattr(portal_automation, "_click", lambda *_args: True)
+
+    assert portal_automation._solve_otp(
+        page, lambda *_args: None) is True
+    assert [field.value for field in page.fields.items] == list("1078")
+
+
+def test_gaca_normal_browser_uses_os_input_for_email_code(monkeypatch):
+    class Field:
+        def __init__(self):
+            self.value = ""
+
+        def is_visible(self):
+            return True
+
+        def fill(self, value):
+            raise AssertionError("Playwright must not type the GACA OTP")
+
+    class Fields:
+        def __init__(self):
+            self.items = [Field() for _ in range(4)]
+            self.first = self.items[0]
+
+        def count(self):
+            return len(self.items)
+
+        def nth(self, index):
+            return self.items[index]
+
+    class Page:
+        url = (
+            "https://myeservices.gaca.gov.sa/eservices/public/qpe/"
+            "verification/email"
+        )
+
+        def __init__(self):
+            self.fields = Fields()
+
+        def get_by_role(self, *_args, **_kwargs):
+            return self.fields
+
+        def locator(self, _selector):
+            return self.fields
+
+        def wait_for_timeout(self, _value):
+            pass
+
+    page = Page()
+    used = []
+    monkeypatch.setenv("FLIGHTBOT_GACA_OS_INPUT", "1")
+    monkeypatch.setattr(
+        portal_automation, "_VERIFICATION_HANDLER",
+        lambda _challenge: "9534")
+    monkeypatch.setattr(
+        portal_automation.gaca_normal_browser,
+        "physical_type_otp",
+        lambda _page, fields, code, verify: used.append(
+            (fields, code, verify)))
+
+    assert portal_automation._solve_otp(
+        page, lambda *_args: None) is True
+    assert used and used[0][1] == "9534"
+
+
 def test_saudia_backend_rejection_and_unconfirmed_timeout_are_failures():
     rejected = portal_automation._saudia_submission_result({
         "seen": True, "status": 500, "json": {"data": None},
@@ -1289,6 +2224,183 @@ def test_saudia_backend_rejection_and_unconfirmed_timeout_are_failures():
         payload={"airline_code": "SV"}, timeout_seconds=0,
         submission_capture={})
     assert result.status == "error"
+
+
+def test_gaca_post_capture_distinguishes_rejection_and_acceptance():
+    class Request:
+        method = "POST"
+
+    class Response:
+        url = ("https://myeservices.gaca.gov.sa/eservices/public/qpe/"
+               "complaint-airline/step4")
+        request = Request()
+        status = 200
+        headers = {}
+
+        def json(self):
+            raise ValueError
+
+        def text(self):
+            return "Error! Security check failed, please try later"
+
+    rejected_capture = {}
+    portal_automation._capture_gaca_response(Response(), rejected_capture)
+    rejected = portal_automation._gaca_submission_result(
+        rejected_capture, {"airline_reference": "C_2760788"})
+    assert rejected.status == "verification_expired"
+
+    accepted = portal_automation._gaca_submission_result({
+        "seen": True,
+        "status": 200,
+        "text": "Complaint successfully submitted. Reference GACA-987654",
+    }, {"airline_reference": "C_2760788"})
+    assert accepted.status == "submitted"
+    assert accepted.reference == "GACA-987654"
+
+    echoed_airline_case = portal_automation._gaca_submission_result({
+        "seen": True,
+        "status": 200,
+        "text": "Airline Complaint Number C_2760788",
+    }, {"airline_reference": "C_2760788"})
+    assert echoed_airline_case is None
+
+
+def test_gaca_uses_one_solver_path_instead_of_native_then_solver(monkeypatch):
+    monkeypatch.setattr(
+        portal_automation, "_recaptcha_challenge",
+        lambda _page: {"kind": "recaptcha", "is_v3": True})
+    monkeypatch.setattr(
+        portal_automation, "_recaptcha_page_context",
+        lambda _page, _site_key: {"is_v3": True})
+    monkeypatch.setattr(
+        portal_automation, "_CAPTCHA_SOLVER",
+        lambda _challenge: {"token": "solved"})
+    monkeypatch.setenv("FLIGHTBOT_GACA_NATIVE_RECAPTCHA", "1")
+
+    assert portal_automation._use_gaca_native_recaptcha(
+        object(), is_gaca=True, attempt=0) is True
+    assert portal_automation._use_gaca_native_recaptcha(
+        object(), is_gaca=True, attempt=1) is False
+    assert portal_automation._use_gaca_native_recaptcha(
+        object(), is_gaca=False, attempt=0) is False
+
+    monkeypatch.setenv("FLIGHTBOT_GACA_NATIVE_RECAPTCHA", "0")
+    assert portal_automation._use_gaca_native_recaptcha(
+        object(), is_gaca=True, attempt=0) is False
+
+
+def test_gaca_success_without_reference_is_not_submitted_twice():
+    accepted = portal_automation._gaca_submission_result({
+        "seen": True,
+        "status": 302,
+        "location": "/complaint-airline/submission-success",
+    })
+    assert accepted.status == "accepted_pending_reference"
+    assert "will not submit a duplicate" in accepted.message
+
+
+def test_gaca_visible_success_waits_for_real_sms_reference(monkeypatch):
+    class Hidden:
+        first = None
+
+        def count(self):
+            return 0
+
+    class Page:
+        url = (
+            "https://myeservices.gaca.gov.sa/eservices/public/qpe/"
+            "survey?detailsId=4701857"
+        )
+
+        def is_closed(self):
+            return False
+
+        def get_by_role(self, *_args, **_kwargs):
+            return Hidden()
+
+    monkeypatch.setattr(
+        portal_automation, "_request_blocked", lambda _page: False)
+    monkeypatch.setattr(
+        portal_automation, "_body_text",
+        lambda _page: "Your request has been successfully submitted")
+    monkeypatch.setattr(
+        portal_automation, "_page_screenshot", lambda _page: b"success")
+
+    result = portal_automation._await_confirmation(
+        Page(),
+        "https://myeservices.gaca.gov.sa/eservices/public/qpe/"
+        "complaint-airline/step4?detailsId=2642710",
+        lambda *_args: None,
+        payload={"kind": "gaca", "airline_code": "SV"},
+        timeout_seconds=5,
+        submission_capture={},
+    )
+    assert result.status == "accepted_pending_reference"
+    assert result.reference == ""
+
+
+def test_gaca_home_after_email_verification_waits_for_sms_reference(
+        monkeypatch):
+    class Control:
+        def __init__(self, *, otp=False):
+            self.otp = otp
+
+    class Page:
+        url = (
+            "https://myeservices.gaca.gov.sa/eservices/public/qpe/"
+            "verification/email"
+        )
+
+        def is_closed(self):
+            return False
+
+        def get_by_role(self, *_args, **_kwargs):
+            return Control()
+
+        def wait_for_timeout(self, _value):
+            pass
+
+    page = Page()
+    monkeypatch.setattr(
+        portal_automation, "_gaca_submission_result",
+        lambda *_args: None)
+    monkeypatch.setattr(
+        portal_automation, "_request_blocked", lambda _page: False)
+    monkeypatch.setattr(
+        portal_automation, "_body_text", lambda _page: "")
+    monkeypatch.setattr(
+        portal_automation, "_visible",
+        lambda control: bool(getattr(control, "otp", False)))
+    monkeypatch.setattr(
+        portal_automation, "_otp_fields",
+        lambda _page: Control(otp=True))
+    monkeypatch.setattr(
+        portal_automation, "_needs_human_step",
+        lambda _page: "Enter the OTP")
+
+    def complete_email_verification(_page, _update):
+        page.url = "https://myeservices.gaca.gov.sa/eservices/home"
+        return True
+
+    monkeypatch.setattr(
+        portal_automation, "_wait_for_human_step",
+        complete_email_verification)
+    monkeypatch.setattr(
+        portal_automation, "_VERIFICATION_HANDLER",
+        lambda _challenge: "9534")
+
+    result = portal_automation._await_confirmation(
+        page,
+        "https://myeservices.gaca.gov.sa/eservices/public/qpe/"
+        "complaint-airline/step4?detailsId=2642710",
+        lambda *_args: None,
+        payload={"kind": "gaca", "airline_code": "SV"},
+        timeout_seconds=5,
+        submission_capture={},
+    )
+
+    assert result.status == "accepted_pending_reference"
+    assert result.reference == ""
 
 
 def test_ai_portal_guardrails_block_final_and_security_actions(monkeypatch):

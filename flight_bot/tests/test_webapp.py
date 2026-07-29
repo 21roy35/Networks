@@ -37,9 +37,320 @@ def test_primary_pages_render(client):
         "status": "ok", "emails": 7, "flights": 3, "complaints": 0}
 
     flight_id = db.list_flights()[0]["id"]
-    assert client.get(f"/flight/{flight_id}").status_code == 200
+    flight_page = client.get(f"/flight/{flight_id}")
+    assert flight_page.status_code == 200
+    assert b'<html lang="en" dir="ltr">' in flight_page.data
+    assert b'<pre class="email-body" dir="auto">' in flight_page.data
     assert client.get(
         f"/flight/{flight_id}/complaint/airline").status_code == 200
+
+
+def test_internal_sms_requires_secret_and_is_deduplicated(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightbot.db")
+    config = deepcopy(DEFAULTS)
+    config["sms"]["ingest_secret"] = "shared-test-secret"
+    application = webapp.create_app(config)
+    application.config.update(TESTING=True)
+    client = application.test_client()
+    payload = {
+        "sender": "SAUDIA", "received_at": "2026-07-19T22:30:00+03:00",
+        "message_id": "shortcut-123",
+        "text": "Your complaint reference number is 123456789",
+    }
+    assert client.post("/api/internal/sms", json=payload).status_code == 404
+    first = client.post(
+        "/api/internal/sms", json=payload,
+        headers={"X-SMS-Secret": "shared-test-secret"})
+    assert first.status_code == 200
+    assert first.json["duplicate"] is False
+    assert first.json["reference"] == "123456789"
+    second = client.post(
+        "/api/internal/sms", json=payload,
+        headers={"X-SMS-Secret": "shared-test-secret"})
+    assert second.json["duplicate"] is True
+    assert len(db.list_sms_messages()) == 1
+    event = db.list_mail_events()[0]
+    assert event["sender"] == "sms@saudia.com"
+    assert "123456789" in event["subject"]
+
+
+def test_internal_sms_attaches_saudia_reference_to_flight_page(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightbot.db")
+    config = deepcopy(DEFAULTS)
+    config["sms"]["ingest_secret"] = "shared-test-secret"
+    application = webapp.create_app(config)
+    application.config.update(TESTING=True)
+    client = application.test_client()
+    flight_key = "8GAKAN|SV1674|2026-07-09"
+    db.replace_flights([{
+        "flight_key": flight_key, "airline_code": "SV",
+        "flight_number": "SV1674", "flight_numbers": ["SV1674"],
+        "flight_date": "2026-07-09", "pnr": "8GAKAN", "email_ids": [],
+    }])
+    complaint_id = db.begin_complaint(
+        flight_key, "airline", "Delayed and damaged baggage")
+    db.finish_complaint(complaint_id, "accepted_pending_reference")
+
+    response = client.post("/api/internal/sms", json={
+        "sender": "Saudia", "received_at": "Jul 20, 2026 at 01:03",
+        "message_id": "saudia-live-reference-1",
+        "text": (
+            "Dear Guest, Thank you for sharing your travel experience with us. "
+            "We will review your comment ref. C_2778782 and respond as soon as "
+            "possible. Guest Relations"
+        ),
+    }, headers={"X-SMS-Secret": "shared-test-secret"})
+
+    assert response.status_code == 200
+    assert response.json["reference"] == "C_2778782"
+    assert response.json["attached_complaint_id"] == complaint_id
+    complaint = db.complaints_for_flight(flight_key)[0]
+    assert complaint["status"] == "submitted"
+    assert complaint["reference"] == "C_2778782"
+    flight_id = db.get_flight_by_key(flight_key)["id"]
+    page = client.get(f"/flight/{flight_id}")
+    assert page.status_code == 200
+    assert b"C_2778782" in page.data
+
+
+def test_recovered_saudia_reference_clears_stale_retry_state(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightbot.db")
+    db.init_db()
+    flight_key = "8GAKAN|SV1674|2026-07-09"
+    db.replace_flights([{
+        "flight_key": flight_key, "airline_code": "SV",
+        "flight_number": "SV1674", "flight_numbers": ["SV1674"],
+        "flight_date": "2026-07-09", "pnr": "8GAKAN", "email_ids": [],
+    }])
+    complaint_id = db.begin_complaint(
+        flight_key, "airline", "Delayed and damaged baggage")
+    db.finish_complaint(complaint_id, "accepted_pending_reference")
+    db.save_portal_job({
+        "id": "saudia-reference-recovery",
+        "kind": "airline",
+        "flight_key": flight_key,
+        "complaint_id": complaint_id,
+        "status": "accepted_pending_reference",
+        "terminal": False,
+        "next_attempt_at": 12345,
+        "lease_until": 23456,
+        "last_error": "stale pre-acceptance failure",
+    })
+
+    db.finish_complaint(
+        complaint_id, "submitted", reference="C_2816389")
+
+    job = db.get_portal_job("saudia-reference-recovery")
+    assert job["status"] == "success"
+    assert job["reference"] == "C_2816389"
+    assert job["terminal"] == 1
+    assert job["next_attempt_at"] is None
+    assert job["lease_until"] is None
+    assert job["last_error"] is None
+
+
+@pytest.mark.parametrize(
+    ("portal_status", "complaint_status"),
+    [
+        ("confirmation_unknown", "failed"),
+        ("accepted_pending_reference", "accepted_pending_reference"),
+    ],
+)
+def test_internal_sms_reconciles_sent_gaca_without_reference(
+        tmp_path, monkeypatch, portal_status, complaint_status):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightbot.db")
+    config = deepcopy(DEFAULTS)
+    config["sms"]["ingest_secret"] = "shared-test-secret"
+    application = webapp.create_app(config)
+    application.config.update(TESTING=True)
+    client = application.test_client()
+    flight_key = "8GAKAN|SV1674|2026-07-09"
+    db.replace_flights([{
+        "flight_key": flight_key, "airline_code": "SV",
+        "flight_number": "SV1674", "flight_numbers": ["SV1674"],
+        "flight_date": "2026-07-09", "pnr": "8GAKAN", "email_ids": [],
+    }])
+    complaint_id = db.begin_complaint(
+        flight_key, "gaca", "Delayed and damaged baggage")
+    db.finish_complaint(complaint_id, complaint_status)
+    db.save_portal_job({
+        "id": "gaca-unknown-job",
+        "kind": "gaca",
+        "flight_key": flight_key,
+        "complaint_id": complaint_id,
+        "status": portal_status,
+        "terminal": True,
+        "message": "Confirmation page blocked after one Submit.",
+    })
+
+    response = client.post("/api/internal/sms", json={
+        "sender": "GACA",
+        "received_at": "2026-07-25T06:01:00+03:00",
+        "message_id": "gaca-reference-1",
+        "text": (
+            "GACA received your complaint for flight SV1674. "
+            "Complaint reference number is GACA-483921."
+        ),
+    }, headers={"X-SMS-Secret": "shared-test-secret"})
+
+    assert response.status_code == 200
+    assert response.json["reference"] == "GACA-483921"
+    assert response.json["attached_complaint_id"] == complaint_id
+    complaint = db.complaints_for_flight(flight_key)[0]
+    assert complaint["status"] == "submitted"
+    assert complaint["reference"] == "GACA-483921"
+    job = db.get_portal_job("gaca-unknown-job")
+    assert job["status"] == "submitted"
+    assert job["reference"] == "GACA-483921"
+
+
+def test_gaca_sms_never_attaches_to_confirmed_pre_submit_failure(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightbot.db")
+    config = deepcopy(DEFAULTS)
+    config["sms"]["ingest_secret"] = "shared-test-secret"
+    application = webapp.create_app(config)
+    application.config.update(TESTING=True)
+    client = application.test_client()
+    flight_key = "8GAKAN|SV1674|2026-07-09"
+    db.replace_flights([{
+        "flight_key": flight_key, "airline_code": "SV",
+        "flight_number": "SV1674", "flight_numbers": ["SV1674"],
+        "flight_date": "2026-07-09", "pnr": "8GAKAN", "email_ids": [],
+    }])
+    complaint_id = db.begin_complaint(
+        flight_key, "gaca", "Delayed and damaged baggage")
+    db.finish_complaint(complaint_id, "failed")
+    db.save_portal_job({
+        "id": "gaca-pre-submit-failure",
+        "kind": "gaca",
+        "flight_key": flight_key,
+        "complaint_id": complaint_id,
+        "status": "error",
+        "terminal": True,
+        "message": "Login failed before the form opened.",
+    })
+
+    response = client.post("/api/internal/sms", json={
+        "sender": "GACA",
+        "message_id": "gaca-reference-no-target",
+        "text": "GACA complaint reference number is GACA-483921.",
+    }, headers={"X-SMS-Secret": "shared-test-secret"})
+
+    assert response.status_code == 200
+    assert response.json["attached_complaint_id"] is None
+    complaint = db.complaints_for_flight(flight_key)[0]
+    assert complaint["status"] == "failed"
+    assert complaint["reference"] is None
+
+
+def test_reference_only_sms_prefers_newest_pending_airline_complaint(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightbot.db")
+    config = deepcopy(DEFAULTS)
+    config["sms"]["ingest_secret"] = "shared-test-secret"
+    application = webapp.create_app(config)
+    application.config.update(TESTING=True)
+    client = application.test_client()
+    older_key = "8GAKAN|SV1674|2026-07-09"
+    newest_key = "7MZ63V|SV520|2025-12-06"
+    db.replace_flights([
+        {
+            "flight_key": older_key, "airline_code": "SV",
+            "flight_number": "SV1674", "flight_numbers": ["SV1674"],
+            "flight_date": "2026-07-09", "pnr": "8GAKAN", "email_ids": [],
+        },
+        {
+            "flight_key": newest_key, "airline_code": "SV",
+            "flight_number": "SV520", "flight_numbers": ["SV520"],
+            "flight_date": "2025-12-06", "pnr": "7MZ63V", "email_ids": [],
+        },
+    ])
+    older_id = db.begin_complaint(older_key, "airline", "Older issue")
+    db.finish_complaint(older_id, "accepted_pending_reference")
+    newest_id = db.begin_complaint(newest_key, "airline", "Newest issue")
+    db.finish_complaint(newest_id, "accepted_pending_reference")
+
+    response = client.post("/api/internal/sms", json={
+        "sender": "Saudia", "received_at": "Jul 20, 2026 at 01:03",
+        "message_id": "saudia-newest-reference",
+        "text": (
+            "Dear Guest, we will review your comment ref. C_2778782 "
+            "and respond as soon as possible."
+        ),
+    }, headers={"X-SMS-Secret": "shared-test-secret"})
+
+    assert response.status_code == 200
+    assert response.json["attached_complaint_id"] == newest_id
+    newest = db.complaints_for_flight(newest_key)[0]
+    older = db.complaints_for_flight(older_key)[0]
+    assert newest["status"] == "submitted"
+    assert newest["reference"] == "C_2778782"
+    assert older["status"] == "accepted_pending_reference"
+    assert older["reference"] is None
+
+
+def test_internal_sms_distills_otp_without_storing_body(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightbot.db")
+    config = deepcopy(DEFAULTS)
+    config["sms"]["ingest_secret"] = "shared-test-secret"
+    application = webapp.create_app(config)
+    application.config.update(TESTING=True)
+    client = application.test_client()
+    headers = {"X-SMS-Secret": "shared-test-secret"}
+
+    first = client.post("/api/internal/sms", json={
+        "sender": "SAUDIA", "message_id": "otp-delivery-a",
+        "text": "Your verification code is 4729",
+    }, headers=headers)
+    second = client.post("/api/internal/sms", json={
+        "sender": "SAUDIA", "message_id": "otp-delivery-b",
+        "text": "Your verification code is 4729",
+    }, headers=headers)
+
+    assert first.json == {
+        "consumed": False, "duplicate": False, "ignored": True, "ok": True,
+        "otp": "4729", "reason": "otp",
+    }
+    assert second.json["duplicate"] is True
+    assert db.list_sms_messages() == []
+    assert db.list_mail_events() == []
+
+
+def test_gaca_c_prefix_reference_requires_gaca_context():
+    body = "Your complaint C076100 has been received."
+    assert webapp._extract_sms_reference(body, "GACA CARE") == "C076100"
+    assert webapp._extract_sms_reference(body, "SAMA") == ""
+
+
+def test_internal_sms_ignores_non_aviation_shortcut_traffic(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightbot.db")
+    config = deepcopy(DEFAULTS)
+    config["sms"]["ingest_secret"] = "shared-test-secret"
+    application = webapp.create_app(config)
+    application.config.update(TESTING=True)
+    client = application.test_client()
+
+    response = client.post("/api/internal/sms", json={
+        "sender": "SAMA",
+        "message_id": "sama-bank-complaint",
+        "text": (
+            "تم استلام اعتراضكم حيال معالجة البنك للشكوى رقم "
+            "C2607056702 وستتم مراجعة الشكوى."
+        ),
+    }, headers={"X-SMS-Secret": "shared-test-secret"})
+
+    assert response.json == {
+        "ignored": True,
+        "ok": True,
+        "reason": "non-aviation",
+    }
+    assert db.list_sms_messages() == []
+    assert db.list_mail_events() == []
 
 
 def test_manual_corrections_are_validated_and_saved(client):

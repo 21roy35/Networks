@@ -27,6 +27,7 @@ DEFAULTS = {
         "middle_name": "",
         "last_name": "",
         "title": "",
+        "gender": "",
         "nationality": "",
         "country_code": "",
         "email": "",
@@ -45,6 +46,9 @@ DEFAULTS = {
         "link_expiry_minutes": 15,
         "session_days": 30,
     },
+    "sms": {
+        "ingest_secret": "",
+    },
     "telegram": {
         "enabled": False,
         "bot_token": "",
@@ -60,9 +64,12 @@ DEFAULTS = {
         "timezone": "Asia/Riyadh",
     },
     "flight_status": {
-        "provider": "schedule",
+        "provider": "auto",
         "flightaware_api_key": "",
         "poll_minutes": 10,
+        "airplanes_live_enabled": True,
+        "adsb_lol_enabled": True,
+        "weather_enabled": True,
     },
     "captcha": {
         "enabled": False,
@@ -71,6 +78,12 @@ DEFAULTS = {
         "poll_interval_seconds": 5,
         "timeout_seconds": 180,
         "telegram_fallback": True,
+    },
+    "gaca_email": {
+        "enabled": False,
+        "recipient": "1929@gaca.gov.sa",
+        "smtp_host": "smtp.gmail.com",
+        "smtp_port": 465,
     },
     "ai": {
         "enabled": False,
@@ -127,8 +140,10 @@ def load_config() -> dict:
         ("telegram", "chat_id"): "FLIGHTBOT_TELEGRAM_CHAT_ID",
         ("flight_status", "flightaware_api_key"): "FLIGHTBOT_FLIGHTAWARE_API_KEY",
         ("captcha", "api_key"): "FLIGHTBOT_2CAPTCHA_API_KEY",
+        ("gaca_email", "recipient"): "FLIGHTBOT_GACA_EMAIL_RECIPIENT",
         ("web", "public_base_url"): "FLIGHTBOT_PUBLIC_BASE_URL",
         ("web", "access_secret"): "FLIGHTBOT_WEB_ACCESS_SECRET",
+        ("sms", "ingest_secret"): "FLIGHTBOT_SMS_INGEST_SECRET",
         ("ai", "api_key"): "FLIGHTBOT_ANTHROPIC_API_KEY",
         ("ai", "model"): "FLIGHTBOT_AI_MODEL",
         ("ai", "name"): "FLIGHTBOT_AI_NAME",
@@ -141,7 +156,11 @@ def load_config() -> dict:
     if not config["user"]["email"]:
         config["user"]["email"] = config["imap"]["user"]
 
-    for section, key in (("imap", "port"), ("web", "port")):
+    for section, key in (
+        ("imap", "port"),
+        ("web", "port"),
+        ("gaca_email", "smtp_port"),
+    ):
         try:
             config[section][key] = int(config[section][key])
         except (TypeError, ValueError) as exc:
@@ -154,6 +173,11 @@ def load_config() -> dict:
         config["telegram"]["enabled"] = True
     if config["captcha"].get("api_key"):
         config["captcha"]["enabled"] = True
+    enabled = os.environ.get("FLIGHTBOT_GACA_EMAIL_FALLBACK", "").strip()
+    if enabled:
+        config["gaca_email"]["enabled"] = (
+            enabled.casefold() in {"1", "true", "yes", "on"}
+        )
     if config["ai"].get("api_key"):
         config["ai"]["enabled"] = True
     return config
@@ -167,8 +191,8 @@ def save_user_profile(profile: dict) -> None:
         existing = {}
     allowed = {
         "full_name", "first_name", "middle_name", "last_name", "email",
-        "phone", "national_id", "title", "nationality", "country_code",
-        "alfursan_id",
+        "phone", "national_id", "title", "gender", "nationality",
+        "country_code", "alfursan_id",
     }
     current["user"] = {
         **existing,
@@ -203,7 +227,7 @@ def save_passenger_profile(passenger_name: str, profile: dict) -> None:
         existing = {}
     allowed = {
         "booking_name", "full_name", "first_name", "middle_name",
-        "last_name", "email", "phone", "national_id", "title",
+        "last_name", "email", "phone", "national_id", "title", "gender",
         "nationality", "country_code", "alfursan_id",
     }
     cleaned = {

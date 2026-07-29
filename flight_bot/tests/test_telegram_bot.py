@@ -55,6 +55,66 @@ class FakeAPI:
         destination.write_bytes(b"telegram-photo")
 
 
+def test_gaca_email_reference_matches_the_exact_pending_flight(monkeypatch):
+    complaints = [
+        {
+            "id": 96,
+            "kind": "gaca",
+            "status": "accepted_pending_reference",
+            "reference": None,
+            "flight_data": {
+                "pnr": "8GAKAN",
+                "flight_number": "SV1674",
+                "flight_numbers": ["SV1674"],
+                "ticket_numbers": ["065-2200541313"],
+            },
+        },
+        {
+            "id": 98,
+            "kind": "gaca",
+            "status": "accepted_pending_reference",
+            "reference": None,
+            "flight_data": {
+                "pnr": "7V5F9V",
+                "flight_number": "SV1671",
+                "flight_numbers": ["SV1671"],
+                "ticket_numbers": ["065-2200278935"],
+            },
+        },
+    ]
+    reconciled = []
+    seen = []
+    monkeypatch.setattr(db, "list_complaints", lambda: complaints)
+    monkeypatch.setattr(db, "event_seen", lambda _key: False)
+    monkeypatch.setattr(
+        db,
+        "reconcile_portal_confirmation",
+        lambda complaint_id, reference:
+        reconciled.append((complaint_id, reference)) or True,
+    )
+    monkeypatch.setattr(db, "mark_event_seen", seen.append)
+
+    count = telegram_bot.reconcile_gaca_mail_events([{
+        "id": 501,
+        "sender": "GACA Care <care@gaca.gov.sa>",
+        "subject": "GACA complaint C076222 - SV1674",
+        "body": "Booking 8GAKAN has been registered.",
+    }])
+
+    assert count == 1
+    assert reconciled == [(96, "C076222")]
+    assert seen == ["gaca-reference-captured:501"]
+
+
+def test_saudia_confirmation_prefers_case_reference_over_emd_voucher():
+    reference = telegram_bot._airline_confirmation_reference(
+        "EMD refundable Compensation request for case C_2737927 has been completed",
+        "Voucher no. 0654228947655 Amount in SAR 752.45",
+    )
+
+    assert reference == "C_2737927"
+
+
 def test_telegram_transport_errors_never_echo_bot_token():
     class FailedSession:
         def post(self, *_args, **_kwargs):
@@ -89,6 +149,24 @@ def coordinator(tmp_path, monkeypatch):
     return TelegramCoordinator(config, api=api), api
 
 
+def test_notification_outage_does_not_abort_portal_work(
+        coordinator, monkeypatch):
+    bot, api = coordinator
+    monkeypatch.setattr(
+        api, "send_message",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("Telegram unavailable")),
+    )
+    monkeypatch.setattr(
+        api, "send_photo",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("Telegram unavailable")),
+    )
+
+    assert bot.notify("Portal work is starting") == {}
+    assert bot._send_photo(b"image", "Portal screenshot") == {}
+
+
 def test_otp_is_relayed_and_deleted_after_use(coordinator):
     bot, api = coordinator
     result = {}
@@ -109,6 +187,23 @@ def test_otp_is_relayed_and_deleted_after_use(coordinator):
     assert api.deleted == [("42", 77)]
 
 
+def test_verification_code_ranking_ignores_footer_year():
+    assert telegram_bot._verification_code_from_text(
+        "Portal Verification Code: 1078. All rights reserved © 2026"
+    ) == "1078"
+
+
+def test_sms_shortcut_can_complete_active_otp_waiter(coordinator):
+    bot, _api = coordinator
+    waiter = telegram_bot.VerificationWaiter("otp")
+    bot._verification = waiter
+
+    assert bot.accept_verification_code(
+        "1 0 7 8", source="test shortcut") is True
+    assert waiter.response == "1078"
+    assert waiter.event.is_set()
+
+
 def test_start_registers_telegram_command_menu(coordinator, monkeypatch):
     bot, api = coordinator
     started = []
@@ -116,7 +211,8 @@ def test_start_registers_telegram_command_menu(coordinator, monkeypatch):
         threading.Thread, "start", lambda thread: started.append(thread.name))
     bot.start()
     assert set(started) == {
-        "telegram-commands", "telegram-updates", "telegram-monitor"}
+        "telegram-commands", "telegram-updates", "portal-job-resume",
+        "telegram-monitor"}
     bot._register_commands()
     assert api.commands_registered is True
 
@@ -163,6 +259,41 @@ def test_complaint_reservation_blocks_duplicates_but_allows_failed_retry(
     db.finish_complaint(retry, "confirmation_unknown")
     assert db.begin_complaint(
         flight["flight_key"], "airline", "Claim", "Broken baggage") is not None
+
+
+def test_reopen_allows_new_complaint_after_closed_resolved(coordinator):
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = db.list_flights()[0]
+    first = db.begin_complaint(
+        flight["flight_key"], "airline", "Claim", "Broken screen")
+    db.finish_complaint(first, "submitted", "C_9000001")
+    assert db.begin_complaint(
+        flight["flight_key"], "airline", "Claim", "Still broken") is None
+    reopen = db.begin_complaint(
+        flight["flight_key"], "airline", "Claim", "Still broken",
+        reopen=True)
+    assert reopen is not None
+    assert db.complaints_for_flight(flight["flight_key"])[0]["status"] == "closed"
+
+
+def test_finish_complaint_updates_stale_pending_portal_jobs(coordinator):
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    complaint_id = db.begin_complaint(
+        flight["flight_key"], "airline", "Claim", "Broken screen")
+    db.finish_complaint(complaint_id, "accepted_pending_reference")
+    db.save_portal_job({
+        "id": "pending-ref-job", "kind": "airline", "airline_code": "SV",
+        "flight_number": flight.get("flight_number") or "SV100",
+        "flight_key": flight["flight_key"],
+        "status": "accepted_pending_reference",
+        "message": "Waiting for reference", "reference": "", "terminal": True,
+    })
+    db.finish_complaint(complaint_id, "submitted", "C_9050001")
+    job = db.list_portal_jobs(5)[0]
+    assert job["status"] == "success"
+    assert job["reference"] == "C_9050001"
 
 
 def test_legacy_submitted_airline_row_without_reference_is_migrated_to_failed(
@@ -339,13 +470,14 @@ def test_substantive_airline_response_offers_gaca_escalation(coordinator):
         "body": "We reviewed CAS-778899 and declined compensation. The case is closed.",
     })
     bot.check_complaint_responses()
-    assert len(api.messages) == 1
+    assert len(api.messages) == 2
     assert "responded" in api.messages[0]["text"]
+    assert "saved profile still needs" in api.messages[1]["text"]
     buttons = api.messages[0]["reply_markup"]["inline_keyboard"][0]
     assert buttons[0]["callback_data"].startswith("escalate:")
 
 
-def test_reference_less_resolutions_are_persistently_matched_fifo(coordinator):
+def test_reference_less_resolutions_are_not_matched_by_fifo(coordinator):
     bot, api = coordinator
     load_demo(log=lambda *_args, **_kwargs: None)
     flight = next(item for item in db.list_flights()
@@ -363,13 +495,13 @@ def test_reference_less_resolutions_are_persistently_matched_fifo(coordinator):
         conn.execute(
             "UPDATE complaints SET created_at = datetime('now', '-1 day') "
             "WHERE reference = 'C_7000002'")
-    first_event = db.save_mail_event({
+    db.save_mail_event({
         "message_id": "<fifo-resolution-1@example>",
         "subject": "Your complaint resolution",
         "sender": "customer.relations@saudia.com", "date": datetime.now(),
         "body": "Our review is complete. Compensation was declined and the case is closed.",
     })
-    second_event = db.save_mail_event({
+    db.save_mail_event({
         "message_id": "<fifo-resolution-2@example>",
         "subject": "Your complaint resolution",
         "sender": "customer.relations@saudia.com",
@@ -378,23 +510,12 @@ def test_reference_less_resolutions_are_persistently_matched_fifo(coordinator):
     })
 
     bot.check_complaint_responses()
-    links = db.list_complaint_responses()
-    complaints = {item["reference"]: item for item in db.list_complaints()}
 
-    assert [(item["complaint_id"], item["mail_event_id"], item["match_method"])
-            for item in links] == [
-        (complaints["C_7000001"]["id"], first_event, "fifo_airline"),
-        (complaints["C_7000002"]["id"], second_event, "fifo_airline"),
-    ]
-    assert len(api.messages) == 2
-    assert "oldest unresolved ticket" in api.messages[0]["text"]
-
-    bot.check_complaint_responses()
-    assert len(db.list_complaint_responses()) == 2
-    assert len(api.messages) == 2
+    assert db.list_complaint_responses() == []
+    assert api.messages == []
 
 
-def test_reference_less_resolution_uses_booking_facts_before_fifo(coordinator):
+def test_reference_less_resolution_uses_strong_booking_facts(coordinator):
     bot, api = coordinator
     load_demo(log=lambda *_args, **_kwargs: None)
     older_flight = next(item for item in db.list_flights()
@@ -440,7 +561,7 @@ def test_reference_less_resolution_uses_booking_facts_before_fifo(coordinator):
     assert [(item["complaint_id"], item["mail_event_id"], item["match_method"])
             for item in links] == [(newer["id"], event_id, "case_facts")]
     assert len(api.messages) == 1
-    assert "booking facts" in api.messages[0]["text"]
+    assert "booking facts" in api.messages[0]["text"].casefold()
 
 
 def test_reference_match_wins_even_when_resolutions_arrive_out_of_order(
@@ -486,7 +607,8 @@ def test_reference_match_wins_even_when_resolutions_arrive_out_of_order(
     }
 
 
-def test_acknowledgement_does_not_consume_fifo_resolution_queue(coordinator):
+def test_acknowledgement_does_not_link_without_reference_or_strong_facts(
+        coordinator):
     bot, api = coordinator
     load_demo(log=lambda *_args, **_kwargs: None)
     flight = next(item for item in db.list_flights()
@@ -499,7 +621,7 @@ def test_acknowledgement_does_not_consume_fifo_resolution_queue(coordinator):
         "sender": "customer.relations@saudia.com", "date": datetime.now(),
         "body": "Thank you for contacting us. We will review your message.",
     })
-    resolution_event = db.save_mail_event({
+    db.save_mail_event({
         "message_id": "<generic-resolution@example>",
         "subject": "Complaint resolution",
         "sender": "customer.relations@saudia.com",
@@ -509,8 +631,36 @@ def test_acknowledgement_does_not_consume_fifo_resolution_queue(coordinator):
 
     bot.check_complaint_responses()
 
-    assert len(api.messages) == 1
-    assert db.list_complaint_responses()[0]["mail_event_id"] == resolution_event
+    assert db.list_complaint_responses() == []
+    assert api.messages == []
+
+
+def test_closure_notice_with_reference_offers_reopen_and_gaca(coordinator):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Claim", "submitted",
+        reference="C_2781202", details="Broken screen.")
+    db.save_mail_event({
+        "message_id": "<closure@example>",
+        "subject": "Your Ticket C_2781202 is Closed",
+        "sender": "CR-NORPLY@saudia.com", "date": datetime.now(),
+        "body": (
+            "Service Ticket -Closure Notification. We have finalized your "
+            "comment No. C_2781202 and email has been sent to your mail address."),
+    })
+
+    bot.check_complaint_responses()
+
+    assert len(api.messages) == 2
+    assert "closed or processed" in api.messages[0]["text"].casefold()
+    assert "saved profile still needs" in api.messages[1]["text"]
+    button_rows = api.messages[0]["reply_markup"]["inline_keyboard"]
+    flat = [button["callback_data"] for row in button_rows for button in row]
+    assert any(item.startswith("escalate:") for item in flat)
+    assert any(item.startswith("reopen_case:") for item in flat)
 
 
 def test_confirmation_email_recovers_missing_airline_reference(coordinator):
@@ -563,6 +713,37 @@ def test_one_confirmation_reference_is_not_assigned_to_two_cases(coordinator):
     older, newer = db.complaints_for_flight(flight["flight_key"])
     assert older["reference"] is None
     assert newer["reference"] == "CAS-99880011"
+
+
+def test_existing_reference_is_not_copied_to_pending_case_after_restart(
+        coordinator):
+    bot, _api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Original complaint",
+        "submitted", reference="C_2778782", details="Amenity kit issue.")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Later complaint",
+        "accepted_pending_reference", details="A later unrelated issue.")
+    db.save_mail_event({
+        "message_id": "<duplicate-confirmation@example>",
+        "subject": "Your Ticket C_2778782 is Registered with us",
+        "sender": "CR-NORPLY@saudia.com", "date": datetime.now(),
+        "body": "Thank you for contacting Saudia Guest Relations.",
+    })
+
+    bot.check_complaint_responses()
+
+    complaints = db.complaints_for_flight(flight["flight_key"])
+    owners = [item for item in complaints
+              if item.get("reference") == "C_2778782"]
+    pending = next(item for item in complaints
+                   if item.get("subject") == "Later complaint")
+    assert len(owners) == 1
+    assert pending["status"] == "accepted_pending_reference"
+    assert pending["reference"] is None
 
 
 def test_saudia_ticket_subject_recovers_missing_reference(coordinator):
@@ -758,9 +939,10 @@ def test_ghala_interprets_matched_airline_response_before_escalation(coordinator
         "body": "We have completed our review of CAS-667788.",
     })
     bot.check_complaint_responses()
-    assert len(api.messages) == 1
+    assert len(api.messages) == 2
     assert "declined compensation" in api.messages[0]["text"]
     assert "Ghala-200 recommends: escalate" in api.messages[0]["text"]
+    assert "saved profile still needs" in api.messages[1]["text"]
 
 
 def test_non_substantive_ai_response_analysis_is_cached(coordinator):
@@ -833,10 +1015,18 @@ def test_gaca_callback_files_with_airline_reference(coordinator, monkeypatch):
     load_demo(log=lambda *_args, **_kwargs: None)
     flight = next(item for item in db.list_flights()
                   if item.get("airline_code") == "SV")
+    db.set_overrides(
+        flight["id"], {"flight_date": datetime.now().date().isoformat()})
+    flight = db.get_flight(flight["id"])
     db.add_complaint(
         flight["flight_key"], "airline", None, "Claim", "submitted",
         reference="CAS-333444", details="The seat was broken.",
         attachments=["seat.jpg"])
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE complaints SET created_at = ? WHERE reference = ?",
+            ((datetime.now() - timedelta(days=8)).strftime(
+                "%Y-%m-%d %H:%M:%S"), "CAS-333444"))
     monkeypatch.setattr(telegram_bot, "missing_portal_fields", lambda _payload: [])
     captured = {}
 
@@ -855,6 +1045,43 @@ def test_gaca_callback_files_with_airline_reference(coordinator, monkeypatch):
     complaint = db.complaints_for_flight(flight["flight_key"])[-1]
     assert complaint["kind"] == "gaca"
     assert complaint["reference"] == "GACA-98765"
+
+
+def test_gaca_acceptance_without_reference_stays_pending_not_failed(
+        coordinator, monkeypatch):
+    bot, _api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.set_overrides(
+        flight["id"], {"flight_date": datetime.now().date().isoformat()})
+    flight = db.get_flight(flight["id"])
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Claim", "submitted",
+        reference="CAS-333445", details="The seat was broken.")
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE complaints SET created_at = ? WHERE reference = ?",
+            ((datetime.now() - timedelta(days=8)).strftime(
+                "%Y-%m-%d %H:%M:%S"), "CAS-333445"))
+    monkeypatch.setattr(
+        telegram_bot, "missing_portal_fields", lambda _payload: [])
+
+    def fake_start(_payload, on_complete, on_update=None):
+        on_complete(PortalResult(
+            "accepted_pending_reference", "accepted without reference"))
+        return "job"
+
+    monkeypatch.setattr(telegram_bot, "start_portal_job", fake_start)
+    bot._handle_callback({
+        "id": "callback-gaca-pending",
+        "data": f"escalate:{flight['id']}",
+        "message": {"chat": {"id": 42}},
+    })
+    complaint = db.complaints_for_flight(flight["flight_key"])[-1]
+    assert complaint["kind"] == "gaca"
+    assert complaint["status"] == "accepted_pending_reference"
+    assert complaint["reference"] is None
 
 
 def _wait_for_ai(bot, timeout=2):
@@ -1143,6 +1370,9 @@ def test_seven_day_no_response_auto_escalates_once(coordinator, monkeypatch):
     load_demo(log=lambda *_args, **_kwargs: None)
     flight = next(item for item in db.list_flights()
                   if item.get("airline_code") == "SV")
+    db.set_overrides(
+        flight["id"], {"flight_date": datetime.now().date().isoformat()})
+    flight = db.get_flight(flight["id"])
     db.add_complaint(
         flight["flight_key"], "airline", None, "Seat screen complaint",
         "submitted", reference="CAS-700001",
@@ -1173,6 +1403,106 @@ def test_seven_day_no_response_auto_escalates_once(coordinator, monkeypatch):
     assert [item["kind"] for item in complaints] == ["airline", "gaca"]
     assert complaints[-1]["reference"] == "GACA-700001"
     assert any("automatically escalating" in item["text"] for item in api.messages)
+
+
+def test_manual_gaca_submission_cannot_bypass_seven_day_gate(
+        coordinator, monkeypatch):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.set_overrides(
+        flight["id"], {"flight_date": datetime.now().date().isoformat()})
+    flight = db.get_flight(flight["id"])
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Recent airline complaint",
+        "submitted", reference="CAS-700010", details="Broken screen")
+    flight = db.get_flight(flight["id"])
+
+    def forbidden_start(*_args, **_kwargs):
+        raise AssertionError("GACA must not open before the seven-day gate")
+
+    monkeypatch.setattr(telegram_bot, "start_portal_job", forbidden_start)
+
+    assert bot._launch_gaca(flight) is False
+    assert bot._launch_gaca(flight) is False
+    assert sum(
+        "handling window has not finished" in item["text"]
+        for item in api.messages
+    ) == 1
+    assert not any(
+        item["kind"] == "gaca"
+        for item in db.complaints_for_flight(flight["flight_key"])
+    )
+
+
+def test_gaca_submission_skips_incidents_older_than_sixty_days(
+        coordinator, monkeypatch):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.set_overrides(flight["id"], {"flight_date": "2025-01-01"})
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Old airline complaint",
+        "submitted", reference="CAS-700012", details="Broken screen")
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE complaints SET created_at = ? WHERE reference = ?",
+            ("2025-01-02 00:00:00", "CAS-700012"))
+    flight = db.get_flight(flight["id"])
+
+    def forbidden_start(*_args, **_kwargs):
+        raise AssertionError("GACA must not open after the 60-day incident limit")
+
+    monkeypatch.setattr(telegram_bot, "start_portal_job", forbidden_start)
+
+    assert bot._launch_gaca(flight) is False
+    assert bot._launch_gaca(flight) is False
+    assert sum(
+        "more than 60 days old" in item["text"]
+        for item in api.messages
+    ) == 1
+
+
+def test_gaca_confirmation_unknown_is_reconciled_not_resubmitted(
+        coordinator, monkeypatch):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.set_overrides(
+        flight["id"], {"flight_date": datetime.now().date().isoformat()})
+    flight = db.get_flight(flight["id"])
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Airline complaint",
+        "submitted", reference="CAS-700011", details="Delayed baggage")
+    airline = db.complaints_for_flight(flight["flight_key"])[0]
+    db.add_complaint(
+        flight["flight_key"], "gaca", None, "GACA escalation", "failed",
+        details="The airline complaint remains unresolved.",
+        parent_complaint_id=int(airline["id"]))
+    gaca = db.complaints_for_flight(flight["flight_key"])[-1]
+    db.save_portal_job({
+        "id": "gaca-unknown-test",
+        "kind": "gaca",
+        "complaint_id": int(gaca["id"]),
+        "status": "confirmation_unknown",
+        "message": "Submit clicked; confirmation unreadable",
+        "terminal": True,
+    })
+    flight = db.get_flight(flight["id"])
+
+    def forbidden_start(*_args, **_kwargs):
+        raise AssertionError("an ambiguous GACA submit must not be repeated")
+
+    monkeypatch.setattr(telegram_bot, "start_portal_job", forbidden_start)
+
+    assert bot._launch_gaca(flight, prior_complaint=airline) is False
+    assert bot._launch_gaca(flight, prior_complaint=airline) is False
+    assert sum(
+        "already sent once" in item["text"] for item in api.messages
+    ) == 1
 
 
 def test_auto_escalation_waits_and_skips_detected_response(
@@ -1226,7 +1556,46 @@ def test_due_escalation_waits_visibly_for_required_airline_reference(
     db.finish_complaint(complaint_id, "submitted", "CAS-700003")
     bot.auto_escalate_due_complaints(now=datetime.now())
     assert calls == [1]
-    assert db.event_seen(f"auto-gaca:{complaint_id}")
+    assert not db.event_seen(f"auto-gaca:{complaint_id}")
+
+
+def test_auto_gaca_marker_is_written_only_after_successful_submission(
+        coordinator, monkeypatch):
+    bot, _api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.set_overrides(
+        flight["id"], {"flight_date": datetime.now().date().isoformat()})
+    flight = db.get_flight(flight["id"])
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Seat screen complaint",
+        "submitted", reference="CAS-700099",
+        details="The seat-back entertainment screen was broken.")
+    submitted_at = datetime.now() - timedelta(days=8)
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE complaints SET created_at = ? WHERE reference = ?",
+            (submitted_at.strftime("%Y-%m-%d %H:%M:%S"), "CAS-700099"))
+    airline_complaint = db.complaints_for_flight(flight["flight_key"])[0]
+    monkeypatch.setattr(telegram_bot, "missing_portal_fields", lambda _payload: [])
+
+    def fake_fail(payload, on_complete, on_update=None):
+        on_complete(PortalResult("needs_attention", "Page.goto timeout"))
+        return "job"
+
+    monkeypatch.setattr(telegram_bot, "start_portal_job", fake_fail)
+    bot.auto_escalate_due_complaints(now=datetime.now())
+    assert not db.event_seen(f"auto-gaca:{airline_complaint['id']}")
+    assert not db.event_seen(f"auto-gaca-inflight:{airline_complaint['id']}")
+
+    def fake_ok(payload, on_complete, on_update=None):
+        on_complete(PortalResult("submitted", "ok", "GACA-700099"))
+        return "job"
+
+    monkeypatch.setattr(telegram_bot, "start_portal_job", fake_ok)
+    bot.auto_escalate_due_complaints(now=datetime.now())
+    assert db.event_seen(f"auto-gaca:{airline_complaint['id']}")
 
 
 def test_every_candidate_mail_is_kept_for_response_matching(

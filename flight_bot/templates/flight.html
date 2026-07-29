@@ -83,9 +83,36 @@
   border:1px solid var(--line); border-radius:11px; background:#f6f9fa;
   white-space:pre-wrap; overflow-wrap:anywhere; font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace; }
 .history-list { display:grid; gap:10px; padding:0 24px 22px; }
-.history-item { display:flex; align-items:center; justify-content:space-between; gap:12px;
-  padding:12px 14px; border:1px solid var(--line); border-radius:11px; }
-.history-item p { margin:0; }
+.complaint-entry { overflow:hidden; border:1px solid var(--line); border-radius:12px; background:#fff; }
+.complaint-entry summary { display:flex; align-items:center; justify-content:space-between; gap:14px;
+  padding:14px; cursor:pointer; list-style:none; }
+.complaint-entry summary::-webkit-details-marker { display:none; }
+.complaint-entry summary:hover { background:#f8fbfb; }
+.complaint-entry summary::after { content:"View"; color:var(--teal-dark); font-size:12px; font-weight:800; }
+.complaint-entry[open] summary::after { content:"Hide"; }
+.complaint-entry summary p { margin:3px 0 0; }
+.complaint-content { display:grid; gap:14px; padding:16px; border-top:1px solid var(--line); background:#fbfdfd; }
+.complaint-facts { display:flex; flex-wrap:wrap; gap:7px; }
+.complaint-facts span { padding:6px 9px; border-radius:999px; color:var(--navy-700);
+  background:#edf4f5; font-size:12px; font-weight:720; }
+.complaint-block { min-width:0; }
+.complaint-block-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:7px; }
+.complaint-block h3 { margin:0; font-size:13px; }
+.complaint-text { max-height:430px; overflow:auto; margin:0; padding:13px;
+  border:1px solid var(--line); border-radius:10px; background:#fff;
+  white-space:pre-wrap; overflow-wrap:anywhere; font:12px/1.58 ui-monospace,SFMono-Regular,Consolas,monospace; }
+.live-status { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:0;
+  overflow:hidden; margin-bottom:22px; }
+.live-status > div { padding:22px 24px; }
+.live-status > div + div { border-left:1px solid var(--line); background:#f8fbfb; }
+.status-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+.status-heading h2 { margin:2px 0 5px; }
+.status-facts { display:flex; flex-wrap:wrap; gap:7px 16px; margin:13px 0 0;
+  color:var(--navy-500); font-size:12px; }
+.status-sources { display:grid; gap:6px; margin-top:13px; }
+.status-source { display:flex; justify-content:space-between; gap:12px; padding:7px 9px;
+  border-radius:8px; background:#fff; font-size:12px; }
+.missing-list { margin:10px 0 0; padding-left:18px; color:var(--navy-700); font-size:13px; }
 @media (max-width:980px) {
   .detail-layout { grid-template-columns:1fr; }
   .assessment { position:static; grid-row:1; }
@@ -101,6 +128,10 @@
   .data-label { grid-column:1/3; }
   .email-details summary { grid-template-columns:1fr; }
   .email-details summary .muted { display:none; }
+  .complaint-entry summary { align-items:flex-start; }
+  .complaint-entry summary > .muted { display:none; }
+  .live-status { grid-template-columns:1fr; }
+  .live-status > div + div { border-left:0; border-top:1px solid var(--line); }
 }
 </style>
 {% endblock %}
@@ -130,6 +161,35 @@
       <div class="quality-bar"><i style="width:{{ flight.quality.score }}%"></i></div>
       <span class="small muted">{{ flight.quality.label }}{% if flight.quality.missing %} · missing {{ flight.quality.missing|join(', ') }}{% endif %}</span>
     </div>
+  </div>
+</section>
+
+<section class="live-status card">
+  <div>
+    <div class="status-heading">
+      <div><p class="eyebrow">Live evidence</p><h2>{{ live_status.label }}</h2>
+        <p class="small muted">{{ (live_status.confidence * 100)|round|int }}% confidence · {{ live_status.provider|replace('_', ' ')|title }}{% if live_status.updated_at %} · checked {{ live_status.updated_at[:16]|replace('T', ' ') }} UTC{% endif %}</p>
+      </div>
+      <form method="post" action="{{ url_for('flight_status_refresh', flight_id=flight.id) }}"><button class="btn">Refresh now</button></form>
+    </div>
+    <div class="status-facts">
+      {% if live_status.estimated_departure %}<span>Estimated departure: {{ live_status.estimated_departure }}</span>{% endif %}
+      {% if live_status.actual_departure %}<span>Actual departure: {{ live_status.actual_departure }}</span>{% endif %}
+      {% if live_status.estimated_arrival %}<span>Estimated arrival: {{ live_status.estimated_arrival }}</span>{% endif %}
+      {% if live_status.actual_arrival %}<span>Actual arrival: {{ live_status.actual_arrival }}</span>{% endif %}
+    </div>
+    {% if live_status.contradictions %}<p class="small" style="color:#a0442f">{{ live_status.contradictions|join(' ') }}</p>{% endif %}
+    {% if live_status.sources %}<div class="status-sources">{% for source in live_status.sources[:5] %}<div class="status-source"><span>{{ source.provider|replace('_', ' ')|title }}</span><strong>{{ source.status|replace('_', ' ')|title }} · {{ (source.confidence * 100)|round|int }}%</strong></div>{% endfor %}</div>{% endif %}
+  </div>
+  <div>
+    <p class="eyebrow">Best course of action</p>
+    <h2>{{ strategy.label }}</h2>
+    <p class="small muted">Complaint readiness {{ strategy.readiness_score }}% · {{ strategy.category|title }}</p>
+    {% if strategy.reasons %}<p>{{ strategy.reasons[0] }}</p>{% endif %}
+    <p class="small"><strong>Recommended remedy:</strong> {{ strategy.requested_remedy }}</p>
+    {% if strategy.missing_facts %}<strong class="small">Information still worth collecting</strong><ul class="missing-list">{% for item in strategy.missing_facts %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
+    {% if strategy.next_review_at %}<p class="small muted">Next review: {{ strategy.next_review_at[:16]|replace('T', ' ') }}</p>{% endif %}
+    {% if strategy.filing_deadline %}<p class="small muted">GACA incident filing deadline: {{ strategy.filing_deadline }}</p>{% endif %}
   </div>
 </section>
 
@@ -199,7 +259,53 @@
       <div class="panel-head"><div><p class="eyebrow">Activity</p><h2>Claim history</h2></div></div>
       <div class="history-list">
         {% for item in flight.complaints %}
-        <div class="history-item"><div><strong>{{ item.kind|upper }} · {{ item.status|replace('_', ' ')|title }}</strong><p class="small muted">{{ item.subject or 'Claim record' }}{% if item.reference %}<br>Reference: {{ item.reference }}{% endif %}</p></div><span class="small muted">{{ item.created_at }}</span></div>
+        <details class="complaint-entry" {% if loop.last %}open{% endif %}>
+          <summary>
+            <div>
+              <strong>{{ item.kind|upper }} · {{ item.status|replace('_', ' ')|title }}</strong>
+              <p class="small muted">Category: {{ item.portal_category or 'Not recorded for this older filing' }}{% if item.reference %}<br>Reference: {{ item.reference }}{% endif %}</p>
+            </div>
+            <span class="small muted">{{ item.created_at }}</span>
+          </summary>
+          <div class="complaint-content">
+            <div class="complaint-facts">
+              <span>{{ item.kind|upper }} portal</span>
+              <span>{{ item.status|replace('_', ' ')|title }}</span>
+              <span>Category: {{ item.portal_category or 'Not recorded' }}</span>
+              {% if item.reference %}<span>Reference: {{ item.reference }}</span>{% endif %}
+              <span>Generation: {{ item.generation or 0 }}</span>
+              {% if item.parent_reference %}<span>Parent: {{ item.parent_reference }}</span>{% endif %}
+              <span>Root: {{ item.root_reference }}</span>
+            </div>
+            {% if item.subject %}<p class="small muted" style="margin:0"><strong>Subject:</strong> {{ item.subject }}</p>{% endif %}
+            <div class="complaint-block">
+              <div class="complaint-block-head"><h3>Immutable original complaint text</h3><button type="button" class="copy" onclick="copyFrom(this, 'complaint-statement-{{ item.id }}')">Copy</button></div>
+              <pre class="complaint-text" dir="auto" id="complaint-statement-{{ item.id }}">{{ item.original_text or item.details or 'Not recorded' }}</pre>
+            </div>
+            {% if item.details and item.details != item.original_text %}<div class="complaint-block">
+              <div class="complaint-block-head"><h3>This child filing's context</h3></div>
+              <pre class="complaint-text" dir="auto">{{ item.details }}</pre>
+            </div>{% endif %}
+            <div class="complaint-block">
+              <div class="complaint-block-head"><h3>Dashboard summary</h3></div>
+              <p class="small"><strong>Why I raised it:</strong> {{ item.issue_summary or item.original_text or item.details or 'Not recorded' }}</p>
+              <p class="small"><strong>What I asked for:</strong> {{ item.requested_resolution_summary or 'Not separately summarized' }}</p>
+              <p class="small"><strong>Provider response:</strong> {{ item.response_summary or 'No substantive response stored yet' }}</p>
+            </div>
+            {% if item.provider_response_text %}<div class="complaint-block">
+              <div class="complaint-block-head"><h3>Provider's exact response</h3></div>
+              <pre class="complaint-text" dir="auto">{{ item.provider_response_text }}</pre>
+            </div>{% endif %}
+            <div class="complaint-block">
+              <div class="complaint-block-head"><h3>{% if item.status in ['submitted', 'filed', 'sent', 'accepted_pending_reference'] %}Exact text sent to portal{% else %}Portal text prepared for this attempt{% endif %}</h3>{% if item.submitted_text %}<button type="button" class="copy" onclick="copyFrom(this, 'complaint-submitted-{{ item.id }}')">Copy</button>{% endif %}</div>
+              {% if item.submitted_text %}<pre class="complaint-text" dir="auto" id="complaint-submitted-{{ item.id }}">{{ item.submitted_text }}</pre>{% else %}<p class="small muted" style="margin:0">This exact expanded portal text was not retained by the older FlightDeck version. The original statement is shown above without guessing the missing wording.</p>{% endif %}
+            </div>
+            {% if item.child_complaints %}<div class="complaint-block">
+              <div class="complaint-block-head"><h3>Child filings for the same issue</h3></div>
+              <ul>{% for child in item.child_complaints %}<li>{{ child.kind|upper }} · {{ child.reference or ('case #' ~ child.id) }} · {{ child.status|replace('_', ' ')|title }}</li>{% endfor %}</ul>
+            </div>{% endif %}
+          </div>
+        </details>
         {% endfor %}
       </div>
     </section>
@@ -214,7 +320,7 @@
           <span class="email-subject">{{ email.subject }}</span>
           <span class="muted small">{{ (email.date or '')[:10] }}</span>
         </summary>
-        <pre class="email-body">{{ email.body }}</pre>
+        <pre class="email-body" dir="auto">{{ email.body }}</pre>
       </details>
       {% else %}<p class="muted" style="padding:0 24px 22px">No source emails are currently linked.</p>{% endfor %}
     </section>

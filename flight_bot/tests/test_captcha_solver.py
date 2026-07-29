@@ -102,3 +102,41 @@ def test_2captcha_dispatches_hcaptcha_with_current_task_type():
         "isInvisible": False,
         "userAgent": "Modern Browser",
     }
+
+
+def test_2captcha_uses_v3_task_with_page_action():
+    config = deepcopy(DEFAULTS)
+    config["captcha"].update({
+        "enabled": True,
+        "api_key": "test-key",
+        "poll_interval_seconds": 5,
+        "timeout_seconds": 60,
+    })
+    session = Session([
+        {"errorId": 0, "taskId": 321},
+        {
+            "errorId": 0,
+            "status": "ready",
+            "solution": {"token": "v3-token"},
+        },
+    ])
+    solver = TwoCaptchaSolver(config, session=session, sleeper=lambda _n: None)
+
+    result = solver.solve_recaptcha({
+        "website_url": "https://myeservices.gaca.gov.sa/complaint/step4",
+        "site_key": "gaca-site-key",
+        "is_v3": True,
+        "page_action": "submit",
+        "min_score": 0.3,
+        "api_domain": "google.com",
+    })
+
+    assert result["token"] == "v3-token"
+    assert session.requests[0][1]["task"] == {
+        "type": "RecaptchaV3TaskProxyless",
+        "websiteURL": "https://myeservices.gaca.gov.sa/complaint/step4",
+        "websiteKey": "gaca-site-key",
+        "minScore": 0.3,
+        "pageAction": "submit",
+        "apiDomain": "google.com",
+    }

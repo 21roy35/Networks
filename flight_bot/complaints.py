@@ -60,13 +60,14 @@ def _clean_passenger_name(value: str) -> str:
 def _same_passenger(booking_name: str, profile: dict) -> bool:
     """Match a booking name to the primary user without fuzzy family guesses."""
     booking_key = passenger_profile_key(booking_name)
+    first = str(profile.get("first_name") or "").strip()
+    middle = str(profile.get("middle_name") or "").strip()
+    last = str(profile.get("last_name") or "").strip()
     candidates = [
         profile.get("full_name"),
-        " ".join(filter(None, (
-            str(profile.get("first_name") or "").strip(),
-            str(profile.get("middle_name") or "").strip(),
-            str(profile.get("last_name") or "").strip(),
-        ))),
+        " ".join(filter(None, (first, middle, last))),
+        # Itinerary emails often omit the middle name used on GACA forms.
+        " ".join(filter(None, (first, last))),
     ]
     candidate_keys = {passenger_profile_key(value) for value in candidates if value}
     if booking_key in candidate_keys:
@@ -74,8 +75,8 @@ def _same_passenger(booking_name: str, profile: dict) -> bool:
     # Some itinerary emails expose only the first name.  Accept that exact
     # one-token match, but never use partial/fuzzy surname matching.
     booking_parts = booking_key.split()
-    first = passenger_profile_key(profile.get("first_name") or "").split()
-    return len(booking_parts) == 1 and bool(first) and booking_parts == first[:1]
+    first_parts = passenger_profile_key(first).split()
+    return len(booking_parts) == 1 and bool(first_parts) and booking_parts == first_parts[:1]
 
 
 def _passenger_profile(booking_name: str, profiles: dict) -> dict | None:
@@ -98,32 +99,181 @@ def _subject(flight: dict, prefix: str) -> str:
             f"PNR {flight.get('pnr') or 'N/A'}")
 
 
-def airline_complaint(flight: dict, user: dict, incident: str = "") -> dict:
+def _sentence(value: str) -> str:
+    text = " ".join(str(value or "").split()).strip(" .")
+    return text + "." if text else ""
+
+
+def _lower_first(value: str) -> str:
+    if len(value) > 1 and value[0].isupper() and value[1].islower():
+        return value[0].lower() + value[1:]
+    return value
+
+
+def _natural_incident(value: str) -> str:
+    """Turn analysis prose into the passenger's own concise first-person voice."""
+    import re
+    text = " ".join(str(value or "").split()).strip(" .")
+    text = re.sub(
+        r"^(?:additional issue summary|facts stated by the passenger|"
+        r"requested resolution)\s*:\s*", "", text, flags=re.I)
+    text = re.sub(
+        r"^(?:the\s+)?passenger\s+(?:reports?|reported|states?|stated)"
+        r"(?:\s+that)?\s+", "", text, flags=re.I)
+    if not text:
+        return "I am writing to explain an issue I experienced on this trip."
+    if re.search(r"\b(?:I|I'm|I've|my|we|our)\b", text, re.I):
+        return _sentence(text)
+    return _sentence("The issue I experienced was that " + _lower_first(text))
+
+
+def _natural_resolution(value: str) -> str:
+    import re
+    text = " ".join(str(value or "").split()).strip(" .")
+    text = re.sub(
+        r"^(?:the\s+)?passenger\s+(?:requests?|requested|would like)"
+        r"(?:\s+that)?\s+", "", text, flags=re.I)
+    if not text:
+        return "I would appreciate it if you could look into this and provide a fair resolution."
+    text = re.sub(r"^investigation\b", "investigate this", text, flags=re.I)
+    text = re.sub(
+        r"\band (?:an )?appropriate remed(?:y|ies)\b",
+        "and provide an appropriate resolution", text, flags=re.I)
+    text = re.sub(
+        r"\bprovide applicable remedies\b", "provide a fair resolution",
+        text, flags=re.I)
+    if re.match(r"^(?:I|please)\b", text, re.I):
+        return _sentence(text)
+    return _sentence(
+        "I would appreciate it if you could " + _lower_first(text))
+
+
+def _gaca_free_text(
+        value: str,
+        flight: dict,
+        user: dict,
+        airline_reference: str,
+        airline_complaint_date: str) -> str:
+    """Remove values already supplied in dedicated GACA form controls."""
+    import re
+
+    text = " ".join(str(value or "").split()).strip()
+    text = re.sub(
+        r"^(?:during|on|regarding)\s+my\s+(?:flight|trip|journey)\b"
+        r"[^.!?]{0,220}?,\s*",
+        "",
+        text,
+        flags=re.I,
+    )
+    exact_values = [
+        airline_reference,
+        airline_complaint_date,
+        user.get("national_id"),
+        user.get("full_name"),
+        effective(flight, "passenger"),
+        effective(flight, "flight_number"),
+        effective(flight, "flight_date"),
+        flight.get("pnr"),
+        *(flight.get("ticket_numbers") or []),
+    ]
+    for structured in exact_values:
+        structured = str(structured or "").strip()
+        if structured:
+            text = re.sub(re.escape(structured), "", text, flags=re.I)
+    # Ghala may naturally spell an ISO form date as "5 July 2026". Remove
+    # those human-readable equivalents as well so the narrative does not
+    # repeat a value already supplied in GACA's Flight Date control.
+    try:
+        from datetime import datetime
+
+        travel_date = datetime.strptime(
+            str(effective(flight, "flight_date") or ""), "%Y-%m-%d")
+        day = travel_date.day
+        month = travel_date.strftime("%B")
+        year = travel_date.year
+        natural_dates = (
+            rf"\b0?{day}(?:st|nd|rd|th)?\s+{month}\s+{year}\b",
+            rf"\b{month}\s+0?{day}(?:st|nd|rd|th)?[,]?\s+{year}\b",
+            rf"\b0?{travel_date.month}[/-]0?{day}[/-]{year}\b",
+            rf"\b0?{day}[/-]0?{travel_date.month}[/-]{year}\b",
+        )
+        for pattern in natural_dates:
+            text = re.sub(pattern, "", text, flags=re.I)
+    except (TypeError, ValueError):
+        pass
+    origin_values = [
+        effective(flight, "origin"), flight.get("origin_city"),
+    ]
+    destination_values = [
+        effective(flight, "destination"), flight.get("destination_city"),
+    ]
+    for origin in filter(None, origin_values):
+        for destination in filter(None, destination_values):
+            text = re.sub(
+                rf"\bfrom\s+{re.escape(str(origin))}\s+to\s+"
+                rf"{re.escape(str(destination))}\b",
+                "",
+                text,
+                flags=re.I,
+            )
+    airline = str(
+        flight.get("airline_name") or flight.get("airline_code") or ""
+    ).strip()
+    if airline:
+        text = re.sub(re.escape(airline), "the airline", text, flags=re.I)
+    text = re.sub(
+        r"\b(?:PNR|booking reference|ticket number|national ID|"
+        r"airline complaint reference|complaint reference)\s*[:#-]?\s*",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"\b(?:on|dated)\s*(?=[,.;:!?]|$)", "", text, flags=re.I)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    text = re.sub(r"(?:\s*,\s*){2,}", ", ", text)
+    return text.strip(" ,.;:")
+
+
+def _journey(flight: dict, airline: str) -> str:
+    number = effective(flight, "flight_number") or "the flight"
+    travel_date = effective(flight, "flight_date") or "the travel date"
+    origin = effective(flight, "origin") or ""
+    destination = effective(flight, "destination") or ""
+    route = f" from {origin} to {destination}" if origin and destination else ""
+    pnr = flight.get("pnr") or ""
+    booking = f", booking reference {pnr}" if pnr else ""
+    return f"my {airline} flight {number}{route} on {travel_date}{booking}"
+
+
+def _requested_resolution(assessment: dict, requested: str = "") -> str:
+    requested = " ".join(str(requested or "").split()).strip()
+    if requested:
+        return requested
+    return "look into this and provide a fair resolution"
+
+
+def airline_complaint(flight: dict, user: dict, incident: str = "",
+                      requested_remedy: str = "") -> dict:
     """Generate the airline claim shown to the user and sent to its portal."""
     assessment = assess(flight)
     code = flight.get("airline_code")
     info = AIRLINES.get(code, {})
     airline = flight.get("airline_name") or code or "the airline"
-    incident = incident.strip() or "Describe what went wrong."
+    incident = _natural_incident(incident)
+    requested_remedy = _requested_resolution(assessment, requested_remedy)
     subject = _subject(flight, "Passenger rights complaint")
-    body = f"""{incident}
+    tickets = ", ".join(flight.get("ticket_numbers") or [])
+    ticket_line = f"\n\nFor reference, my ticket number is {tickets}.\n" if tickets else ""
+    name = user.get("full_name") or effective(flight, "passenger") or "Passenger"
+    body = f"""Hello,
 
-Flight details:
-{_flight_facts(flight, user)}
+I am writing about {_journey(flight, airline)}.
 
-Requested compensation and resolution:
-  I request fair financial compensation for what occurred, reimbursement for
-  every related loss or expense, and every additional refund, repair,
-  replacement, or duty-of-care remedy available. Please provide a written
-  decision and complaint reference number.
+{incident}
 
-Assessment basis:
-  {"; ".join(assessment["frameworks"])}.
-
-Contact:
-{user.get('full_name') or effective(flight, 'passenger') or '[Passenger]'}
-{user.get('email') or ''}
-{user.get('phone') or ''}
+{_natural_resolution(requested_remedy)} Please send me a written response and the complaint reference number so I can follow up.{ticket_line}
+Thank you,
+{name}
 """
     return {
         "airline": airline,
@@ -136,30 +286,29 @@ Contact:
 
 def gaca_complaint(flight: dict, user: dict, incident: str = "",
                    airline_reference: str = "",
-                   airline_complaint_date: str = "") -> dict:
+                   airline_complaint_date: str = "",
+                   requested_remedy: str = "") -> dict:
     """Generate the regulator escalation sent through GACA's official portal."""
     assessment = assess(flight)
     airline = flight.get("airline_name") or flight.get("airline_code") or "the airline"
-    incident = incident.strip() or "Describe what went wrong."
+    incident = _natural_incident(_gaca_free_text(
+        incident,
+        flight,
+        user,
+        airline_reference,
+        airline_complaint_date,
+    ))
+    requested_remedy = _requested_resolution(assessment, requested_remedy)
     subject = _subject(flight, f"GACA escalation against {airline}")
-    body = f"""{incident}
-
-Formal escalation to {GACA['name']}
-
-Airline complaint reference: {airline_reference or '[required]'}
-Airline complaint date: {airline_complaint_date or '[required]'}
-
-Flight details:
-{_flight_facts(flight, user)}
-
-Requested compensation and resolution:
-  Please investigate this complaint and require the carrier to provide fair
-  financial compensation, reimbursement for every related loss or expense,
-  and every additional remedy due under the applicable passenger-rights rules.
-
-Assessment basis:
-  {"; ".join(assessment["frameworks"])}.
-"""
+    # GACA receives the passenger, carrier, journey, airline reference, and
+    # filing date through dedicated controls. Keep its free-text field focused
+    # on the unresolved incident and requested remedy.
+    body = (
+        f"{incident}\n\n"
+        f"{_natural_resolution(requested_remedy)} "
+        f"I would appreciate GACA's help obtaining a written decision and "
+        f"a proper resolution from the airline."
+    )
     return {
         "airline": airline,
         "portal_url": GACA["portal_url"],
@@ -203,35 +352,21 @@ def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
                  else trip_passenger or profile_name)
     parsed_first, parsed_middle, parsed_last = _names(
         profile_name or trip_passenger)
+    has_explicit_names = bool(explicit_names[0] or explicit_names[2])
     first = explicit_names[0] or parsed_first
-    middle = explicit_names[1] or parsed_middle
+    # An explicitly structured profile may intentionally have no middle name.
+    # Do not recreate one by splitting a multiword family name from full_name.
+    middle = explicit_names[1] if has_explicit_names else parsed_middle
     last = explicit_names[2] or parsed_last
     origin = effective(flight, "origin") or ""
     destination = effective(flight, "destination") or ""
     ticket_numbers = flight.get("ticket_numbers") or []
     assessment = assess(flight)
-    complaint_incident = incident
-    if ai_analysis:
-        facts = [str(item).strip() for item in ai_analysis.get("facts") or []
-                 if str(item).strip()]
-        sections = [incident]
-        if ai_analysis.get("summary"):
-            sections.append("Additional issue summary: "
-                            + str(ai_analysis["summary"]).strip())
-        if facts:
-            sections.append("Facts stated by the passenger: " + "; ".join(facts))
-        observations = [
-            str(item).strip()
-            for item in ai_analysis.get("evidence_observations") or []
-            if str(item).strip()
-        ]
-        if observations:
-            sections.append("Visible evidence observations: "
-                            + "; ".join(observations))
-        if ai_analysis.get("requested_remedy"):
-            sections.append("Requested resolution: "
-                            + str(ai_analysis["requested_remedy"]).strip())
-        complaint_incident = "\n  ".join(sections)
+    requested_remedy = str((ai_analysis or {}).get("requested_remedy") or "")
+    # Ghala's analysis guides category/remedy selection, but the portal text
+    # stays a short first-person account instead of an internal case report.
+    complaint_incident = str(
+        (ai_analysis or {}).get("summary") or incident).strip()
     contact_email = identity.get("email") or user.get("email") or ""
     contact_phone = identity.get("phone") or user.get("phone") or ""
     contact_country_code = (identity.get("country_code")
@@ -244,12 +379,13 @@ def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
     }
     letter = (gaca_complaint(
         flight, letter_user, complaint_incident, airline_reference,
-        airline_complaint_date)
+        airline_complaint_date, requested_remedy)
         if kind == "gaca" else airline_complaint(
-            flight, letter_user, complaint_incident))
+            flight, letter_user, complaint_incident, requested_remedy))
     departure = effective(flight, "departure") or ""
     return {
         "kind": kind,
+        "flight_key": flight.get("flight_key") or "",
         "airline_code": flight.get("airline_code") or "",
         "airline_name": flight.get("airline_name")
                         or flight.get("airline_code") or "",
@@ -265,6 +401,16 @@ def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
         "phone": contact_phone,
         "national_id": identity.get("national_id") or "",
         "title": identity.get("title") or "",
+        "gender": (
+            str(identity.get("gender") or "").strip()
+            or (
+                "Male" if str(identity.get("title") or "").strip().casefold()
+                in {"mr", "mr.", "mister"} else
+                "Female" if str(identity.get("title") or "").strip().casefold()
+                in {"mrs", "mrs.", "ms", "ms.", "miss", "miss."} else
+                ""
+            )
+        ),
         "nationality": identity.get("nationality") or "",
         "country_code": contact_country_code,
         "alfursan_id": identity.get("alfursan_id") or "",
