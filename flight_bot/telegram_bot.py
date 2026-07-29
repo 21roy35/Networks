@@ -2976,6 +2976,22 @@ class TelegramCoordinator:
         if not prior or not prior.get("reference"):
             self.notify("GACA requires the airline complaint reference, which has not been captured yet.")
             return False
+        active_gaca = db.active_complaint_for_flight(
+            flight["flight_key"], "gaca")
+        active_portal_job = (
+            db.active_portal_job_for_complaint(int(active_gaca["id"]))
+            if active_gaca and active_gaca.get("id") is not None
+            else None
+        )
+        if active_portal_job:
+            # A durable portal worker is stronger evidence than the age of the
+            # complaint reservation. Avoid both duplicate AI work and a second
+            # GACA reservation while the first browser is still progressing.
+            if not automatic:
+                self.notify(
+                    "A GACA escalation for this flight is already underway or "
+                    "on record. I will not submit it again.")
+            return False
         now = self._flight_local_now()
         incident_day = parse_flight_time(
             self._effective_flight_value(flight, "flight_date")

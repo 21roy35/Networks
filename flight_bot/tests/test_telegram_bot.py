@@ -1487,6 +1487,64 @@ def test_auto_escalation_silently_recognizes_active_gaca_job(
         for item in api.messages)
 
 
+def test_old_filing_with_active_portal_job_is_not_replaced(
+        coordinator, monkeypatch):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.set_overrides(
+        flight["id"], {"flight_date": datetime.now().date().isoformat()})
+    flight = db.get_flight(flight["id"])
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Seat complaint",
+        "submitted", reference="CAS-700021",
+        details="The seat door was broken.")
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE complaints SET created_at=datetime('now', '-8 days') "
+            "WHERE reference='CAS-700021'")
+    airline = db.complaints_for_flight(flight["flight_key"])[0]
+    gaca_id = db.add_complaint(
+        flight["flight_key"], "gaca", None, "Active GACA escalation",
+        "filing", details="The seat door was broken.",
+        parent_complaint_id=int(airline["id"]),
+        created_at=(
+            datetime.now() - timedelta(hours=2)
+        ).strftime("%Y-%m-%d %H:%M:%S"))
+    db.save_portal_job({
+        "id": "active-old-gaca",
+        "kind": "gaca",
+        "flight_key": flight["flight_key"],
+        "complaint_id": gaca_id,
+        "status": "reviewing",
+        "message": "Reviewing the official form",
+        "terminal": False,
+        "payload": {
+            "kind": "gaca",
+            "flight_key": flight["flight_key"],
+            "portal_complaint_id": gaca_id,
+        },
+    })
+    monkeypatch.setattr(
+        telegram_bot, "missing_portal_fields", lambda _payload: [])
+
+    assert db.begin_complaint(
+        flight["flight_key"], "gaca", "Duplicate", "Duplicate") is None
+    assert db.get_complaint(gaca_id)["status"] == "filing"
+    assert bot._launch_gaca(
+        db.get_flight(flight["id"]), automatic=True) is False
+
+    gaca_rows = [
+        item for item in db.complaints_for_flight(flight["flight_key"])
+        if item["kind"] == "gaca"
+    ]
+    assert [item["id"] for item in gaca_rows] == [gaca_id]
+    assert not any(
+        "already underway or on record" in item["text"]
+        for item in api.messages)
+
+
 def test_manual_gaca_submission_cannot_bypass_seven_day_gate(
         coordinator, monkeypatch):
     bot, api = coordinator

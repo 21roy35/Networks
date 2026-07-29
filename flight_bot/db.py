@@ -11,6 +11,12 @@ from datetime import datetime, timedelta
 from .config import DB_PATH, passenger_profile_key
 
 
+_ACTIVE_PORTAL_JOB_STATUSES = (
+    "queued", "retry_wait", "leased", "opening", "filling", "reviewing",
+    "verification", "submitting",
+)
+
+
 def gaca_identity_key(payload: dict | None) -> str:
     """Return a non-PII key for the passenger used on GACA Step 2."""
     payload = payload if isinstance(payload, dict) else {}
@@ -1448,11 +1454,24 @@ def begin_complaint(flight_key: str, kind: str, subject: str | None,
                ORDER BY created_at DESC, id DESC LIMIT 1""",
             (flight_key, kind)).fetchone()
         if current:
-            stale = conn.execute(
+            stale_by_age = conn.execute(
                 """SELECT 1 WHERE ? = 'filing'
                    AND datetime(?) < datetime('now', 'localtime', '-45 minutes')""",
                 (current["status"], current["created_at"])).fetchone()
-            if stale:
+            placeholders = ",".join(
+                "?" for _ in _ACTIVE_PORTAL_JOB_STATUSES)
+            active_portal_job = conn.execute(
+                f"""SELECT 1 FROM portal_jobs
+                    WHERE complaint_id = ?
+                      AND terminal = 0
+                      AND status IN ({placeholders})
+                    LIMIT 1""",
+                (
+                    int(current["id"]),
+                    *_ACTIVE_PORTAL_JOB_STATUSES,
+                ),
+            ).fetchone()
+            if stale_by_age and not active_portal_job:
                 conn.execute(
                     "UPDATE complaints SET status = 'interrupted' WHERE id = ?",
                     (current["id"],))
@@ -1959,6 +1978,22 @@ def get_portal_job(job_id: str) -> dict | None:
     except (TypeError, ValueError):
         job["payload"] = {}
     return job
+
+
+def active_portal_job_for_complaint(complaint_id: int) -> dict | None:
+    """Return the authoritative non-terminal portal worker for a complaint."""
+    placeholders = ",".join("?" for _ in _ACTIVE_PORTAL_JOB_STATUSES)
+    with connect() as conn:
+        row = conn.execute(
+            f"""SELECT id FROM portal_jobs
+                WHERE complaint_id = ?
+                  AND terminal = 0
+                  AND status IN ({placeholders})
+                ORDER BY created_at, id
+                LIMIT 1""",
+            (int(complaint_id), *_ACTIVE_PORTAL_JOB_STATUSES),
+        ).fetchone()
+    return get_portal_job(str(row["id"])) if row else None
 
 
 def gaca_confirmation_unknown_complaint_ids() -> set[int]:
