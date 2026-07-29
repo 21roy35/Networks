@@ -181,6 +181,17 @@ def _retry_minimum_delay(result: PortalResult) -> int:
     return 5 * 60
 
 
+def _gaca_permanent_validation_rejection(result: PortalResult) -> bool:
+    """True when GACA rendered a final rule violation that cannot improve."""
+    return bool(re.search(
+        r"complaint is more than 60 days old|"
+        r"(?:flight|complaint).{0,80}older than 60 days|"
+        r"more than 60 days.{0,120}will not be accepted",
+        str(result.message or ""),
+        re.I,
+    ))
+
+
 def _maybe_use_gaca_email_fallback(
     job_id: str,
     payload: dict,
@@ -324,14 +335,32 @@ def _start_portal_worker(
         result = _maybe_use_gaca_email_fallback(
             job_id, payload, result, update)
         previous_stage = state["last_stage"]
+        gaca_permanent_rejection = (
+            payload.get("kind") == "gaca"
+            and _gaca_permanent_validation_rejection(result)
+        )
+        if gaca_permanent_rejection:
+            result = PortalResult(
+                "needs_attention",
+                result.message,
+                error_code="gaca_permanent_validation",
+            )
         gaca_reconciliation_retry = (
             payload.get("kind") == "gaca"
+            and not gaca_permanent_rejection
             and result.status not in {
                 "submitted", "success", "accepted_pending_reference",
             }
             and not re.search(r"\bcancel(?:led|ed)?\b", result.message, re.I)
         )
-        if _retry_is_safe(result, previous_stage) or gaca_reconciliation_retry:
+        should_retry = (
+            not gaca_permanent_rejection
+            and (
+                _retry_is_safe(result, previous_stage)
+                or gaca_reconciliation_retry
+            )
+        )
+        if should_retry:
             remediated_proxy = bool(re.search(
                 r"rotated (?:the )?GACA residential proxy|"
                 r"GACA residential proxy was rotated",
@@ -434,7 +463,8 @@ def _start_portal_worker(
                 "quarantined",
                 f"{result.message} The safe retry limit was reached and the "
                 "job was quarantined for manual review.")
-        elif (result.status not in {
+        elif (not gaca_permanent_rejection
+              and result.status not in {
                 "submitted", "accepted_pending_reference"}
               and previous_stage == "submitting"):
             db.quarantine_portal_job(job_id, result.message)

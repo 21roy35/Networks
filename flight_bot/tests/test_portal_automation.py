@@ -353,6 +353,52 @@ def test_legacy_job_restores_routing_fields_before_worker(monkeypatch):
     assert captured["portal_complaint_id"] == 96
 
 
+def test_gaca_age_rejection_is_terminal_and_never_retried(monkeypatch):
+    final_results = []
+
+    def submit(_payload, update):
+        update("submitting", "Checking GACA's final validation.")
+        return portal_automation.PortalResult(
+            "error",
+            "GACA kept the form open because validation failed: Your "
+            "complaint is more than 60 days old, and therefore will not be "
+            "accepted according to the complaint submission rules.",
+            retry_safe=True,
+        )
+
+    monkeypatch.setattr(portal_automation, "submit_portal_claim", submit)
+    monkeypatch.setattr(
+        portal_automation.db, "retry_portal_job",
+        lambda *_args, **_kwargs:
+        pytest.fail("A permanent age rejection must not be retried"))
+    monkeypatch.setattr(
+        portal_automation.db, "quarantine_portal_job",
+        lambda *_args, **_kwargs:
+        pytest.fail("An explicit age rejection is not an ambiguous submit"))
+    monkeypatch.setattr(
+        portal_automation.db, "save_portal_job",
+        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        portal_automation, "_finalize_persisted_complaint",
+        lambda _payload, result: final_results.append(result))
+    monkeypatch.setattr(
+        portal_automation.threading.Thread, "start",
+        lambda thread: thread.run())
+
+    job_id = "gaca-permanent-age-rejection"
+    portal_automation._start_portal_worker({
+        "id": job_id,
+        "kind": "gaca",
+        "status": "leased",
+        "payload": {"kind": "gaca"},
+    })
+
+    assert final_results[-1].status == "needs_attention"
+    assert final_results[-1].error_code == "gaca_permanent_validation"
+    assert portal_automation._JOBS[job_id]["status"] == "needs_attention"
+    assert portal_automation._JOBS[job_id]["terminal"] is True
+
+
 def test_interrupted_submit_is_quarantined_but_opening_is_requeued(
         tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightdeck.db")
