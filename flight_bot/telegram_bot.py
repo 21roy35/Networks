@@ -3235,10 +3235,10 @@ class TelegramCoordinator:
             self, flight: dict, complaint_id: int,
             _portal_message: str = "") -> None:
         marker = f"gaca-duplicate-recovery-prompted:{int(complaint_id)}"
-        if db.event_seen(marker):
+        if not db.mark_event_seen(marker):
             return
         label = self._post_flight_label(flight)
-        self.notify(
+        delivered = self.notify(
             f"GACA confirmed that it already has the same complaint information "
             f"for {label}. This proves an existing regulator case; it does not "
             "mean this new attempt succeeded. I held the job and will not "
@@ -3249,7 +3249,8 @@ class TelegramCoordinator:
                 ("Recover existing GACA case",
                  f"gaca_recover:{int(flight['id'])}")
             ]]))
-        db.mark_event_seen(marker)
+        if not delivered.get("message_id"):
+            db.clear_event_seen(marker)
 
     def _prompt_held_gaca_duplicates(self) -> None:
         """Surface older held duplicates once, including prior-build jobs."""
@@ -3619,7 +3620,8 @@ class TelegramCoordinator:
                              event.get("body") or ""))
             deterministic = bool(substantive.search(blob))
             is_closure = bool(closure_notice.search(blob))
-            points_to_linked_message = bool(linked_message_pointer.search(blob))
+            points_to_linked_message = bool(
+                is_closure and linked_message_pointer.search(blob))
             analysis = None
             # Only spend an AI call once the email is already strongly tied to
             # this complaint (exact reference or booking facts). That stops Ghala
@@ -3715,11 +3717,11 @@ class TelegramCoordinator:
         def notify_linked_message_pending(
                 complaint: dict, info: dict, analysis: dict | None) -> None:
             marker = f"closure-details-pending:{int(complaint['id'])}"
-            if db.event_seen(marker):
+            if not db.mark_event_seen(marker):
                 return
             flight = complaint.get("flight_data") or {}
             summary = str((analysis or {}).get("summary") or "").strip()
-            self.notify(
+            delivered = self.notify(
                 f"{info.get('name') or 'The airline'} says complaint "
                 f"{complaint.get('reference') or ''} for "
                 f"{self._post_flight_label(flight)} was finalized, but this "
@@ -3730,7 +3732,8 @@ class TelegramCoordinator:
                   "not reopen or escalate merely because of this notice. If "
                   "the detailed email went to another inbox, forward or paste "
                   "it into Telegram.")
-            db.mark_event_seen(marker)
+            if not delivered.get("message_id"):
+                db.clear_event_seen(marker)
 
         def notify_response(complaint: dict, info: dict, event: dict,
                             analysis: dict | None, match_method: str) -> None:

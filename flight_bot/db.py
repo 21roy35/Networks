@@ -1749,11 +1749,13 @@ def event_seen(event_key: str) -> bool:
             (event_key,)).fetchone() is not None
 
 
-def mark_event_seen(event_key: str):
+def mark_event_seen(event_key: str) -> bool:
+    """Atomically claim a one-shot event; true only for the first caller."""
     with connect() as conn:
-        conn.execute(
+        cursor = conn.execute(
             "INSERT OR IGNORE INTO telegram_events (event_key) VALUES (?)",
             (event_key,))
+    return bool(cursor.rowcount)
 
 
 def clear_event_seen(event_key: str) -> bool:

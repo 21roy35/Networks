@@ -519,8 +519,14 @@ def test_held_gaca_duplicate_prompts_reference_recovery_once(
         "payload": {"kind": "gaca"},
     })
 
-    bot._prompt_held_gaca_duplicates()
-    bot._prompt_held_gaca_duplicates()
+    threads = [
+        threading.Thread(target=bot._prompt_held_gaca_duplicates)
+        for _index in range(6)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(2)
 
     recovery_messages = [
         item for item in api.messages
@@ -786,6 +792,36 @@ def test_closure_notice_that_points_to_email_waits_for_details(coordinator):
     assert api.messages[0]["reply_markup"] is None
     assert db.list_complaint_responses() == []
     assert len(db.complaints_for_flight(flight["flight_key"])) == 1
+
+
+def test_creation_notice_email_footer_does_not_become_closure(coordinator):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Claim", "submitted",
+        reference="C_2817700", details="Broken screen.")
+    db.save_mail_event({
+        "message_id": "<creation-notice@example>",
+        "subject": "Your Ticket C_2817700 is Registered with us",
+        "sender": "CR-NORPLY@saudia.com",
+        "date": datetime.now(),
+        "body": (
+            "Service Ticket - Creation Notification. This is an auto response "
+            "confirming we received your comment. A specialist will review and "
+            "reply within 15 days. The recipient should check this email and "
+            "attachments for viruses."),
+    })
+
+    bot.check_complaint_responses()
+    bot.check_complaint_responses()
+
+    assert api.messages == []
+    assert db.list_complaint_responses() == []
+    complaint = db.complaints_for_flight(flight["flight_key"])[0]
+    assert not db.event_seen(f"airline-responded:{complaint['id']}")
+    assert not db.event_seen(f"closure-details-pending:{complaint['id']}")
 
 
 def test_confirmation_email_recovers_missing_airline_reference(coordinator):
