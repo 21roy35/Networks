@@ -144,6 +144,7 @@ input:hover, select:hover, textarea:hover { border-color:#a6bbc5; }
     <nav class="nav" aria-label="Primary navigation">
       <a href="{{ url_for('index') }}" {% if request.endpoint == 'index' %}aria-current="page"{% endif %}>Flights</a>
       <a href="{{ url_for('emails') }}" {% if request.endpoint == 'emails' %}aria-current="page"{% endif %}>Email evidence</a>
+      <a href="{{ url_for('gaca_cases') }}" {% if request.endpoint in ('gaca_cases', 'sync_gaca_cases') %}aria-current="page"{% endif %}>GACA cases</a>
     </nav>
     {% if scan_running %}
     <a class="topbar-status" href="{{ url_for('scan_status') }}"><span class="pulse"></span>Mailbox scan running</a>

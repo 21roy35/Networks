@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}GACA cases · FlightDeck{% endblock %}
+{% block head %}
+<style>
+.account-head { display:flex; align-items:flex-end; justify-content:space-between; gap:24px; margin-bottom:22px; }
+.account-head h1 { font-size:clamp(34px,5vw,50px); margin-bottom:9px; }
+.account-head p { max-width:720px; margin:0; }
+.account-stats { display:grid; grid-template-columns:repeat(3,145px); gap:10px; }
+.account-stat { padding:14px 16px; }
+.account-stat strong { display:block; font-size:23px; }
+.account-stat span { color:var(--navy-500); font-size:10px; font-weight:800; }
+.sync-bar { padding:16px 18px; margin-bottom:14px; display:flex; align-items:center; justify-content:space-between; gap:18px; }
+.sync-bar p { margin:0; }
+.filterbar { margin-bottom:14px; padding:15px; display:grid; grid-template-columns:minmax(230px,1fr) 180px auto; gap:10px; }
+.case-table-wrap { overflow:auto; }
+.case-table { width:100%; border-collapse:collapse; min-width:1050px; }
+.case-table th { padding:12px 15px; color:var(--navy-500); background:#f7f9fa; border-bottom:1px solid var(--line); text-align:left; text-transform:uppercase; letter-spacing:.08em; font-size:10px; }
+.case-table td { padding:15px; border-bottom:1px solid var(--line); vertical-align:top; }
+.case-table tr:last-child td { border-bottom:0; }
+.case-table tbody tr:hover { background:#f9fbfb; }
+.case-ref { font-weight:850; color:var(--navy-900); }
+.fact-list { display:grid; gap:3px; font-size:12px; color:var(--navy-700); }
+.linked-flight { color:var(--teal-dark); font-weight:800; text-decoration:none; }
+.linked-flight:hover { text-decoration:underline; }
+.mapping-note { max-width:210px; overflow-wrap:anywhere; }
+@media (max-width:900px) { .account-head { align-items:flex-start; flex-direction:column; } .account-stats { width:100%; grid-template-columns:repeat(3,1fr); } }
+@media (max-width:650px) { .filterbar { grid-template-columns:1fr; } .account-stats { grid-template-columns:1fr; } .sync-bar { align-items:flex-start; flex-direction:column; } }
+</style>
+{% endblock %}
+{% block content %}
+<div class="account-head">
+  <div>
+    <p class="eyebrow">Official account mirror</p>
+    <h1>GACA cases</h1>
+    <p class="muted">Complaints read from your signed-in GACA account and mapped to FlightDeck using regulator references, airline references, tickets, PNRs, flights, dates, and passenger names.</p>
+  </div>
+  <div class="account-stats">
+    <div class="account-stat card"><strong>{{ total }}</strong><span>ACCOUNT CASES</span></div>
+    <div class="account-stat card"><strong>{{ mapped_total }}</strong><span>MAPPED</span></div>
+    <div class="account-stat card"><strong>{{ ambiguous_total }}</strong><span>NEEDS REVIEW</span></div>
+  </div>
+</div>
+
+<section class="sync-bar card">
+  <div>
+    <strong>{{ (sync.status or 'never synced')|replace('_', ' ')|title }}</strong>
+    <p class="muted small">{{ sync.message or 'The account has not been synchronized yet.' }}{% if sync.last_success_at %} Last successful sync: {{ sync.last_success_at }}.{% endif %}</p>
+  </div>
+  <form method="post" action="{{ url_for('sync_gaca_cases') }}"><button class="btn primary">Sync GACA now</button></form>
+</section>
+
+<form class="filterbar card" method="get" action="{{ url_for('gaca_cases') }}">
+  <label><span class="sr-only">Search GACA cases</span><input type="text" name="q" value="{{ query }}" placeholder="Search reference, airline, passenger, flight, ticket…"></label>
+  <label><span class="sr-only">Filter mapping state</span><select name="mapping" onchange="this.form.submit()"><option value="all" {% if mapping == 'all' %}selected{% endif %}>All cases</option><option value="mapped" {% if mapping == 'mapped' %}selected{% endif %}>Mapped</option><option value="review" {% if mapping == 'review' %}selected{% endif %}>Needs review</option></select></label>
+  <div class="actions"><button class="btn dark">Search</button>{% if query or mapping != 'all' %}<a class="btn" href="{{ url_for('gaca_cases') }}">Clear</a>{% endif %}</div>
+</form>
+
+<section class="card" style="overflow:hidden">
+  {% if cases %}
+  <div class="case-table-wrap"><table class="case-table">
+    <thead><tr><th>GACA case</th><th>Airline case</th><th>Flight</th><th>Passenger & booking</th><th>Account status</th><th>FlightDeck mapping</th></tr></thead>
+    <tbody>{% for case in cases %}<tr>
+      <td><div class="case-ref">{{ case.reference or 'Reference unavailable' }}</div><div class="small muted">{{ case.submitted_at or case.first_seen_at or '' }}</div>{% if case.category %}<span class="badge kind">{{ case.category }}</span>{% endif %}</td>
+      <td><div class="fact-list"><strong>{{ case.airline or 'Airline not shown' }}</strong><span>{{ case.airline_reference or 'No airline reference shown' }}</span></div></td>
+      <td><div class="fact-list"><strong>{{ case.flight_number or 'Flight not shown' }}</strong><span>{{ case.flight_date or '' }}</span><span>{% if case.origin or case.destination %}{{ case.origin or '—' }} → {{ case.destination or '—' }}{% endif %}</span></div></td>
+      <td><div class="fact-list"><strong>{{ case.passenger_name or 'Passenger not shown' }}</strong>{% if case.ticket_number %}<span>Ticket {{ case.ticket_number }}</span>{% endif %}{% if case.pnr %}<span>PNR {{ case.pnr }}</span>{% endif %}</div></td>
+      <td><span class="badge {% if case.status and ('closed' in case.status|lower or 'resolved' in case.status|lower) %}eligible{% else %}kind{% endif %}">{{ case.status or 'Status unavailable' }}</span></td>
+      <td><div class="mapping-note">{% if case.flight_id %}<a class="linked-flight" href="{{ url_for('flight_detail', flight_id=case.flight_id) }}">{{ case.flight_data.airline_name or case.flight_data.airline_code or 'Flight' }} {{ case.flight_data.flight_number or case.flight_number or '' }} →</a>{% else %}<span class="badge unknown">{{ case.mapping_status|replace('_',' ')|title }}</span>{% endif %}{% if case.match_method %}<div class="small muted">{{ case.match_method|replace('+', ' + ') }} · score {{ case.match_score }}</div>{% endif %}</div></td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+  <div class="pagination"><span class="muted small">Showing {{ pagination.from }}–{{ pagination.to }} of {{ pagination.total }}</span><div class="pagination-nav">{% if pagination.has_prev %}<a class="btn small-btn" href="{{ url_for('gaca_cases', q=query, mapping=mapping, page=pagination.page-1) }}">← Previous</a>{% endif %}<span class="small muted">Page {{ pagination.page }} of {{ pagination.pages }}</span>{% if pagination.has_next %}<a class="btn small-btn" href="{{ url_for('gaca_cases', q=query, mapping=mapping, page=pagination.page+1) }}">Next →</a>{% endif %}</div></div>
+  {% else %}
+  <div class="empty"><div class="empty-icon">G</div><h2>No GACA cases found</h2><p class="muted">Run the read-only sync. If Nafath is required, the Telegram bot will show the approval number.</p></div>
+  {% endif %}
+</section>
+{% endblock %}

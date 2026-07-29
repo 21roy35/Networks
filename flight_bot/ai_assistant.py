@@ -473,6 +473,7 @@ class ClaudeAssistant:
             "status", "list_flights", "flight_details",
             "flight_status", "case_recommendation", "complaint_readiness",
             "list_complaints", "complaint_details", "complaint_responses",
+            "gaca_account_cases", "sync_gaca_account",
             "search_email", "show_evidence", "latest_screenshot",
             "portal_status", "explain_portal_failure",
             "profile_details", "list_passengers", "scan_mailbox",
@@ -516,6 +517,9 @@ class ClaudeAssistant:
             "mailbox": catalog.get("mailbox") or {},
             "flights": (catalog.get("flights") or [])[:20],
             "complaints": (catalog.get("complaints") or [])[:20],
+            "gaca_account_cases": (
+                catalog.get("gaca_account_cases") or [])[:30],
+            "gaca_account_sync": catalog.get("gaca_account_sync") or {},
             "passengers": (catalog.get("passengers") or [])[:30],
             "available_images": catalog.get("available_images") or {},
             "recent_portal_jobs": (catalog.get("recent_portal_jobs") or [])[:5],
@@ -544,6 +548,10 @@ class ClaudeAssistant:
             "record. Use list_flights or list_complaints only for an explicit list, "
             "all records, or multiple results. Use show_evidence for incident/"
             "complaint photos and latest_screenshot for portal screenshots. "
+            "Use gaca_account_cases when the user asks what complaints or cases "
+            "exist in their signed-in GACA account, including GACA status or "
+            "mapping. Use sync_gaca_account only for an explicit request to log "
+            "in to, fetch, refresh, or synchronize the GACA account. "
             "Use flight_status when the user asks whether a flight is on time, "
             "delayed, cancelled, airborne, landed, where it is, or asks for a live "
             "refresh. Use case_recommendation when the user asks what they should do, "
@@ -562,7 +570,8 @@ class ClaudeAssistant:
             "Use scan_mailbox only for an "
             "explicit request to check/sync/fetch mail now. Use profile_details for "
             "stored contact, National ID, or loyalty details. The available actions "
-            "are read-only except scan_mailbox and generating a private web link. "
+            "are read-only except scan_mailbox, sync_gaca_account, and generating "
+            "a private web link. "
             "Do not route requests to file, submit, retry, cancel, close, or escalate "
             "a complaint; explain in reply that the user should identify the flight "
             "and describe the incident in the existing complaint flow. reply should "

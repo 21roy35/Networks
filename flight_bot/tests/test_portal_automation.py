@@ -1938,11 +1938,17 @@ def test_gaca_nafath_walks_tab_and_national_id_screen(monkeypatch):
     page = Page()
     filled = []
     updates = []
+    nafath_clicks = 0
 
     def click(_page, names):
+        nonlocal nafath_clicks
         if any("Nafath" in name for name in names):
+            nafath_clicks += 1
             page.url = (
-                "https://myeservices.gaca.gov.sa/eservices/login/nafath")
+                "https://myeservices.gaca.gov.sa/eservices/dashboard"
+                if nafath_clicks > 1 else
+                "https://myeservices.gaca.gov.sa/eservices/login/nafath"
+            )
             return True
         if any("Login" in name for name in names):
             page.url = "https://myeservices.gaca.gov.sa/eservices/dashboard"

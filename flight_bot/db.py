@@ -191,6 +191,47 @@ CREATE TABLE IF NOT EXISTS portal_jobs (
     FOREIGN KEY (complaint_id) REFERENCES complaints(id)
 );
 
+CREATE TABLE IF NOT EXISTS gaca_account_cases (
+    case_key TEXT PRIMARY KEY,
+    reference TEXT,
+    status TEXT,
+    service_type TEXT,
+    airline TEXT,
+    flight_number TEXT,
+    flight_date TEXT,
+    airline_reference TEXT,
+    ticket_number TEXT,
+    pnr TEXT,
+    passenger_name TEXT,
+    origin TEXT,
+    destination TEXT,
+    category TEXT,
+    submitted_at TEXT,
+    complaint_text TEXT,
+    source_url TEXT,
+    raw_json TEXT NOT NULL DEFAULT '{}',
+    mapped_complaint_id INTEGER REFERENCES complaints(id),
+    mapped_flight_key TEXT,
+    mapping_status TEXT NOT NULL DEFAULT 'unmapped',
+    match_method TEXT,
+    match_score INTEGER NOT NULL DEFAULT 0,
+    first_seen_at TEXT DEFAULT (datetime('now', 'localtime')),
+    last_seen_at TEXT DEFAULT (datetime('now', 'localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS gaca_account_sync (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    status TEXT NOT NULL,
+    message TEXT,
+    cases_seen INTEGER NOT NULL DEFAULT 0,
+    cases_mapped INTEGER NOT NULL DEFAULT 0,
+    cases_reconciled INTEGER NOT NULL DEFAULT 0,
+    cases_ambiguous INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT,
+    last_success_at TEXT,
+    screenshot_file TEXT
+);
+
 CREATE TABLE IF NOT EXISTS ai_profile_cache (
     passenger_key TEXT PRIMARY KEY,
     evidence_hash TEXT NOT NULL,
@@ -243,6 +284,11 @@ CREATE INDEX IF NOT EXISTS idx_telegram_messages_created
     ON telegram_messages(created_at, id);
 CREATE INDEX IF NOT EXISTS idx_portal_jobs_updated
     ON portal_jobs(updated_at, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gaca_account_reference_unique
+    ON gaca_account_cases(lower(trim(reference)))
+    WHERE reference IS NOT NULL AND length(trim(reference)) > 0;
+CREATE INDEX IF NOT EXISTS idx_gaca_account_mapping
+    ON gaca_account_cases(mapping_status, mapped_flight_key, last_seen_at);
 CREATE INDEX IF NOT EXISTS idx_flight_status_observations_lookup
     ON flight_status_observations(flight_key, observed_at DESC, id DESC);
 """
@@ -1758,6 +1804,272 @@ def reconcile_portal_confirmation(complaint_id: int, reference: str) -> bool:
     return True
 
 
+def upsert_gaca_account_case(case: dict, mapping: dict | None = None) -> bool:
+    """Persist one read-only case imported from the signed-in GACA account."""
+    mapping = dict(mapping or {})
+    reference = str(case.get("reference") or "").strip().upper()
+    source_url = str(case.get("source_url") or "").strip()
+    case_key = str(case.get("case_key") or reference or "").strip()
+    if not case_key:
+        fingerprint = json.dumps(
+            case, ensure_ascii=False, sort_keys=True, default=str)
+        case_key = "account:" + hashlib.sha256(
+            fingerprint.encode("utf-8")).hexdigest()[:32]
+    raw = case.get("raw")
+    if not isinstance(raw, dict):
+        raw = {
+            key: value for key, value in case.items()
+            if key not in {"raw", "case_key"}
+        }
+    fields = (
+        "status", "service_type", "airline", "flight_number", "flight_date",
+        "airline_reference", "ticket_number", "pnr", "passenger_name",
+        "origin", "destination", "category", "submitted_at", "complaint_text",
+    )
+    values = {
+        field: str(case.get(field) or "").strip()
+        for field in fields
+    }
+    mapped_id = mapping.get("complaint_id")
+    if mapped_id not in (None, ""):
+        mapped_id = int(mapped_id)
+    mapped_key = str(mapping.get("flight_key") or "").strip() or None
+    mapping_status = str(
+        mapping.get("status") or (
+            "mapped" if mapped_id else "unmapped"
+        )
+    ).strip()
+    with connect() as conn:
+        existed = conn.execute(
+            "SELECT 1 FROM gaca_account_cases WHERE case_key=?",
+            (case_key,),
+        ).fetchone()
+        conn.execute(
+            """INSERT INTO gaca_account_cases (
+                   case_key, reference, status, service_type, airline,
+                   flight_number, flight_date, airline_reference,
+                   ticket_number, pnr, passenger_name, origin, destination,
+                   category, submitted_at, complaint_text, source_url,
+                   raw_json, mapped_complaint_id, mapped_flight_key,
+                   mapping_status, match_method, match_score
+               ) VALUES (
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   ?, ?, ?, ?, ?
+               )
+               ON CONFLICT(case_key) DO UPDATE SET
+                   reference=COALESCE(NULLIF(excluded.reference, ''), reference),
+                   status=COALESCE(NULLIF(excluded.status, ''), status),
+                   service_type=COALESCE(
+                       NULLIF(excluded.service_type, ''), service_type),
+                   airline=COALESCE(NULLIF(excluded.airline, ''), airline),
+                   flight_number=COALESCE(
+                       NULLIF(excluded.flight_number, ''), flight_number),
+                   flight_date=COALESCE(
+                       NULLIF(excluded.flight_date, ''), flight_date),
+                   airline_reference=COALESCE(
+                       NULLIF(excluded.airline_reference, ''),
+                       airline_reference),
+                   ticket_number=COALESCE(
+                       NULLIF(excluded.ticket_number, ''), ticket_number),
+                   pnr=COALESCE(NULLIF(excluded.pnr, ''), pnr),
+                   passenger_name=COALESCE(
+                       NULLIF(excluded.passenger_name, ''), passenger_name),
+                   origin=COALESCE(NULLIF(excluded.origin, ''), origin),
+                   destination=COALESCE(
+                       NULLIF(excluded.destination, ''), destination),
+                   category=COALESCE(NULLIF(excluded.category, ''), category),
+                   submitted_at=COALESCE(
+                       NULLIF(excluded.submitted_at, ''), submitted_at),
+                   complaint_text=COALESCE(
+                       NULLIF(excluded.complaint_text, ''), complaint_text),
+                   source_url=COALESCE(
+                       NULLIF(excluded.source_url, ''), source_url),
+                   raw_json=excluded.raw_json,
+                   mapped_complaint_id=excluded.mapped_complaint_id,
+                   mapped_flight_key=NULLIF(
+                       excluded.mapped_flight_key, ''),
+                   mapping_status=excluded.mapping_status,
+                   match_method=excluded.match_method,
+                   match_score=excluded.match_score,
+                   last_seen_at=datetime('now', 'localtime')""",
+            (
+                case_key, reference, values["status"], values["service_type"],
+                values["airline"], values["flight_number"],
+                values["flight_date"], values["airline_reference"],
+                values["ticket_number"], values["pnr"],
+                values["passenger_name"], values["origin"],
+                values["destination"], values["category"],
+                values["submitted_at"], values["complaint_text"], source_url,
+                json.dumps(raw, ensure_ascii=False, default=str),
+                mapped_id, mapped_key, mapping_status,
+                str(mapping.get("method") or "").strip(),
+                int(mapping.get("score") or 0),
+            ),
+        )
+    return not bool(existed)
+
+
+def list_gaca_account_cases(limit: int = 500) -> list[dict]:
+    """Return imported GACA cases, including their mapped local flight."""
+    limit = max(1, min(int(limit or 500), 2000))
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT gac.*, f.id AS flight_id, f.data AS flight_data,
+                      c.status AS local_complaint_status,
+                      c.reference AS local_complaint_reference
+               FROM gaca_account_cases gac
+               LEFT JOIN flights f ON f.flight_key=gac.mapped_flight_key
+               LEFT JOIN complaints c ON c.id=gac.mapped_complaint_id
+               ORDER BY COALESCE(gac.submitted_at, gac.last_seen_at) DESC,
+                        gac.case_key DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["raw"] = json.loads(item.pop("raw_json") or "{}")
+        except (TypeError, ValueError):
+            item["raw"] = {}
+            item.pop("raw_json", None)
+        try:
+            item["flight_data"] = (
+                json.loads(item["flight_data"])
+                if item.get("flight_data") else {}
+            )
+        except (TypeError, ValueError):
+            item["flight_data"] = {}
+        result.append(item)
+    return result
+
+
+def get_gaca_account_sync() -> dict:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM gaca_account_sync WHERE id=1").fetchone()
+    return dict(row) if row else {
+        "status": "never_synced", "message": "",
+        "cases_seen": 0, "cases_mapped": 0,
+        "cases_reconciled": 0, "cases_ambiguous": 0,
+        "last_attempt_at": None, "last_success_at": None,
+        "screenshot_file": None,
+    }
+
+
+def save_gaca_account_sync(
+        status: str,
+        message: str,
+        *,
+        cases_seen: int = 0,
+        cases_mapped: int = 0,
+        cases_reconciled: int = 0,
+        cases_ambiguous: int = 0,
+        screenshot_file: str | None = None,
+) -> None:
+    succeeded = str(status) == "success"
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO gaca_account_sync (
+                   id, status, message, cases_seen, cases_mapped,
+                   cases_reconciled, cases_ambiguous, last_attempt_at,
+                   last_success_at, screenshot_file
+               ) VALUES (
+                   1, ?, ?, ?, ?, ?, ?,
+                   datetime('now', 'localtime'),
+                   CASE WHEN ? THEN datetime('now', 'localtime') END,
+                   ?
+               )
+               ON CONFLICT(id) DO UPDATE SET
+                   status=excluded.status,
+                   message=excluded.message,
+                   cases_seen=excluded.cases_seen,
+                   cases_mapped=excluded.cases_mapped,
+                   cases_reconciled=excluded.cases_reconciled,
+                   cases_ambiguous=excluded.cases_ambiguous,
+                   last_attempt_at=excluded.last_attempt_at,
+                   last_success_at=CASE
+                       WHEN ? THEN excluded.last_success_at
+                       ELSE gaca_account_sync.last_success_at
+                   END,
+                   screenshot_file=COALESCE(
+                       excluded.screenshot_file,
+                       gaca_account_sync.screenshot_file)""",
+            (
+                str(status), str(message)[:2000], int(cases_seen),
+                int(cases_mapped), int(cases_reconciled),
+                int(cases_ambiguous), int(succeeded), screenshot_file,
+                int(succeeded),
+            ),
+        )
+
+
+def reconcile_gaca_account_case(
+        case_key: str,
+        complaint_id: int,
+        reference: str,
+) -> bool:
+    """Use a signed-in GACA account record as authoritative acceptance."""
+    reference = str(reference or "").strip().upper()
+    if not reference:
+        return False
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        target = conn.execute(
+            "SELECT * FROM complaints WHERE id=? AND kind='gaca'",
+            (int(complaint_id),),
+        ).fetchone()
+        imported = conn.execute(
+            "SELECT * FROM gaca_account_cases WHERE case_key=?",
+            (str(case_key),),
+        ).fetchone()
+        if not target or not imported:
+            return False
+        duplicate = conn.execute(
+            """SELECT id FROM complaints
+               WHERE kind='gaca'
+                 AND lower(trim(reference))=lower(trim(?))
+                 AND id != ?
+               LIMIT 1""",
+            (reference, int(complaint_id)),
+        ).fetchone()
+        if duplicate:
+            return False
+        conn.execute(
+            """UPDATE complaints
+               SET status='submitted', reference=?
+               WHERE id=?""",
+            (reference, int(complaint_id)),
+        )
+        conn.execute(
+            """UPDATE portal_jobs
+               SET status='submitted', terminal=1, reference=?,
+                   next_attempt_at=NULL, lease_until=NULL, last_error=NULL,
+                   message=?,
+                   updated_at=datetime('now', 'localtime')
+               WHERE complaint_id=? AND kind='gaca'
+                 AND status NOT IN ('superseded', 'cancelled')""",
+            (
+                reference,
+                "Reconciled from the signed-in GACA account. The regulator "
+                "case exists, so no duplicate submission was made.",
+                int(complaint_id),
+            ),
+        )
+        conn.execute(
+            """UPDATE gaca_account_cases
+               SET reference=?, mapped_complaint_id=?,
+                   mapped_flight_key=?, mapping_status='reconciled',
+                   last_seen_at=datetime('now', 'localtime')
+               WHERE case_key=?""",
+            (
+                reference, int(complaint_id), str(target["flight_key"] or ""),
+                str(case_key),
+            ),
+        )
+    return True
+
+
 def claim_portal_job(job_id: str, lease_seconds: int = 20 * 60) -> dict | None:
     """Atomically lease one queued portal job for a browser worker."""
     now = time.time()
@@ -2006,6 +2318,8 @@ def reset():
         conn.execute("DELETE FROM flight_status_observations")
         conn.execute("DELETE FROM complaint_responses")
         conn.execute("DELETE FROM complaint_response_state")
+        conn.execute("DELETE FROM gaca_account_cases")
+        conn.execute("DELETE FROM gaca_account_sync")
         conn.execute("DELETE FROM flight_emails")
         conn.execute("DELETE FROM flights")
         conn.execute("DELETE FROM emails")

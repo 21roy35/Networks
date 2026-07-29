@@ -11,6 +11,7 @@ from flight_bot import db
 from flight_bot.config import DEFAULTS
 from flight_bot.pipeline import ingest, load_demo
 from flight_bot.portal_automation import PortalResult, _annotate_grid, _parse_cells
+from flight_bot.gaca_account import GacaAccountSyncResult
 from flight_bot.telegram_bot import TelegramAPI, TelegramCoordinator
 from flight_bot import telegram_bot
 from flight_bot.web_access import verify_web_token
@@ -449,6 +450,29 @@ def test_web_command_returns_short_lived_private_link(coordinator):
     assert button["url"].startswith("http://flightdeck.example:5000/?access=")
     token = button["url"].split("?access=", 1)[1]
     assert verify_web_token("test-web-secret", token, 900)
+
+
+def test_gaca_command_starts_read_only_account_sync(coordinator, monkeypatch):
+    bot, api = coordinator
+    captured = {}
+
+    def fake_sync(config, update, *, allow_login=False):
+        captured["allow_login"] = allow_login
+        update("opening", "Opening GACA account", None)
+        return GacaAccountSyncResult(
+            "success", "Imported 2 GACA cases.", cases_seen=2,
+            cases_mapped=2)
+
+    monkeypatch.setattr(telegram_bot, "sync_gaca_account", fake_sync)
+    bot.handle_update({"message": {
+        "message_id": 80, "chat": {"id": 42}, "text": "/gaca"}})
+    bot._gaca_sync_thread.join(2)
+
+    assert captured["allow_login"] is True
+    assert any("read-only GACA account sync" in item["text"]
+               for item in api.messages)
+    assert any("Imported 2 GACA cases" in item["text"]
+               for item in api.messages)
 
 
 def test_issue_text_and_photo_auto_file_to_official_portal(

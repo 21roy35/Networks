@@ -28,6 +28,7 @@ from .complaints import complaint_payload, missing_portal_fields
 from .config import TELEGRAM_EVIDENCE_DIR, passenger_profile_key
 from .flight_status import (get_flight_status, live_landed, parse_flight_time,
                             refresh_flight_status, schedule_has_finished)
+from .gaca_account import sync_gaca_account
 from .mail_client import fetch_recent_verification_message
 from .pipeline import scan_mailbox
 from .portal_automation import (PortalResult, _extract_reference, set_ai_handler,
@@ -278,6 +279,7 @@ class TelegramAPI:
             {"command": "status", "description": "Show FlightDeck status"},
             {"command": "flightstatus", "description": "Refresh a flight status"},
             {"command": "recommend", "description": "Best complaint next step"},
+            {"command": "gaca", "description": "Sync your GACA complaint account"},
             {"command": "web", "description": "Open the private dashboard"},
             {"command": "cancel", "description": "Cancel pending issue intake"},
         ]
@@ -339,6 +341,9 @@ class TelegramCoordinator:
         self._ai_chat_lock = threading.Lock()
         self._ai_chat_thread: threading.Thread | None = None
         self._ai_context: dict[str, object] = {}
+        self._gaca_sync_lock = threading.Lock()
+        self._gaca_sync_thread: threading.Thread | None = None
+        self._last_gaca_sync = 0.0
         # Legacy floor kept for migrations/tests; FIFO response matching is disabled.
         self._fifo_response_floor = db.initialize_fifo_response_floor()
 
@@ -622,6 +627,7 @@ class TelegramCoordinator:
                 self.ask_for_pending_references()
                 self.resume_pending_parent_escalations()
                 self.auto_escalate_due_complaints()
+                self._maybe_sync_gaca_account()
                 # The dedicated resume loop and this slower monitor loop both
                 # use a one-job lease.  The portal worker's global browser
                 # lock then guarantees that only one official-site request
@@ -743,6 +749,9 @@ class TelegramCoordinator:
             self._send_case_recommendation(
                 {"query": query, "latest": not query}, question=text)
             return
+        if text and text.split(maxsplit=1)[0].lower() == "/gaca":
+            self.start_gaca_account_sync(manual=True)
+            return
         if text and text.split(maxsplit=1)[0].lower() == "/web":
             self._send_web_link()
             return
@@ -849,15 +858,112 @@ class TelegramCoordinator:
             f"{status_counts['observations']} source observation(s) are persisted."
             if status_sources else
             " Live flight evidence is using booking and schedule data only.")
+        gaca_sync = db.get_gaca_account_sync()
+        if gaca_sync.get("last_success_at"):
+            gaca_status = (
+                f" GACA account last synced at "
+                f"{gaca_sync['last_success_at']}; "
+                f"{gaca_sync.get('cases_seen') or 0} regulator case(s) "
+                "were seen.")
+        elif gaca_sync.get("status") == "auth_required":
+            gaca_status = (
+                " GACA account sync needs a fresh Nafath login; send /gaca.")
+        else:
+            gaca_status = " GACA account sync is waiting for its first run."
         return (
             f"FlightDeck is running. {counts['flights']} flights, "
             f"{counts['complaints']} complaints, {counts['emails']} parsed emails."
             + mailbox_status + tracking_status + ai_status + captcha_status
+            + gaca_status
             + f" GACA auto-escalation is on after {auto_days} days "
               "without a substantive airline response.")
 
     def _send_status(self):
         self.notify(self._status_text())
+
+    def _gaca_cases_buttons(self) -> dict | None:
+        settings = self.config.get("web") or {}
+        base_url = str(settings.get("public_base_url") or "").rstrip("/")
+        secret = str(settings.get("access_secret") or "")
+        if not base_url or not secret:
+            return None
+        token = create_web_token(secret, self.chat_id)
+        return {"inline_keyboard": [[{
+            "text": "Open mapped GACA cases",
+            "url": f"{base_url}/gaca-cases?access={token}",
+        }]]}
+
+    def start_gaca_account_sync(self, *, manual: bool = True) -> bool:
+        """Start one account import; a manual run may request Nafath approval."""
+        with self._gaca_sync_lock:
+            if self._gaca_sync_thread and self._gaca_sync_thread.is_alive():
+                if manual:
+                    self.notify(
+                        "The GACA account sync is already running. I will "
+                        "send the result when it finishes.")
+                return False
+            if manual:
+                self.notify(
+                    "Starting a read-only GACA account sync. I will ask for "
+                    "Nafath approval only if the saved session has expired.")
+            self._gaca_sync_thread = threading.Thread(
+                target=self._run_gaca_account_sync,
+                args=(manual,),
+                name="gaca-account-sync",
+                daemon=True,
+            )
+            self._gaca_sync_thread.start()
+        return True
+
+    def _run_gaca_account_sync(self, manual: bool):
+        last_stage = {"value": ""}
+
+        def progress(stage: str, message: str, image: bytes | None = None):
+            # Automatic refreshes are quiet unless they discover something.
+            if not manual:
+                return
+            if stage == last_stage["value"] and not image:
+                return
+            last_stage["value"] = stage
+            if image:
+                self._send_photo(image, message)
+            elif stage not in {"submitted", "error"}:
+                self.notify(message)
+
+        result = sync_gaca_account(
+            self.config, progress, allow_login=manual)
+        if result.status == "success":
+            should_report = manual or result.new_cases or result.cases_reconciled
+            if should_report:
+                image = b""
+                if result.screenshot_file:
+                    try:
+                        image = Path(result.screenshot_file).read_bytes()
+                    except OSError:
+                        image = b""
+                if image:
+                    self._send_photo(
+                        image, result.message,
+                        buttons=self._gaca_cases_buttons())
+                else:
+                    self.notify(
+                        result.message, buttons=self._gaca_cases_buttons())
+        elif manual:
+            self.notify(result.message)
+
+    def _maybe_sync_gaca_account(self):
+        settings = self.config.get("gaca_account") or {}
+        if not settings.get("enabled", True):
+            return
+        try:
+            interval = max(5, int(settings.get("sync_minutes", 30))) * 60
+        except (TypeError, ValueError):
+            interval = 30 * 60
+        now = time.monotonic()
+        if now - self._last_gaca_sync < interval:
+            return
+        self._last_gaca_sync = now
+        self.start_gaca_account_sync(manual=False)
 
     @staticmethod
     def _search_key(value: object) -> str:
@@ -1036,6 +1142,14 @@ class TelegramCoordinator:
                     "updated_at",
                 )
             } | {"has_screenshot": bool(job.get("screenshot_file"))})
+        gaca_account_cases = [{
+            key: item.get(key) for key in (
+                "reference", "status", "airline", "airline_reference",
+                "flight_number", "flight_date", "ticket_number", "pnr",
+                "passenger_name", "category", "mapping_status",
+                "mapped_flight_key", "match_method",
+            )
+        } for item in db.list_gaca_account_cases(30)]
         with self._lock:
             verification_kind = (self._verification.kind
                                  if self._verification else "")
@@ -1046,6 +1160,8 @@ class TelegramCoordinator:
             "mailbox": db.mailbox_cursor_summary(),
             "flights": flights,
             "complaints": complaints,
+            "gaca_account_cases": gaca_account_cases,
+            "gaca_account_sync": db.get_gaca_account_sync(),
             "passengers": [{
                 "name": profile.get("booking_name") or "",
                 "role": "owner" if index == 0 else "family",
@@ -1556,6 +1672,62 @@ class TelegramCoordinator:
         )))
         return True
 
+    def _send_gaca_account_cases(self, action: dict) -> bool:
+        rows = db.list_gaca_account_cases()
+        reference = self._search_key(action.get("reference"))
+        flight_number = self._search_key(action.get("flight_number"))
+        pnr = self._search_key(action.get("pnr"))
+        passenger = passenger_profile_key(action.get("passenger") or "")
+        query = str(action.get("query") or "").strip().casefold()
+        if reference:
+            rows = [item for item in rows if reference in {
+                self._search_key(item.get("reference")),
+                self._search_key(item.get("airline_reference")),
+            }]
+        if flight_number:
+            rows = [item for item in rows if self._search_key(
+                item.get("flight_number")) == flight_number]
+        if pnr:
+            rows = [item for item in rows if self._search_key(
+                item.get("pnr")) == pnr]
+        if passenger:
+            rows = [item for item in rows if passenger in passenger_profile_key(
+                item.get("passenger_name") or "")]
+        if query:
+            rows = [item for item in rows if query in " ".join(
+                str(item.get(field) or "") for field in (
+                    "reference", "status", "airline", "airline_reference",
+                    "flight_number", "flight_date", "ticket_number", "pnr",
+                    "passenger_name", "category", "mapping_status",
+                )).casefold()]
+        if action.get("latest") and rows:
+            rows = rows[:1]
+        limit = max(1, min(int(action.get("limit") or 8), 10))
+        if not rows:
+            state = db.get_gaca_account_sync()
+            if state.get("status") in {"never_synced", "auth_required"}:
+                self.notify(
+                    "No imported GACA account cases are available yet. Send "
+                    "/gaca to sign in with Nafath and synchronize them.")
+            else:
+                self.notify(
+                    "No imported GACA account case matched those exact details.")
+            return True
+        lines = ["GACA account cases:"]
+        for item in rows[:limit]:
+            lines.append(
+                f"• {item.get('reference') or 'reference unavailable'} | "
+                f"{item.get('status') or 'status unavailable'} | "
+                f"{item.get('airline') or 'airline unavailable'} "
+                f"{item.get('flight_number') or ''} | "
+                f"airline ref {item.get('airline_reference') or 'not shown'} | "
+                f"{item.get('passenger_name') or 'passenger not shown'} | "
+                f"{str(item.get('mapping_status') or 'unmapped').replace('_', ' ')}"
+            )
+        self.notify(
+            "\n".join(lines), buttons=self._gaca_cases_buttons())
+        return True
+
     def _execute_ai_action(self, action: dict) -> bool:
         name = action.get("name")
         if name == "status":
@@ -1612,6 +1784,11 @@ class TelegramCoordinator:
                     f"â€¢ {self._complaint_summary(item)}"
                     for item in complaints[:limit]))
             return True
+        if name == "gaca_account_cases":
+            return self._send_gaca_account_cases(action)
+        if name == "sync_gaca_account":
+            self.start_gaca_account_sync(manual=True)
+            return True
         if name == "complaint_responses":
             return self._send_response_details(action)
         if name == "search_email":
@@ -1637,8 +1814,9 @@ class TelegramCoordinator:
                 "Ask naturally about flights, PNRs, passengers, complaint "
                 "references, airline responses, stored email, evidence photos, "
                 "portal screenshots, live flight status, complaint readiness, the "
-                "best next action, or a fresh Gmail sync. Existing "
-                "/status, /web, /cancel, post-flight, verification, and complaint "
+                "best next action, a fresh Gmail sync, or GACA account cases. "
+                "Existing /status, /gaca, /web, /cancel, post-flight, "
+                "verification, and complaint "
                 "flows keep priority.")
             return True
         return False

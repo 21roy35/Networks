@@ -3532,11 +3532,28 @@ def _start_gaca_nafath(page, payload: dict, update) -> str:
     if not filled:
         return "manual"
 
-    if not _click(page, [r"^Login$", r"^Sign\s*in$", r"^تسجيل\s*الدخول$"]):
+    # The current portal labels the National-ID submit button "Nafath".
+    # Older deployments used "Login" or "Sign in".
+    clicked = _click(page, [r"^Nafath$"]) or _click(
+        page, [r"^Login$", r"^Sign\s*in$", r"^تسجيل\s*الدخول$"])
+    if not clicked:
         return "manual"
+    page.wait_for_timeout(1200)
+    approval_text = re.sub(r"\s+", " ", _body_text(page)).strip()
+    approval_match = re.search(
+        r"(?:code below|verification code|approval (?:code|number))"
+        r"[^0-9]{0,80}(\d{2})\b",
+        approval_text,
+        re.I,
+    )
+    approval_suffix = (
+        f" Approve number {approval_match.group(1)} in the Nafath app."
+        if approval_match else ""
+    )
     update(
         "verification",
-        "GACA accepted the National ID request. Waiting for Nafath approval…",
+        "GACA accepted the National ID request. Waiting for Nafath approval."
+        + approval_suffix,
         _page_screenshot(page))
 
     deadline = time.monotonic() + 15

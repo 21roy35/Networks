@@ -33,6 +33,7 @@ def test_primary_pages_render(client):
     assert b"Your inbox, turned into answers" in response.data
 
     assert client.get("/emails").status_code == 200
+    assert client.get("/gaca-cases").status_code == 200
     assert client.get("/healthz").json == {
         "status": "ok", "emails": 7, "flights": 3, "complaints": 0}
 

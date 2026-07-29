@@ -85,6 +85,11 @@ DEFAULTS = {
         "smtp_host": "smtp.gmail.com",
         "smtp_port": 465,
     },
+    "gaca_account": {
+        "enabled": True,
+        "sync_minutes": 30,
+        "max_cases": 200,
+    },
     "ai": {
         "enabled": False,
         "provider": "anthropic",

@@ -59,6 +59,7 @@ _TEMPLATES = Path(__file__).resolve().parent / "templates"
 _REQUIRED_TEMPLATES = (
     "base.html", "index.html", "flight.html", "complaint.html",
     "portal_status.html", "profile.html", "scan.html", "emails.html",
+    "gaca_cases.html",
 )
 
 
@@ -1239,6 +1240,70 @@ def create_app(config: dict) -> Flask:
             query=query, status=status, email_total=db.counts()["emails"],
             linked_total=linked_total,
             unlinked_total=db.counts()["emails"] - linked_total)
+
+    @app.route("/gaca-cases")
+    def gaca_cases():
+        rows = db.list_gaca_account_cases()
+        query = request.args.get("q", "").strip()
+        mapping = request.args.get("mapping", "all").strip()
+        total = len(rows)
+        mapped_total = sum(
+            item.get("mapping_status") in {"mapped", "reconciled", "flight_only"}
+            for item in rows
+        )
+        ambiguous_total = sum(
+            item.get("mapping_status") == "ambiguous" for item in rows)
+        if query:
+            folded = query.casefold()
+            rows = [
+                item for item in rows
+                if folded in " ".join(str(value or "") for value in (
+                    item.get("reference"), item.get("status"),
+                    item.get("airline"), item.get("airline_reference"),
+                    item.get("flight_number"), item.get("flight_date"),
+                    item.get("ticket_number"), item.get("pnr"),
+                    item.get("passenger_name"), item.get("origin"),
+                    item.get("destination"), item.get("category"),
+                )).casefold()
+            ]
+        if mapping == "mapped":
+            rows = [
+                item for item in rows
+                if item.get("mapping_status") in {
+                    "mapped", "reconciled", "flight_only"}
+            ]
+        elif mapping == "review":
+            rows = [
+                item for item in rows
+                if item.get("mapping_status") in {"ambiguous", "unmapped"}
+            ]
+        elif mapping != "all":
+            mapping = "all"
+        cases_page, pagination = _paginate(rows, _page_number(), 50)
+        return render_template(
+            "gaca_cases.html",
+            cases=cases_page,
+            pagination=pagination,
+            query=query,
+            mapping=mapping,
+            total=total,
+            mapped_total=mapped_total,
+            ambiguous_total=ambiguous_total,
+            sync=db.get_gaca_account_sync(),
+        )
+
+    @app.post("/gaca-cases/sync")
+    def sync_gaca_cases():
+        starter = getattr(telegram, "start_gaca_account_sync", None)
+        if not starter:
+            flash("Telegram must be connected before GACA Nafath sync can run.")
+        elif starter(manual=True):
+            flash(
+                "GACA account sync started. Approve Nafath in Telegram if "
+                "the saved session has expired.")
+        else:
+            flash("The GACA account sync is already running.")
+        return redirect(url_for("gaca_cases"))
 
     @app.route("/healthz")
     def healthz():
