@@ -679,14 +679,22 @@ def create_app(config: dict) -> Flask:
             reference, trusted_sender, body, event_id)
         if telegram:
             if attached_complaint_id:
-                telegram.notify(
-                    f"Captured aviation complaint reference {reference} from "
-                    f"SMS and attached it to complaint #{attached_complaint_id}.")
+                final_notifier = getattr(
+                    telegram, "notify_reference_reconciled", None)
+                if callable(final_notifier):
+                    final_notifier(
+                        attached_complaint_id, reference, source="SMS")
+                else:
+                    telegram.notify(
+                        f"Captured aviation complaint reference {reference} "
+                        f"from SMS and attached it to complaint "
+                        f"#{attached_complaint_id}.")
             else:
                 telegram.check_complaint_responses()
-            telegram.notify(
-                f"📱 FlightDeck received an airline SMS from {sender or 'unknown sender'} "
-                "and checked it against active complaints.")
+                telegram.notify(
+                    "FlightDeck received an airline SMS from "
+                    f"{sender or 'unknown sender'} and checked it against "
+                    "active complaints.")
         return jsonify(
             ok=True, duplicate=False, mail_event_id=event_id,
             reference=reference, attached_complaint_id=attached_complaint_id,

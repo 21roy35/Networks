@@ -206,6 +206,65 @@ def test_internal_sms_reconciles_sent_gaca_without_reference(
     assert job["reference"] == "GACA-483921"
 
 
+def test_reconciled_sms_emits_one_final_notification(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightbot.db")
+    config = deepcopy(DEFAULTS)
+    config["sms"]["ingest_secret"] = "shared-test-secret"
+
+    class Telegram:
+        def __init__(self):
+            self.final = []
+            self.generic = []
+
+        def notify_reference_reconciled(
+                self, complaint_id, reference, *, source):
+            self.final.append((complaint_id, reference, source))
+
+        def notify(self, text):
+            self.generic.append(text)
+
+        def check_complaint_responses(self):
+            raise AssertionError("Reference was expected to reconcile.")
+
+    telegram = Telegram()
+    monkeypatch.setattr(webapp, "start_telegram", lambda _config: telegram)
+    application = webapp.create_app(config)
+    application.config.update(TESTING=True)
+    client = application.test_client()
+    flight_key = "RXBOOKING|RX28|2026-06-16"
+    db.replace_flights([{
+        "flight_key": flight_key,
+        "airline_code": "RX",
+        "flight_number": "RX28",
+        "flight_numbers": ["RX28"],
+        "flight_date": "2026-06-16",
+        "pnr": "RXBOOKING",
+        "email_ids": [],
+    }])
+    complaint_id = db.begin_complaint(
+        flight_key, "gaca", "On-board service complaint")
+    db.finish_complaint(complaint_id, "accepted_pending_reference")
+    db.save_portal_job({
+        "id": "gaca-final-notification",
+        "kind": "gaca",
+        "flight_key": flight_key,
+        "complaint_id": complaint_id,
+        "status": "accepted_pending_reference",
+        "terminal": True,
+    })
+
+    response = client.post("/api/internal/sms", json={
+        "sender": "GACA CARE",
+        "message_id": "gaca-final-reference",
+        "text": "GACA تم استلام شكواكم C076574",
+    }, headers={"X-SMS-Secret": "shared-test-secret"})
+
+    assert response.status_code == 200
+    assert telegram.final == [(complaint_id, "C076574", "SMS")]
+    assert telegram.generic == []
+
+
 def test_gaca_sms_never_attaches_to_confirmed_pre_submit_failure(
         tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightbot.db")

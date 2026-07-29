@@ -283,6 +283,13 @@ class TelegramAPI:
             "sendPhoto", data,
             files={"photo": ("verification.png", image, "image/png")})
 
+    def edit_message_text(self, chat_id, message_id: int, text: str) -> dict:
+        return self.call("editMessageText", {
+            "chat_id": chat_id,
+            "message_id": int(message_id),
+            "text": text[:4096],
+        })
+
     def answer_callback(self, query_id: str, text: str = ""):
         self.call("answerCallbackQuery", {
             "callback_query_id": query_id, "text": text[:200]})
@@ -453,8 +460,18 @@ class TelegramCoordinator:
         return result
 
     def portal_progress_handler(self):
-        """Return a per-job Telegram relay with readable stage transitions."""
-        state = {"stage": "", "key": None}
+        """Return a compact per-job relay with one live status message.
+
+        Portal automation can emit dozens of small updates. Editing one anchor
+        message keeps Telegram readable, while milestone screenshots remain
+        separate evidence the user can inspect later.
+        """
+        state = {
+            "stage": "",
+            "key": None,
+            "anchor_message_id": None,
+            "photo_keys": set(),
+        }
         deliveries: queue.Queue = queue.Queue()
         worker_started = threading.Event()
         labels = {
@@ -477,14 +494,47 @@ class TelegramCoordinator:
             "needs_attention", "error", "retry_wait", "quarantined",
         }
 
+        def photo_key(status: str, message: str) -> str:
+            lowered = message.casefold()
+            if "gaca" in lowered:
+                step = re.search(
+                    r"gaca step ([1-4]) of 4 is complete", message, re.I)
+                if step:
+                    return f"gaca-step-{step.group(1)}"
+                if "final gaca page is complete" in lowered:
+                    return "gaca-final-review"
+                if status in terminal:
+                    return f"gaca-terminal-{status}"
+                return ""
+            return f"portal-{status}"
+
+        def update_anchor(text: str) -> None:
+            message_id = state["anchor_message_id"]
+            if message_id:
+                try:
+                    self.api.edit_message_text(
+                        self.chat_id, int(message_id), text)
+                    db.record_telegram_message(
+                        "outgoing", int(message_id), text, "text")
+                    return
+                except Exception as exc:
+                    logger.info(
+                        "Could not edit Telegram portal progress; sending a "
+                        "new anchor instead: %s", exc)
+            result = self.notify(text)
+            state["anchor_message_id"] = (
+                result.get("message_id") if result else None)
+
         def deliver():
             while True:
-                status, text, image = deliveries.get()
+                status, text, image, milestone = deliveries.get()
                 try:
-                    if image:
-                        self._send_photo(image, text)
-                    else:
-                        self.notify(text)
+                    update_anchor(text)
+                    if (image and milestone
+                            and milestone not in state["photo_keys"]):
+                        result = self._send_photo(image, text)
+                        if result:
+                            state["photo_keys"].add(milestone)
                 except Exception:
                     logger.exception("Telegram portal progress delivery failed")
                 finally:
@@ -517,9 +567,49 @@ class TelegramCoordinator:
                 worker_started.set()
                 threading.Thread(
                     target=deliver, name="portal-progress", daemon=True).start()
-            deliveries.put((status, text, image))
+            deliveries.put((
+                status,
+                text,
+                image,
+                photo_key(status, message) if image else "",
+            ))
 
         return relay
+
+    def notify_reference_reconciled(
+            self, complaint_id: int, reference: str,
+            *, source: str = "SMS") -> None:
+        """Send one high-signal final result instead of generic SMS chatter."""
+        complaint = db.get_complaint(int(complaint_id)) or {}
+        flight = db.get_flight_by_key(
+            str(complaint.get("flight_key") or "")) or {}
+        job = db.latest_portal_job_for_complaint(int(complaint_id)) or {}
+        flight_number = str(
+            flight.get("flight_number")
+            or job.get("flight_number")
+            or "the flight"
+        )
+        airline = str(
+            flight.get("airline_name")
+            or flight.get("airline")
+            or job.get("airline_code")
+            or "the airline"
+        )
+        text = (
+            "✅ GACA complaint submitted\n"
+            f"Flight: {flight_number} · {airline}\n"
+            f"Reference: {reference}\n"
+            f"Confirmed from the regulator {source}; no duplicate was filed."
+        )
+        screenshot = Path(str(job.get("screenshot_file") or ""))
+        try:
+            image = screenshot.read_bytes() if screenshot.is_file() else b""
+        except OSError:
+            image = b""
+        if image:
+            self._send_photo(image, text)
+        else:
+            self.notify(text)
 
     def request_verification(self, challenge: dict):
         waiter = VerificationWaiter(challenge.get("kind") or "verification")

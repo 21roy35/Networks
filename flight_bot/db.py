@@ -1998,6 +1998,19 @@ def active_portal_job_for_complaint(complaint_id: int) -> dict | None:
     return get_portal_job(str(row["id"])) if row else None
 
 
+def latest_portal_job_for_complaint(complaint_id: int) -> dict | None:
+    """Return the newest portal job, including a completed one."""
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT id FROM portal_jobs
+               WHERE complaint_id = ?
+               ORDER BY updated_at DESC, created_at DESC, id DESC
+               LIMIT 1""",
+            (int(complaint_id),),
+        ).fetchone()
+    return get_portal_job(str(row["id"])) if row else None
+
+
 def gaca_confirmation_unknown_complaint_ids() -> set[int]:
     """Return GACA complaints accepted or ambiguously sent without a reference.
 

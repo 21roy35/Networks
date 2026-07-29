@@ -22,6 +22,7 @@ class FakeAPI:
         self.messages = []
         self.photos = []
         self.deleted = []
+        self.edits = []
         self.callbacks = []
         self.counter = 100
         self.commands_registered = False
@@ -43,6 +44,15 @@ class FakeAPI:
                   "caption": caption, "image": image,
                   "reply_markup": reply_markup}
         self.photos.append(record)
+        return record
+
+    def edit_message_text(self, chat_id, message_id, text):
+        record = {
+            "message_id": message_id,
+            "chat": {"id": chat_id},
+            "text": text,
+        }
+        self.edits.append(record)
         return record
 
     def answer_callback(self, query_id, text=""):
@@ -345,14 +355,58 @@ def test_portal_progress_reports_stage_transitions_with_screenshots(coordinator)
     relay("submitting", "Form checks finished.", b"review-screen")
     relay("submitted", "Submission confirmed.")
     deadline = time.time() + 2
-    while (len(api.messages) < 2 or len(api.photos) < 2) and time.time() < deadline:
+    while (len(api.edits) < 3 or len(api.photos) < 2) and time.time() < deadline:
         time.sleep(.01)
 
     assert "Doing now: opening the official website" in api.messages[0]["text"]
     assert api.photos[0]["image"] == b"loaded-screen"
     assert "Finished: opening the official website" in api.photos[0]["caption"]
     assert "Doing now: filling the complaint form" in api.photos[0]["caption"]
+    assert len(api.messages) == 1
     assert len(api.photos) == 2
+    assert "Result: complaint submitted" in api.edits[-1]["text"]
+
+
+def test_reference_reconciliation_sends_one_final_screenshot(coordinator):
+    bot, api = coordinator
+    db.replace_flights([{
+        "flight_key": "RXBOOKING|RX28|2026-06-16",
+        "airline_code": "RX",
+        "airline_name": "Riyadh Air",
+        "flight_number": "RX28",
+        "flight_date": "2026-06-16",
+        "email_ids": [],
+    }])
+    complaint_id = db.begin_complaint(
+        "RXBOOKING|RX28|2026-06-16",
+        "gaca",
+        "On-board service complaint",
+    )
+    screenshot = telegram_bot.TELEGRAM_EVIDENCE_DIR / "gaca-success.png"
+    screenshot.parent.mkdir(parents=True, exist_ok=True)
+    screenshot.write_bytes(b"success-screen")
+    db.save_portal_job({
+        "id": "gaca-final",
+        "kind": "gaca",
+        "flight_key": "RXBOOKING|RX28|2026-06-16",
+        "flight_number": "RX28",
+        "complaint_id": complaint_id,
+        "status": "submitted",
+        "reference": "C076574",
+        "terminal": True,
+        "screenshot_file": str(screenshot),
+    })
+
+    bot.notify_reference_reconciled(
+        complaint_id, "C076574", source="SMS")
+
+    assert len(api.photos) == 1
+    assert api.photos[0]["image"] == b"success-screen"
+    assert "RX28" in api.photos[0]["caption"]
+    assert "Riyadh Air" in api.photos[0]["caption"]
+    assert "C076574" in api.photos[0]["caption"]
+    assert "no duplicate" in api.photos[0]["caption"]
+    assert api.messages == []
 
 
 def test_due_flight_gets_one_telegram_survey(coordinator):
