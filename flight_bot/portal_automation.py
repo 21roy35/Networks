@@ -3416,7 +3416,7 @@ def _selectize_by_label(page, label_pattern: str, query: str,
 
 
 _GACA_CITY_NAMES = {
-    "AHB": "Abha", "BAH": "Bahrain", "CAI": "Cairo",
+    "AHB": "Abha", "BAH": "Manama", "CAI": "Cairo",
     "DMM": "Dammam", "DXB": "Dubai", "JED": "Jeddah",
     "LHR": "London", "MED": "Madinah", "NUM": "Neom",
     "RUH": "Riyadh",

@@ -1923,6 +1923,7 @@ def test_gaca_normalizes_saudia_and_local_mobile_number():
     assert portal_automation._gaca_airline_label({
         "airline_code": "SV", "airline_name": "Saudia"
     }) == "Saudi Arabian Airlines"
+    assert portal_automation._GACA_CITY_NAMES["BAH"] == "Manama"
     assert portal_automation._gaca_mobile({
         "country_code": "+966", "phone": "+966599491494"
     }) == "599491494"
