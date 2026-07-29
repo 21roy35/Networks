@@ -519,11 +519,11 @@ def test_substantive_airline_response_offers_gaca_escalation(coordinator):
         "body": "We reviewed CAS-778899 and declined compensation. The case is closed.",
     })
     bot.check_complaint_responses()
-    assert len(api.messages) == 2
+    assert len(api.messages) == 1
     assert "responded" in api.messages[0]["text"]
-    assert "saved profile still needs" in api.messages[1]["text"]
     buttons = api.messages[0]["reply_markup"]["inline_keyboard"][0]
     assert buttons[0]["callback_data"].startswith("escalate:")
+    assert len(db.complaints_for_flight(flight["flight_key"])) == 1
 
 
 def test_reference_less_resolutions_are_not_matched_by_fifo(coordinator):
@@ -703,13 +703,13 @@ def test_closure_notice_with_reference_offers_reopen_and_gaca(coordinator):
 
     bot.check_complaint_responses()
 
-    assert len(api.messages) == 2
+    assert len(api.messages) == 1
     assert "closed or processed" in api.messages[0]["text"].casefold()
-    assert "saved profile still needs" in api.messages[1]["text"]
     button_rows = api.messages[0]["reply_markup"]["inline_keyboard"]
     flat = [button["callback_data"] for row in button_rows for button in row]
     assert any(item.startswith("escalate:") for item in flat)
     assert any(item.startswith("reopen_case:") for item in flat)
+    assert len(db.complaints_for_flight(flight["flight_key"])) == 1
 
 
 def test_confirmation_email_recovers_missing_airline_reference(coordinator):
@@ -988,10 +988,10 @@ def test_ghala_interprets_matched_airline_response_before_escalation(coordinator
         "body": "We have completed our review of CAS-667788.",
     })
     bot.check_complaint_responses()
-    assert len(api.messages) == 2
+    assert len(api.messages) == 1
     assert "declined compensation" in api.messages[0]["text"]
     assert "Ghala-200 recommends: escalate" in api.messages[0]["text"]
-    assert "saved profile still needs" in api.messages[1]["text"]
+    assert len(db.complaints_for_flight(flight["flight_key"])) == 1
 
 
 def test_non_substantive_ai_response_analysis_is_cached(coordinator):

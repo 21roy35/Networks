@@ -3634,7 +3634,7 @@ class TelegramCoordinator:
                     [("No, close", f"close_case:{complaint['flight_id']}")],
                 ]))
 
-        def retain_and_auto_handle(
+        def retain_response(
                 complaint: dict,
                 event: dict,
                 analysis: dict | None) -> None:
@@ -3647,28 +3647,9 @@ class TelegramCoordinator:
                     (analysis or {}).get("summary") or
                     _clean_excerpt(raw_response)),
             )
-            recommendation = str(
-                (analysis or {}).get("recommendation") or "").casefold()
-            outcome = str(
-                (analysis or {}).get("outcome") or "").casefold()
-            unsatisfactory = (
-                bool((analysis or {}).get("closed_needs_followup"))
-                or recommendation in {"escalate", "reopen"}
-                or outcome in {"declined", "partially_approved"}
-            )
-            if not unsatisfactory:
-                return
-            action_key = (
-                f"auto-airline-followup:{complaint['id']}:{event['id']}")
-            if db.event_seen(action_key):
-                return
-            db.mark_event_seen(action_key)
-            flight_id = complaint.get("flight_id")
-            flight = db.get_flight(int(flight_id)) if flight_id else None
-            if not flight:
-                return
-            self._launch_airline_followup(
-                flight, complaint, response_analysis=analysis)
+            # Ghala's recommendation informs the Telegram prompt; it does not
+            # authorize a second airline filing. The user explicitly chooses
+            # Escalate, Reopen, or Close from the buttons sent above.
 
         # Reference-bearing responses are authoritative. Process emails
         # chronologically for deterministic state. FIFO fallback is disabled:
@@ -3711,7 +3692,7 @@ class TelegramCoordinator:
                 db.mark_event_seen(f"airline-responded:{complaint['id']}")
                 notify_response(
                     complaint, info, event, analysis, "exact_reference")
-                retain_and_auto_handle(complaint, event, analysis)
+                retain_response(complaint, event, analysis)
                 break
 
         known_references = {
@@ -3761,7 +3742,7 @@ class TelegramCoordinator:
                     f"airline-responded:{complaint['id']}")
                 notify_response(
                     complaint, info, event, analysis, "case_facts")
-                retain_and_auto_handle(complaint, event, analysis)
+                retain_response(complaint, event, analysis)
 
 _COORDINATOR: TelegramCoordinator | None = None
 _COORDINATOR_LOCK = threading.Lock()
