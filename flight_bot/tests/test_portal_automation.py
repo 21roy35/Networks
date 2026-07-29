@@ -1965,6 +1965,25 @@ def test_gaca_proxy_rotation_updates_shared_session_file(
         assert session_file.stat().st_mode & 0o777 == 0o600
 
 
+def test_gaca_normal_browser_uses_saudi_timezone(monkeypatch):
+    monkeypatch.setenv("TZ", "UTC")
+    monkeypatch.delenv("FLIGHTBOT_GACA_TIMEZONE", raising=False)
+
+    environment = gaca_normal_browser._chrome_environment()
+
+    assert environment["TZ"] == "Asia/Riyadh"
+    assert os.environ["TZ"] == "UTC"
+
+
+def test_gaca_normal_browser_allows_truthful_timezone_override(monkeypatch):
+    monkeypatch.setenv("FLIGHTBOT_GACA_TIMEZONE", "Asia/Dubai")
+
+    assert (
+        gaca_normal_browser._chrome_environment()["TZ"]
+        == "Asia/Dubai"
+    )
+
+
 def test_gaca_normalizes_saudia_and_local_mobile_number():
     assert portal_automation._gaca_airline_label({
         "airline_code": "SV", "airline_name": "Saudia"

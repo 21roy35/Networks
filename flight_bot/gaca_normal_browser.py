@@ -91,6 +91,22 @@ def _local_proxy() -> str:
     return value
 
 
+def _chrome_environment() -> dict[str, str]:
+    """Keep Chrome's real locale signals aligned with the Saudi exit IP.
+
+    Normal Chrome inherits the VPS timezone unless we set it explicitly.
+    The GACA proxy exits in Riyadh Region, while the host itself runs in UTC;
+    exposing that contradiction to reCAPTCHA v3 needlessly lowers trust in an
+    otherwise ordinary browser session.
+    """
+    environment = os.environ.copy()
+    environment["TZ"] = (
+        os.environ.get("FLIGHTBOT_GACA_TIMEZONE", "").strip()
+        or "Asia/Riyadh"
+    )
+    return environment
+
+
 def _wait_for_cdp(port: int, process: subprocess.Popen | None) -> None:
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
@@ -229,6 +245,7 @@ def connect(playwright, *, profile_dir: Path):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            env=_chrome_environment(),
         )
         _wait_for_cdp(port, _NORMAL_CHROME_PROCESS)
     browser = playwright.chromium.connect_over_cdp(
