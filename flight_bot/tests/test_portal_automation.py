@@ -2202,6 +2202,50 @@ def test_gaca_category_honors_explicit_baggage_delay_priority():
         "Baggage Services", "Baggage Delay", "")
 
 
+def test_gaca_amenity_category_uses_onboard_and_never_first_option():
+    payload = {
+        "incident": "No amenity kit was provided on flight SV520.",
+    }
+    assert portal_automation._gaca_categories(payload) == (
+        "On Board Services", "", "")
+    assert portal_automation._pick_gaca_option(
+        ["Delay on the Runway", "Cabin Services"], "", []) == ""
+
+
+def test_gaca_missing_category_level_uses_ghala_exact_live_option(monkeypatch):
+    calls = []
+
+    def choose(incident, options, _analysis, flight):
+        calls.append((incident, options, flight))
+        return {
+            "category": "Cabin Services",
+            "rationale": "Amenity kits are provided onboard.",
+        }
+
+    monkeypatch.setattr(portal_automation, "_CATEGORY_HANDLER", choose)
+    payload = {
+        "incident": "No amenity kit was provided on flight SV520.",
+        "flight_number": "SV520",
+        "flight_date": "2025-12-06",
+    }
+    selected = portal_automation._choose_gaca_live_option(
+        payload,
+        ["Delay on the Runway", "Cabin Services"],
+    )
+
+    assert selected == "Cabin Services"
+    assert calls[-1][1] == ["Delay on the Runway", "Cabin Services"]
+    assert calls[-1][2]["flight_number"] == "SV520"
+
+
+def test_gaca_retry_reuses_exact_previously_selected_category():
+    assert portal_automation._gaca_categories({
+        "incident": "No amenity kit was provided on flight SV520.",
+        "selected_complaint_category": (
+            "On Board Services › Cabin Services › Amenity Kits"),
+    }) == ("On Board Services", "Cabin Services", "Amenity Kits")
+
+
 def test_reference_is_extracted_from_official_confirmation_text():
     assert _extract_reference(
         "Thank you. Your complaint reference number is CAS-12345678.") == (
