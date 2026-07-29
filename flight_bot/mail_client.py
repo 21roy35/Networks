@@ -12,7 +12,7 @@ import io
 import re
 import time
 from datetime import datetime, timedelta
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
 
@@ -193,8 +193,9 @@ def fetch_recent_verification_message(
         config: dict,
         *,
         since: datetime | None = None,
+        recipient: str = "",
         limit: int = 20) -> dict | None:
-    """Return the newest recent OTP/verification email without storing it."""
+    """Return the newest recent OTP email for the active portal recipient."""
     imap_cfg = config.get("imap") or {}
     if not imap_cfg.get("user") or not imap_cfg.get("password"):
         return None
@@ -230,6 +231,18 @@ def fetch_recent_verification_message(
             raw_bytes = data[0][1]
             msg = email.message_from_bytes(
                 raw_bytes, policy=email.policy.default)
+            if recipient:
+                recipients = getaddresses([
+                    *msg.get_all("to", []),
+                    *msg.get_all("cc", []),
+                    *msg.get_all("delivered-to", []),
+                    *msg.get_all("x-original-to", []),
+                ])
+                expected = recipient.strip().casefold()
+                if expected not in {
+                        address.strip().casefold()
+                        for _name, address in recipients if address}:
+                    continue
             raw = message_to_raw(msg, raw_bytes=raw_bytes)
             sent_at = raw.get("date")
             if isinstance(sent_at, datetime):

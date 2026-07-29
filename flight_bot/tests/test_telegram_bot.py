@@ -187,6 +187,31 @@ def test_otp_is_relayed_and_deleted_after_use(coordinator):
     assert api.deleted == [("42", 77)]
 
 
+def test_otp_email_lookup_is_scoped_to_active_alias(coordinator, monkeypatch):
+    bot, _api = coordinator
+    lookup = {}
+
+    def fetch(_config, *, since, recipient):
+        lookup.update(since=since, recipient=recipient)
+        return {
+            "message_id": "gaca-alias-otp",
+            "subject": "GACA EServices - OTP Code",
+            "body": "Verification Code: 4821",
+        }
+
+    monkeypatch.setattr(
+        telegram_bot, "fetch_recent_verification_message", fetch)
+
+    result = bot.request_verification({
+        "kind": "otp",
+        "message": "Enter OTP",
+        "recipient_email": "icrackgames101+2760788@gmail.com",
+    })
+
+    assert result == "4821"
+    assert lookup["recipient"] == "icrackgames101+2760788@gmail.com"
+
+
 def test_verification_code_ranking_ignores_footer_year():
     assert telegram_bot._verification_code_from_text(
         "Portal Verification Code: 1078. All rights reserved © 2026"

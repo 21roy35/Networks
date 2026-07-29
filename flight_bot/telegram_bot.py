@@ -526,7 +526,11 @@ class TelegramCoordinator:
                 next_email_check = time.monotonic() + 8
                 try:
                     message = fetch_recent_verification_message(
-                        self.config, since=started)
+                        self.config,
+                        since=started,
+                        recipient=str(
+                            challenge.get("recipient_email") or "").strip(),
+                    )
                     message_id = str(
                         (message or {}).get("message_id") or "")
                     if (message and message_id

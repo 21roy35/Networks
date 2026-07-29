@@ -1,4 +1,6 @@
 from email.message import EmailMessage
+from email.utils import format_datetime
+from datetime import datetime
 
 import pytest
 
@@ -83,6 +85,59 @@ def test_imap_cursor_fetches_only_new_uids(isolated_db, monkeypatch):
     assert instances[1].fetches == []
     assert instances[1].searches == []
     assert db.get_mailbox_cursor("INBOX")["last_uid"] == 12
+
+
+def test_verification_email_uses_exact_gmail_alias(monkeypatch):
+    def message(recipient, code, number):
+        value = EmailMessage()
+        value["Message-ID"] = f"<otp-{number}@gaca.gov.sa>"
+        value["From"] = "no-reply@gaca.gov.sa"
+        value["To"] = recipient
+        value["Date"] = format_datetime(datetime.now().astimezone())
+        value["Subject"] = "GACA EServices - OTP Code"
+        value.set_content(f"Verification Code: {code}")
+        return value.as_bytes()
+
+    messages = {
+        21: message("icrackgames101+2760788@gmail.com", "4821", 21),
+        22: message("icrackgames101+other@gmail.com", "9999", 22),
+    }
+
+    class FakeIMAP:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def login(self, *_args):
+            return "OK", []
+
+        def select(self, _folder, readonly=True):
+            return "OK", [b"2"]
+
+        def uid(self, command, *args):
+            if command == "SEARCH":
+                return "OK", [b"21 22"]
+            uid = int(args[0])
+            return "OK", [(b"RFC822", messages[uid])]
+
+        def logout(self):
+            return "BYE", []
+
+    monkeypatch.setattr(mail_client.imaplib, "IMAP4_SSL", FakeIMAP)
+    config = {"imap": {
+        "host": "imap.example",
+        "port": 993,
+        "user": "icrackgames101@gmail.com",
+        "password": "app-password",
+    }}
+
+    result = mail_client.fetch_recent_verification_message(
+        config,
+        since=datetime.now().astimezone(),
+        recipient="icrackgames101+2760788@gmail.com",
+    )
+
+    assert result["message_id"] == "<otp-21@gaca.gov.sa>"
+    assert "4821" in result["body"]
 
 
 def test_empty_incremental_scan_does_not_rebuild_flights(

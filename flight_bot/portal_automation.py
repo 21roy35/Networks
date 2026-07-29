@@ -1904,16 +1904,19 @@ def _page_screenshot(page) -> bytes:
 
 
 def _ask_verification(kind: str, message: str, page, image: bytes = b"",
-                      choices: list[str] | None = None):
+                      choices: list[str] | None = None,
+                      context: dict | None = None):
     if not _VERIFICATION_HANDLER:
         return None
-    return _VERIFICATION_HANDLER({
+    challenge = {
         "kind": kind,
         "message": message,
         "image": image or _page_screenshot(page),
         "choices": choices or [],
         "url": page.url,
-    })
+    }
+    challenge.update(context or {})
+    return _VERIFICATION_HANDLER(challenge)
 
 
 def _portal_elements(page) -> list[dict]:
@@ -2351,12 +2354,16 @@ def _solve_turnstile(page, update) -> bool:
     return False
 
 
-def _solve_otp(page, update) -> bool:
+def _solve_otp(page, update, recipient_email: str = "") -> bool:
     fields = _otp_fields(page)
     if not _visible(fields):
         return False
     response = _ask_verification(
-        "otp", "Reply with the one-time code sent by the official portal.", page)
+        "otp",
+        "Reply with the one-time code sent by the official portal.",
+        page,
+        context={"recipient_email": recipient_email},
+    )
     code = re.sub(r"\D", "", str(response or ""))
     if not code:
         return False
@@ -2413,7 +2420,8 @@ def _approve_declaration(page, update) -> bool:
 
 
 def _wait_for_human_step(page, update, timeout_seconds: int = 600,
-                         defer_captcha: bool = False) -> bool:
+                         defer_captcha: bool = False,
+                         recipient_email: str = "") -> bool:
     message = _needs_human_step(page)
     if not message:
         return True
@@ -2427,7 +2435,9 @@ def _wait_for_human_step(page, update, timeout_seconds: int = 600,
     # mentioned only if that attempt actually fails and fallback is required.
     if not (captcha_kind and _CAPTCHA_SOLVER):
         update("verification", message)
-    if _VERIFICATION_HANDLER and _solve_otp(page, update):
+    otp_started = _visible(_otp_fields(page))
+    if _VERIFICATION_HANDLER and _solve_otp(
+            page, update, recipient_email):
         pass
     elif _VERIFICATION_HANDLER and _solve_text_captcha(page, update):
         pass
@@ -2478,6 +2488,12 @@ def _wait_for_human_step(page, update, timeout_seconds: int = 600,
     while time.monotonic() < deadline:
         if page.is_closed():
             return False
+        # An OTP redirect can land on a fresh CAPTCHA or the final form after a
+        # rejection. Return control to the confirmation state machine as soon
+        # as the OTP controls disappear so it can inspect the POST response.
+        if otp_started and not _visible(_otp_fields(page)):
+            update("filling", "Email verification response received. Checking it…")
+            return True
         if not _needs_human_step(page):
             update("filling", "Verification complete. Continuing automatically…")
             return True
@@ -4382,22 +4398,32 @@ def _gaca_security_rejected(value: str) -> bool:
 
 
 def _capture_gaca_response(response, capture: dict) -> None:
-    """Capture GACA's complaint POST before a WAF can hide the next page."""
+    """Capture GACA's complaint and OTP POSTs before redirects hide them."""
     try:
-        if ("/complaint-airline/step4" not in response.url
-                or str(response.request.method).upper() != "POST"):
+        if str(response.request.method).upper() != "POST":
             return
-        capture.update(seen=True, status=response.status, url=response.url)
+        is_complaint = "/complaint-airline/step4" in response.url
+        is_verification = "/verification/email" in response.url
+        if not (is_complaint or is_verification):
+            return
         headers = getattr(response, "headers", {}) or {}
         if callable(headers):
             headers = headers()
+        location = ""
         if isinstance(headers, dict):
-            capture["location"] = str(
+            location = str(
                 headers.get("location") or headers.get("Location") or "")
+        prefix = "verification_" if is_verification else ""
+        capture.update({
+            f"{prefix}seen": True,
+            f"{prefix}status": response.status,
+            f"{prefix}url": response.url,
+            f"{prefix}location": location,
+        })
         try:
-            capture["json"] = response.json()
+            capture[f"{prefix}json"] = response.json()
         except Exception:
-            capture["text"] = response.text()[:8000]
+            capture[f"{prefix}text"] = response.text()[:8000]
     except Exception:
         return
 
@@ -4457,6 +4483,79 @@ def _gaca_submission_result(
         "GACA's complaint POST confirmed acceptance, but the confirmation "
         "page did not expose the regulator reference. FlightDeck will "
         "reconcile it from email or SMS and will not submit a duplicate.")
+
+
+def _gaca_verification_result(
+        capture: dict | None,
+        payload: dict | None = None) -> PortalResult | None:
+    """Interpret GACA's OTP POST redirect, the authoritative final decision."""
+    if not capture or not capture.get("verification_seen"):
+        return None
+    try:
+        status = int(capture.get("verification_status") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    body = str(capture.get("verification_text") or "")
+    if capture.get("verification_json") is not None:
+        try:
+            body += "\n" + json.dumps(
+                capture.get("verification_json"),
+                ensure_ascii=False,
+                default=str,
+            )
+        except Exception:
+            pass
+    location = str(capture.get("verification_location") or "")
+    combined = f"{body}\n{location}"
+    if _gaca_security_rejected(combined):
+        return PortalResult(
+            "verification_expired",
+            "GACA rejected the final email verification security token. The "
+            "complaint was not accepted and is safe to retry.",
+        )
+    if status >= 400:
+        return PortalResult(
+            "error",
+            f"GACA rejected the email verification with HTTP {status}; no "
+            "acceptance was recorded.",
+            retry_safe=True,
+        )
+    if re.search(r"/complaint-airline/step4(?:[/?#]|$)", location, re.I):
+        return PortalResult(
+            "verification_expired",
+            "GACA returned the email verification to the final complaint form. "
+            "The complaint was not accepted and is safe to retry with a fresh "
+            "OTP and security token.",
+        )
+    success = bool(re.search(
+        r"/(?:survey|submission[-_/]?success)(?:[/?#]|$)|"
+        r"successfully submitted|complaint (?:was )?(?:received|submitted)|"
+        r"request (?:was )?received",
+        combined,
+        re.I,
+    ))
+    if not success:
+        return None
+    reference = _extract_reference(combined)
+    structured = {
+        str((payload or {}).get(key) or "").strip().lower()
+        for key in ("airline_reference", "pnr", "ticket_number")
+    }
+    if reference and reference.strip().lower() in structured:
+        reference = ""
+    if reference:
+        return PortalResult(
+            "submitted",
+            "GACA accepted the email verification and returned a regulator "
+            "reference.",
+            reference,
+        )
+    return PortalResult(
+        "accepted_pending_reference",
+        "GACA accepted the email verification and opened its official survey. "
+        "FlightDeck will reconcile the regulator reference from SMS or email "
+        "and will not submit a duplicate.",
+    )
 
 
 def _gaca_ai_submission_result(page, payload: dict | None,
@@ -4536,7 +4635,6 @@ def _await_confirmation(page, before_url: str, update,
     started = time.monotonic()
     deadline = started + timeout_seconds
     waiting_reported = False
-    gaca_email_verified = False
     is_gaca = bool(payload and payload.get("kind") == "gaca")
     # GACA escalations for Saudia flights still carry airline_code=SV; do not
     # apply Saudia's production-API confirmation rules to the GACA portal.
@@ -4576,6 +4674,19 @@ def _await_confirmation(page, before_url: str, update,
                     gaca_result.message,
                     _page_screenshot(page) if not page.is_closed() else None)
             return gaca_result
+        gaca_verification_result = (
+            _gaca_verification_result(submission_capture, payload)
+            if is_gaca else None
+        )
+        if gaca_verification_result:
+            if gaca_verification_result.status in {
+                    "submitted", "accepted_pending_reference"}:
+                update(
+                    gaca_verification_result.status,
+                    gaca_verification_result.message,
+                    _page_screenshot(page) if not page.is_closed() else None,
+                )
+            return gaca_verification_result
         if page.is_closed():
             if is_saudia:
                 return PortalResult(
@@ -4584,13 +4695,6 @@ def _await_confirmation(page, before_url: str, update,
                     "acceptance response or airline reference. The attempt is "
                     "recorded as failed.")
             if is_gaca:
-                if gaca_email_verified:
-                    return PortalResult(
-                        "accepted_pending_reference",
-                        "GACA accepted the email verification and closed the "
-                        "verification page. FlightDeck will reconcile the "
-                        "regulator reference from SMS or email and will not "
-                        "submit a duplicate.")
                 return PortalResult(
                     "error",
                     "GACA closed before returning any acceptance signal or "
@@ -4698,7 +4802,11 @@ def _await_confirmation(page, before_url: str, update,
                     "GACA requires a fresh verification before the complaint "
                     "can be submitted again.")
             update("verification", human)
-            if _VERIFICATION_HANDLER and _wait_for_human_step(page, update):
+            if _VERIFICATION_HANDLER and _wait_for_human_step(
+                    page,
+                    update,
+                    recipient_email=str((payload or {}).get("email") or ""),
+            ):
                 update("submitting", "Verification complete. Waiting for confirmation…")
                 if is_gaca and pending_kind == "recaptcha":
                     # After a mid-wait captcha solve, Submit must be clicked again.
@@ -4706,17 +4814,7 @@ def _await_confirmation(page, before_url: str, update,
                         "verification_expired",
                         "GACA verification was refreshed; a safe re-submit is required.")
                 if is_gaca and otp_visible:
-                    gaca_email_verified = True
                     page.wait_for_timeout(700)
-                    if re.search(
-                            r"/eservices/home(?:[/?#]|$)",
-                            str(page.url), re.I):
-                        return PortalResult(
-                            "accepted_pending_reference",
-                            "GACA accepted the email verification and "
-                            "returned to E-Services. FlightDeck will "
-                            "reconcile the regulator reference from SMS or "
-                            "email and will not submit a duplicate.")
                 continue
         elif not waiting_reported and time.monotonic() - started > 12:
             waiting_reported = True
@@ -4790,7 +4888,11 @@ def _submit_with_captcha_recovery(page, payload: dict, update) -> PortalResult:
                 "verification",
                 "Using GACA's native invisible verification on Submit…")
             _settle_gaca_native_recaptcha(page, update)
-        elif not _wait_for_human_step(page, update):
+        elif not _wait_for_human_step(
+                page,
+                update,
+                recipient_email=str(payload.get("email") or ""),
+        ):
             if attempt + 1 < attempts and _CAPTCHA_SOLVER and _pending_captcha_kind(page):
                 update(
                     "verification",
@@ -5199,7 +5301,12 @@ def submit_portal_claim(payload: dict, update: Callable[..., None]) -> PortalRes
                 "reviewing",
                 "Finished filling the known details. Checking verification and required fields.",
                 _page_screenshot(page))
-            if not _wait_for_human_step(page, update, defer_captcha=True):
+            if not _wait_for_human_step(
+                    page,
+                    update,
+                    defer_captcha=True,
+                    recipient_email=str(payload.get("email") or ""),
+            ):
                 return PortalResult(
                     "needs_attention",
                     "Login or verification was not completed before the portal timed out.")

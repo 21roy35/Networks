@@ -2471,6 +2471,44 @@ def test_gaca_post_capture_distinguishes_rejection_and_acceptance():
     assert echoed_airline_case is None
 
 
+def test_gaca_email_verification_redirect_distinguishes_rejection_and_acceptance():
+    class Request:
+        method = "POST"
+
+    class Response:
+        url = ("https://myeservices.gaca.gov.sa/eservices/public/qpe/"
+               "verification/email")
+        request = Request()
+        status = 302
+
+        def __init__(self, location):
+            self.headers = {"location": location}
+
+        def json(self):
+            raise ValueError
+
+        def text(self):
+            return ""
+
+    rejected_capture = {}
+    portal_automation._capture_gaca_response(
+        Response("/eservices/public/qpe/complaint-airline/step4"),
+        rejected_capture,
+    )
+    rejected = portal_automation._gaca_verification_result(rejected_capture)
+    assert rejected.status == "verification_expired"
+    assert "not accepted" in rejected.message
+
+    accepted_capture = {}
+    portal_automation._capture_gaca_response(
+        Response("/eservices/public/qpe/survey?detailsId=4705816"),
+        accepted_capture,
+    )
+    accepted = portal_automation._gaca_verification_result(accepted_capture)
+    assert accepted.status == "accepted_pending_reference"
+    assert "official survey" in accepted.message
+
+
 def test_gaca_uses_one_solver_path_instead_of_native_then_solver(monkeypatch):
     monkeypatch.setattr(
         portal_automation, "_recaptcha_challenge",
@@ -2545,7 +2583,7 @@ def test_gaca_visible_success_waits_for_real_sms_reference(monkeypatch):
     assert result.reference == ""
 
 
-def test_gaca_home_after_email_verification_waits_for_sms_reference(
+def test_gaca_home_alone_after_email_verification_is_not_acceptance(
         monkeypatch):
     class Control:
         def __init__(self, *, otp=False):
@@ -2557,8 +2595,11 @@ def test_gaca_home_after_email_verification_waits_for_sms_reference(
             "verification/email"
         )
 
+        def __init__(self):
+            self.closed = False
+
         def is_closed(self):
-            return False
+            return self.closed
 
         def get_by_role(self, *_args, **_kwargs):
             return Control()
@@ -2584,8 +2625,9 @@ def test_gaca_home_after_email_verification_waits_for_sms_reference(
         portal_automation, "_needs_human_step",
         lambda _page: "Enter the OTP")
 
-    def complete_email_verification(_page, _update):
+    def complete_email_verification(_page, _update, **_kwargs):
         page.url = "https://myeservices.gaca.gov.sa/eservices/home"
+        page.closed = True
         return True
 
     monkeypatch.setattr(
@@ -2605,8 +2647,9 @@ def test_gaca_home_after_email_verification_waits_for_sms_reference(
         submission_capture={},
     )
 
-    assert result.status == "accepted_pending_reference"
+    assert result.status == "error"
     assert result.reference == ""
+    assert "No verified submission exists" in result.message
 
 
 def test_ai_portal_guardrails_block_final_and_security_actions(monkeypatch):
