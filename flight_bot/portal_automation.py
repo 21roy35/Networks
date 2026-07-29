@@ -3464,8 +3464,32 @@ def _gaca_login_abort_message(page) -> str:
     )
 
 
+def _dismiss_gaca_cookie_banner(page) -> bool:
+    """Remove GACA's cookie overlay before Nafath input or screenshots."""
+    for selector in (
+            "#rejectCookies",
+            "#acceptCookies",
+            "#closeCookiePopup",
+            "[data-cookie-action='reject']",
+            "[data-cookie-action='accept']"):
+        try:
+            control = page.locator(selector)
+            if not control.count():
+                continue
+            control = control.first
+            if not control.is_visible():
+                continue
+            control.click(force=True, timeout=3000)
+            page.wait_for_timeout(250)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def _click_gaca_nafath_submit(page) -> bool:
     """Click the Nafath submit button, not the identically named tab."""
+    _dismiss_gaca_cookie_banner(page)
     try:
         buttons = page.locator("button[type='submit']")
         for index in range(buttons.count() - 1, -1, -1):
@@ -3474,7 +3498,7 @@ def _click_gaca_nafath_submit(page) -> bool:
                 continue
             label = re.sub(r"\s+", " ", button.inner_text()).strip()
             if re.fullmatch(r"Nafath|نفاذ", label, re.I):
-                button.click(force=True)
+                button.click(force=True, no_wait_after=True)
                 return True
     except Exception:
         pass
@@ -3489,6 +3513,7 @@ def _start_gaca_nafath(page, payload: dict, update) -> str:
     """Walk GACA's two National-ID screens and request phone approval."""
     if not _is_gaca_login_page(page):
         return "authenticated"
+    _dismiss_gaca_cookie_banner(page)
     try:
         url = str(page.url or "").casefold()
     except Exception:
@@ -3511,6 +3536,7 @@ def _start_gaca_nafath(page, payload: dict, update) -> str:
                 break
         if not _is_gaca_login_page(page):
             return "authenticated"
+        _dismiss_gaca_cookie_banner(page)
 
     national_id = str(payload.get("national_id") or "").strip()
     if not national_id:
@@ -3559,6 +3585,7 @@ def _start_gaca_nafath(page, payload: dict, update) -> str:
     if not clicked:
         return "manual"
     page.wait_for_timeout(1200)
+    _dismiss_gaca_cookie_banner(page)
     approval_text = re.sub(r"\s+", " ", _body_text(page)).strip()
     approval_match = re.search(
         r"(?:code below|verification code|approval (?:code|number))"

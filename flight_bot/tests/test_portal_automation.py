@@ -1928,6 +1928,60 @@ def test_gaca_normalizes_saudia_and_local_mobile_number():
     }) == "599491494"
 
 
+def test_gaca_nafath_dismisses_cookie_banner_before_submit():
+    events = []
+
+    class Control:
+        def __init__(self, name, *, visible=True):
+            self.name = name
+            self.visible = visible
+
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return 1
+
+        def nth(self, _index):
+            return self
+
+        def is_visible(self):
+            return self.visible
+
+        def is_enabled(self):
+            return True
+
+        def inner_text(self):
+            return "Nafath"
+
+        def click(self, **kwargs):
+            events.append((self.name, kwargs))
+
+    class Missing:
+        def count(self):
+            return 0
+
+    cookie = Control("cookie")
+    submit = Control("submit")
+
+    class Page:
+        def locator(self, selector):
+            if selector == "#rejectCookies":
+                return cookie
+            if selector == "button[type='submit']":
+                return submit
+            return Missing()
+
+        def wait_for_timeout(self, _milliseconds):
+            return None
+
+    assert portal_automation._click_gaca_nafath_submit(Page()) is True
+    assert [event[0] for event in events] == ["cookie", "submit"]
+    assert events[0][1]["force"] is True
+    assert events[1][1]["no_wait_after"] is True
+
+
 def test_gaca_nafath_walks_tab_and_national_id_screen(monkeypatch):
     class Page:
         url = "https://myeservices.gaca.gov.sa/eservices/login"
