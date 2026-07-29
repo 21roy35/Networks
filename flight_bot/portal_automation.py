@@ -124,6 +124,8 @@ def _finalize_persisted_complaint(payload: dict,
         status = "submitted"
     elif result.status == "accepted_pending_reference":
         status = "accepted_pending_reference"
+    elif result.status == "held":
+        status = "filing"
     elif payload.get("kind") == "gaca":
         status = "needs_attention"
     else:
@@ -188,6 +190,18 @@ def _gaca_permanent_validation_rejection(result: PortalResult) -> bool:
         r"(?:flight|complaint).{0,80}older than 60 days|"
         r"more than 60 days.{0,120}will not be accepted",
         str(result.message or ""),
+        re.I,
+    ))
+
+
+def _gaca_duplicate_existing(value: str) -> bool:
+    """Recognize GACA's field-level proof that the same case already exists."""
+    return bool(re.search(
+        r"already\s+(?:been\s+)?submitted\s+a?\s*complaint"
+        r"[\s\S]{0,120}(?:same|identical)\s+(?:information|details)|"
+        r"(?:same|identical)\s+(?:complaint\s+)?(?:information|details)"
+        r"[\s\S]{0,120}already\s+(?:been\s+)?submitted",
+        str(value or ""),
         re.I,
     ))
 
@@ -339,15 +353,27 @@ def _start_portal_worker(
             payload.get("kind") == "gaca"
             and _gaca_permanent_validation_rejection(result)
         )
+        gaca_duplicate = (
+            payload.get("kind") == "gaca"
+            and result.error_code == "gaca_duplicate_existing"
+        )
         if gaca_permanent_rejection:
             result = PortalResult(
                 "needs_attention",
                 result.message,
                 error_code="gaca_permanent_validation",
             )
+        elif gaca_duplicate:
+            result = PortalResult(
+                "held",
+                result.message,
+                error_code="gaca_duplicate_existing",
+            )
+            db.hold_portal_job(job_id, result.message)
         gaca_reconciliation_retry = (
             payload.get("kind") == "gaca"
             and not gaca_permanent_rejection
+            and not gaca_duplicate
             and result.status not in {
                 "submitted", "success", "accepted_pending_reference",
             }
@@ -355,6 +381,7 @@ def _start_portal_worker(
         )
         should_retry = (
             not gaca_permanent_rejection
+            and not gaca_duplicate
             and (
                 _retry_is_safe(result, previous_stage)
                 or gaca_reconciliation_retry
@@ -464,6 +491,7 @@ def _start_portal_worker(
                 f"{result.message} The safe retry limit was reached and the "
                 "job was quarantined for manual review.")
         elif (not gaca_permanent_rejection
+              and not gaca_duplicate
               and result.status not in {
                 "submitted", "accepted_pending_reference"}
               and previous_stage == "submitting"):
@@ -4743,6 +4771,14 @@ def _gaca_submission_result(
             pass
     location = str(capture.get("location") or "")
     combined = f"{body}\n{location}"
+    if _gaca_duplicate_existing(combined):
+        return PortalResult(
+            "held",
+            "GACA reports that a complaint with the same flight, ticket, and "
+            "airline-reference information already exists. This job is held "
+            "for account/reference reconciliation and will not be resubmitted.",
+            error_code="gaca_duplicate_existing",
+        )
     if _gaca_security_rejected(combined):
         return PortalResult(
             "verification_expired",
@@ -5322,6 +5358,15 @@ def _submit_with_captcha_recovery(page, payload: dict, update) -> PortalResult:
                         "GACA rejected Submit with validation still open: "
                         f"{detail[:240]}",
                         _page_screenshot(page))
+                    if _gaca_duplicate_existing(detail):
+                        return PortalResult(
+                            "held",
+                            "GACA reports that a complaint with the same flight, "
+                            "ticket, and airline-reference information already "
+                            "exists. This job is held for account/reference "
+                            "reconciliation and will not be resubmitted.",
+                            error_code="gaca_duplicate_existing",
+                        )
                     if _gaca_security_rejected(detail):
                         return PortalResult(
                             "verification_expired",

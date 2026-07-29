@@ -475,6 +475,80 @@ def test_gaca_command_starts_read_only_account_sync(coordinator, monkeypatch):
                for item in api.messages)
 
 
+def test_callback_press_is_journaled_with_safe_action(coordinator):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = db.list_flights()[0]
+
+    bot.handle_update({"callback_query": {
+        "id": "callback-1",
+        "data": f"flight_good:{flight['id']}",
+        "message": {"message_id": 700, "chat": {"id": 42}},
+    }})
+
+    journal = db.list_telegram_messages(10)
+    callback = next(item for item in journal
+                    if item.get("media_kind") == "callback")
+    assert callback["direction"] == "incoming"
+    assert callback["text"] == "[Button pressed: flight good]"
+    assert callback["reply_to_message_id"] == 700
+    assert api.callbacks == [("callback-1", "")]
+
+
+def test_held_gaca_duplicate_prompts_reference_recovery_once(
+        coordinator, monkeypatch):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    airline_id = db.add_complaint(
+        flight["flight_key"], "airline", None, "Seat complaint",
+        "closed", reference="C_2760788", details="Broken screen.")
+    gaca_id = db.add_complaint(
+        flight["flight_key"], "gaca", None, "Escalation", "filing",
+        details="Broken screen.", parent_complaint_id=airline_id)
+    db.save_portal_job({
+        "id": "held-duplicate",
+        "kind": "gaca",
+        "flight_key": flight["flight_key"],
+        "complaint_id": gaca_id,
+        "status": "held",
+        "message": (
+            "GACA reports this escalation as a duplicate; held for recovery."),
+        "terminal": False,
+        "payload": {"kind": "gaca"},
+    })
+
+    bot._prompt_held_gaca_duplicates()
+    bot._prompt_held_gaca_duplicates()
+
+    recovery_messages = [
+        item for item in api.messages
+        if "Recover existing GACA case" in str(item.get("reply_markup"))
+    ]
+    assert len(recovery_messages) == 1
+    button = recovery_messages[0]["reply_markup"]["inline_keyboard"][0][0]
+    assert button["callback_data"] == f"gaca_recover:{flight['id']}"
+
+    launched = []
+    monkeypatch.setattr(
+        bot, "start_gaca_account_sync",
+        lambda manual=False: launched.append(manual))
+    bot.handle_update({"callback_query": {
+        "id": "callback-recover",
+        "data": button["callback_data"],
+        "message": {
+            "message_id": recovery_messages[0]["message_id"],
+            "chat": {"id": 42},
+        },
+    }})
+
+    assert launched == [True]
+    assert any(
+        item["text"] == "[Button pressed: gaca recover]"
+        for item in db.list_telegram_messages(20))
+
+
 def test_issue_text_and_photo_auto_file_to_official_portal(
         coordinator, monkeypatch):
     bot, api = coordinator
@@ -684,7 +758,7 @@ def test_acknowledgement_does_not_link_without_reference_or_strong_facts(
     assert api.messages == []
 
 
-def test_closure_notice_with_reference_offers_reopen_and_gaca(coordinator):
+def test_closure_notice_that_points_to_email_waits_for_details(coordinator):
     bot, api = coordinator
     load_demo(log=lambda *_args, **_kwargs: None)
     flight = next(item for item in db.list_flights()
@@ -702,13 +776,15 @@ def test_closure_notice_with_reference_offers_reopen_and_gaca(coordinator):
     })
 
     bot.check_complaint_responses()
+    bot.check_complaint_responses()
 
     assert len(api.messages) == 1
-    assert "closed or processed" in api.messages[0]["text"].casefold()
-    button_rows = api.messages[0]["reply_markup"]["inline_keyboard"]
-    flat = [button["callback_data"] for row in button_rows for button in row]
-    assert any(item.startswith("escalate:") for item in flat)
-    assert any(item.startswith("reopen_case:") for item in flat)
+    assert "contains no outcome or remedy" in api.messages[0]["text"]
+    assert "checking Gmail for the detailed message" in api.messages[0]["text"]
+    assert "will not reopen or escalate merely because of this notice" in (
+        api.messages[0]["text"])
+    assert api.messages[0]["reply_markup"] is None
+    assert db.list_complaint_responses() == []
     assert len(db.complaints_for_flight(flight["flight_key"])) == 1
 
 

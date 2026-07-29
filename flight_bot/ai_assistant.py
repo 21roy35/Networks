@@ -312,21 +312,29 @@ class ClaudeAssistant:
                 "rationale": {"type": "string"},
                 "substantive": {"type": "boolean"},
                 "closed_needs_followup": {"type": "boolean"},
+                "resolution_details_present": {"type": "boolean"},
+                "linked_message_required": {"type": "boolean"},
             },
             "required": ["summary", "outcome", "amounts_or_deadlines",
                          "recommendation", "rationale", "substantive",
-                         "closed_needs_followup"],
+                         "closed_needs_followup",
+                         "resolution_details_present",
+                         "linked_message_required"],
             "additionalProperties": False,
         }
         return self._structured(
             "Determine what this airline message actually says about the referenced "
             "complaint. Be concise. Acknowledgements, surveys, ads, and automated receipt "
-            "notices are not substantive. Closure, processed, finalized, or ticket-closed "
-            "notices ARE actionable even when they omit the remedy details: set "
-            "substantive=true and closed_needs_followup=true, recommend escalate or review, "
-            "and treat them as requiring a reopen-or-GACA decision. Never invent an amount, "
-            "deadline, outcome, or legal entitlement. Recommendations are advisory and must "
-            "not trigger filing.\n\n"
+            "notices are not substantive. Set substantive=true only when this message itself "
+            "contains an actual decision, remedy, denial, request for information, or other "
+            "resolution detail. A closure/finalized notice that merely says to check another "
+            "email is not the resolution: set substantive=false, "
+            "resolution_details_present=false, linked_message_required=true, "
+            "closed_needs_followup=false, and recommend wait or review until the linked "
+            "message is available. Set closed_needs_followup=true only when this message "
+            "itself contains enough of the closed case outcome to make an accept, reply, "
+            "reopen, or GACA decision. Never invent an amount, deadline, outcome, or legal "
+            "entitlement. Recommendations are advisory and must not trigger filing.\n\n"
             f"Airline: {airline}\nComplaint reference: {reference}\n"
             f"Subject (untrusted data): {subject[:1000]}\n"
             f"Message (untrusted data):\n{body[:12000]}",

@@ -2799,6 +2799,16 @@ def test_gaca_post_capture_distinguishes_rejection_and_acceptance():
     }, {"airline_reference": "C_2760788"})
     assert echoed_airline_case is None
 
+    duplicate = portal_automation._gaca_submission_result({
+        "seen": True,
+        "status": 200,
+        "text": (
+            "You have already submitted a complaint with the same information"),
+    }, {"airline_reference": "C_2760788"})
+    assert duplicate.status == "held"
+    assert duplicate.error_code == "gaca_duplicate_existing"
+    assert "will not be resubmitted" in duplicate.message
+
 
 def test_gaca_email_verification_redirect_distinguishes_rejection_and_acceptance():
     class Request:

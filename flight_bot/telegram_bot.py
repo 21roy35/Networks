@@ -643,6 +643,7 @@ class TelegramCoordinator:
                 self.ask_for_pending_references()
                 self.resume_pending_parent_escalations()
                 self.auto_escalate_due_complaints()
+                self._prompt_held_gaca_duplicates()
                 self._maybe_sync_gaca_account()
                 # The dedicated resume loop and this slower monitor loop both
                 # use a one-job lease.  The portal worker's global browser
@@ -2426,6 +2427,19 @@ class TelegramCoordinator:
     def _handle_callback(self, callback: dict):
         data = callback.get("data") or ""
         self.api.answer_callback(callback["id"])
+        safe_action = (
+            "[Button pressed: verification response]"
+            if data.startswith("verify:")
+            else "[Button pressed: "
+                 + " ".join(data.partition(":")[0].split("_"))[:80]
+                 + "]"
+        )
+        try:
+            db.record_telegram_message(
+                "incoming", None, safe_action, "callback",
+                (callback.get("message") or {}).get("message_id"))
+        except Exception:
+            logger.exception("Could not journal Telegram callback")
         if data.startswith("verify:"):
             with self._lock:
                 waiter = self._verification
@@ -2473,6 +2487,12 @@ class TelegramCoordinator:
                              prompt["message_id"], "awaiting_details")
         elif action == "escalate":
             self._launch_gaca(flight)
+        elif action == "gaca_recover":
+            self.notify(
+                "Starting the read-only GACA account recovery now. Complete "
+                "the Nafath approval when Telegram asks; FlightDeck will import "
+                "the existing case and attach its real regulator reference.")
+            self.start_gaca_account_sync(manual=True)
         elif action == "reopen_case":
             self._start_reopen_intake(flight)
         elif action == "close_case":
@@ -3181,6 +3201,13 @@ class TelegramCoordinator:
                     "GACA accepted the escalation. Its confirmation page did "
                     "not show the regulator reference, so FlightDeck is waiting "
                     "for the matching email or SMS and will not submit it again.")
+            elif (result.status == "held"
+                  and result.error_code == "gaca_duplicate_existing"):
+                finish_record("filing")
+                if automatic:
+                    db.mark_event_seen(auto_key)
+                self._notify_gaca_duplicate_recovery(
+                    flight, complaint_id, result.message)
             elif result.status == "confirmation_unknown":
                 finish_record("failed")
                 db.clear_event_seen(auto_key)
@@ -3203,6 +3230,49 @@ class TelegramCoordinator:
             payload, on_complete=complete,
             on_update=self.portal_progress_handler())
         return True
+
+    def _notify_gaca_duplicate_recovery(
+            self, flight: dict, complaint_id: int,
+            _portal_message: str = "") -> None:
+        marker = f"gaca-duplicate-recovery-prompted:{int(complaint_id)}"
+        if db.event_seen(marker):
+            return
+        label = self._post_flight_label(flight)
+        self.notify(
+            f"GACA confirmed that it already has the same complaint information "
+            f"for {label}. This proves an existing regulator case; it does not "
+            "mean this new attempt succeeded. I held the job and will not "
+            "resubmit it.\n\nTap below when ready. FlightDeck will use a "
+            "read-only Nafath sign-in to import the existing case and attach "
+            "its real GACA reference.",
+            buttons=_buttons([[
+                ("Recover existing GACA case",
+                 f"gaca_recover:{int(flight['id'])}")
+            ]]))
+        db.mark_event_seen(marker)
+
+    def _prompt_held_gaca_duplicates(self) -> None:
+        """Surface older held duplicates once, including prior-build jobs."""
+        for job in db.list_portal_jobs(100):
+            if (job.get("kind") != "gaca"
+                    or job.get("status") != "held"
+                    or not re.search(
+                        r"duplicate|already.{0,80}(?:same|submitted)",
+                        str(job.get("message") or ""),
+                        re.I)):
+                continue
+            complaint_id = job.get("complaint_id")
+            if complaint_id is None:
+                continue
+            complaint = db.get_complaint(int(complaint_id))
+            if not complaint:
+                continue
+            flight = db.get_flight_by_key(
+                str(complaint.get("flight_key") or ""))
+            if flight:
+                self._notify_gaca_duplicate_recovery(
+                    flight, int(complaint_id),
+                    str(job.get("message") or ""))
 
     def auto_escalate_due_complaints(self, now: datetime | None = None):
         """File one GACA escalation after seven days without a real response."""
@@ -3421,12 +3491,18 @@ class TelegramCoordinator:
         reconcile_gaca_mail_events(events, notify=self.notify)
         substantive = re.compile(
             r"resolved|resolution|decision|outcome|approved|declined|denied|"
-            r"refund|compensation|reimburse|closed|closure|processed|finalized|"
-            r"تعويض|استرداد|مرفوض|إغلاق|حل|تم المعالجة",
+            r"refund|compensation|reimburse|remedy|credit|voucher|"
+            r"تعويض|استرداد|مرفوض|حل",
             re.I)
         closure_notice = re.compile(
             r"\b(?:closed|closure|processed|finalized|ticket[\s-]*closed)\b|"
             r"إغلاق|تم المعالجة|تم الإغلاق|service ticket\s*[-–]?\s*closure",
+            re.I)
+        linked_message_pointer = re.compile(
+            r"(?:refer to|check|see|sent to).{0,80}(?:your\s+)?"
+            r"(?:e-?mail|mail address|inbox)|"
+            r"(?:e-?mail|message).{0,80}(?:for|with).{0,40}(?:details|outcome)|"
+            r"راجع.{0,60}(?:البريد|الإيميل)|تم إرسال.{0,60}(?:البريد|الإيميل)",
             re.I)
         response_candidate = re.compile(
             r"review|regarding|with regard|update|decision|response|reply|"
@@ -3543,6 +3619,7 @@ class TelegramCoordinator:
                              event.get("body") or ""))
             deterministic = bool(substantive.search(blob))
             is_closure = bool(closure_notice.search(blob))
+            points_to_linked_message = bool(linked_message_pointer.search(blob))
             analysis = None
             # Only spend an AI call once the email is already strongly tied to
             # this complaint (exact reference or booking facts). That stops Ghala
@@ -3561,7 +3638,7 @@ class TelegramCoordinator:
                     "subject": event.get("subject") or "",
                     "body": event.get("body") or "",
                 }, ensure_ascii=False, sort_keys=True)
-                cache_key = "response-v2:" + hashlib.sha256(
+                cache_key = "response-v3:" + hashlib.sha256(
                     cache_material.encode("utf-8")).hexdigest()
                 analysis = db.get_ai_analysis_cache(cache_key, model)
                 if analysis is None:
@@ -3580,6 +3657,20 @@ class TelegramCoordinator:
                             cache_key, "airline_response", model, analysis)
             if analysis is not None:
                 analysis = dict(analysis)
+                if (points_to_linked_message
+                        and not bool(analysis.get(
+                            "resolution_details_present"))):
+                    # A pointer to a separate email is not the resolution.
+                    # Enforce that fact even if an older/malformed AI response
+                    # classified the word "finalized" too aggressively.
+                    analysis.update({
+                        "substantive": False,
+                        "closed_needs_followup": False,
+                        "resolution_details_present": False,
+                        "linked_message_required": True,
+                        "recommendation": "wait",
+                    })
+                    return False, analysis
                 actionable = (
                     bool(analysis.get("substantive"))
                     or bool(analysis.get("closed_needs_followup"))
@@ -3591,6 +3682,22 @@ class TelegramCoordinator:
                             "", "wait", "accept"}:
                         analysis["recommendation"] = "escalate"
                 return actionable, analysis
+            if points_to_linked_message:
+                return False, {
+                    "summary": (
+                        "The airline says the case was finalized but placed the "
+                        "actual resolution in a separate email."),
+                    "outcome": "unknown",
+                    "amounts_or_deadlines": [],
+                    "recommendation": "wait",
+                    "rationale": (
+                        "This notice contains no decision or remedy to evaluate. "
+                        "The linked email must be recovered first."),
+                    "substantive": False,
+                    "closed_needs_followup": False,
+                    "resolution_details_present": False,
+                    "linked_message_required": True,
+                }
             if is_closure:
                 return True, {
                     "summary": "The airline closed or finalized this complaint.",
@@ -3604,6 +3711,26 @@ class TelegramCoordinator:
                     "closed_needs_followup": True,
                 }
             return deterministic, None
+
+        def notify_linked_message_pending(
+                complaint: dict, info: dict, analysis: dict | None) -> None:
+            marker = f"closure-details-pending:{int(complaint['id'])}"
+            if db.event_seen(marker):
+                return
+            flight = complaint.get("flight_data") or {}
+            summary = str((analysis or {}).get("summary") or "").strip()
+            self.notify(
+                f"{info.get('name') or 'The airline'} says complaint "
+                f"{complaint.get('reference') or ''} for "
+                f"{self._post_flight_label(flight)} was finalized, but this "
+                "notice contains no outcome or remedy. "
+                + (f"{summary}\n\n" if summary else "\n\n")
+                + "I am checking Gmail for the detailed message before "
+                  "classifying the result or offering any new filing. I will "
+                  "not reopen or escalate merely because of this notice. If "
+                  "the detailed email went to another inbox, forward or paste "
+                  "it into Telegram.")
+            db.mark_event_seen(marker)
 
         def notify_response(complaint: dict, info: dict, event: dict,
                             analysis: dict | None, match_method: str) -> None:
@@ -3698,6 +3825,9 @@ class TelegramCoordinator:
                 is_substantive, analysis = response_analysis(
                     event, complaint, info)
                 if not is_substantive:
+                    if (analysis or {}).get("linked_message_required"):
+                        notify_linked_message_pending(
+                            complaint, info, analysis)
                     continue
                 if not db.link_complaint_response(
                         complaint["id"], event["id"], "exact_reference"):
@@ -3705,6 +3835,8 @@ class TelegramCoordinator:
                 db.mark_event_seen(
                     f"complaint-response:{complaint['id']}:{event['id']}")
                 db.mark_event_seen(f"airline-responded:{complaint['id']}")
+                db.clear_event_seen(
+                    f"closure-details-pending:{int(complaint['id'])}")
                 notify_response(
                     complaint, info, event, analysis, "exact_reference")
                 retain_response(complaint, event, analysis)
@@ -3749,12 +3881,17 @@ class TelegramCoordinator:
             _score, complaint, info = fact_matches[0]
             is_substantive, analysis = response_analysis(
                 event, complaint, info)
+            if (not is_substantive
+                    and (analysis or {}).get("linked_message_required")):
+                notify_linked_message_pending(complaint, info, analysis)
             if is_substantive and db.link_complaint_response(
                     complaint["id"], event["id"], "case_facts"):
                 db.mark_event_seen(
                     f"complaint-response:{complaint['id']}:{event['id']}")
                 db.mark_event_seen(
                     f"airline-responded:{complaint['id']}")
+                db.clear_event_seen(
+                    f"closure-details-pending:{int(complaint['id'])}")
                 notify_response(
                     complaint, info, event, analysis, "case_facts")
                 retain_response(complaint, event, analysis)

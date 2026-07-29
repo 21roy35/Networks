@@ -1117,6 +1117,12 @@ def create_app(config: dict) -> Flask:
                         "reference on the page. I will check email first; if the "
                         "reference is still missing after the mailbox scan, I will "
                         "ask for the SMS in Telegram. No duplicate will be filed.")
+            elif (result.status == "held"
+                  and result.error_code == "gaca_duplicate_existing"):
+                finish_record("filing")
+                if telegram:
+                    telegram._notify_gaca_duplicate_recovery(
+                        flight, complaint_id, result.message)
             elif result.status == "confirmation_unknown":
                 finish_record("failed")
                 if telegram:

@@ -234,6 +234,40 @@ def test_ai_failure_is_non_fatal_and_does_not_expose_response_data():
     assert "sensitive" not in assistant.last_error
 
 
+def test_response_prompt_treats_linked_email_pointer_as_incomplete():
+    result = {
+        "summary": "The SMS points to a separate email for details.",
+        "outcome": "unknown",
+        "amounts_or_deadlines": [],
+        "recommendation": "wait",
+        "rationale": "The resolution is not in this SMS.",
+        "substantive": False,
+        "closed_needs_followup": False,
+        "resolution_details_present": False,
+        "linked_message_required": True,
+    }
+    session = FakeSession({
+        "content": [{"type": "text", "text": json.dumps(result)}],
+    })
+    assistant = ClaudeAssistant(enabled_config(), session=session)
+
+    actual = assistant.analyze_response(
+        "SMS from Saudia · C_2761389",
+        "We finalized your comment. Kindly refer to your email for details.",
+        "C_2761389",
+        "Saudia",
+    )
+
+    assert actual == result
+    request = session.calls[0][1]["json"]
+    prompt = request["messages"][0]["content"][-1]["text"]
+    assert "merely says to check another email is not the resolution" in prompt
+    assert "linked_message_required=true" in prompt
+    schema = request["output_config"]["format"]["schema"]
+    assert "resolution_details_present" in schema["required"]
+    assert "linked_message_required" in schema["required"]
+
+
 def test_low_credit_error_is_actionable_without_copying_api_response():
     response = {"error": {
         "type": "invalid_request_error",
