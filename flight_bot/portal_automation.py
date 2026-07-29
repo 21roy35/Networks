@@ -3464,6 +3464,27 @@ def _gaca_login_abort_message(page) -> str:
     )
 
 
+def _click_gaca_nafath_submit(page) -> bool:
+    """Click the Nafath submit button, not the identically named tab."""
+    try:
+        buttons = page.locator("button[type='submit']")
+        for index in range(buttons.count() - 1, -1, -1):
+            button = buttons.nth(index)
+            if not button.is_visible() or not button.is_enabled():
+                continue
+            label = re.sub(r"\s+", " ", button.inner_text()).strip()
+            if re.fullmatch(r"Nafath|نفاذ", label, re.I):
+                button.click(force=True)
+                return True
+    except Exception:
+        pass
+    return _click(
+        page,
+        [r"^Nafath$", r"^Login$", r"^Sign\s*in$",
+         r"^تسجيل\s*الدخول$"],
+    )
+
+
 def _start_gaca_nafath(page, payload: dict, update) -> str:
     """Walk GACA's two National-ID screens and request phone approval."""
     if not _is_gaca_login_page(page):
@@ -3534,8 +3555,7 @@ def _start_gaca_nafath(page, payload: dict, update) -> str:
 
     # The current portal labels the National-ID submit button "Nafath".
     # Older deployments used "Login" or "Sign in".
-    clicked = _click(page, [r"^Nafath$"]) or _click(
-        page, [r"^Login$", r"^Sign\s*in$", r"^تسجيل\s*الدخول$"])
+    clicked = _click_gaca_nafath_submit(page)
     if not clicked:
         return "manual"
     page.wait_for_timeout(1200)
