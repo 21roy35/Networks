@@ -44,3 +44,14 @@ def test_authorization_replaces_existing_city():
     MODULE.ProxyHandler.session_file = None
 
     assert "-country-sa-city-riyadh-session-current-" in _decoded_username()
+
+
+def test_proxy_idle_timeout_keeps_slow_gaca_response_alive(monkeypatch):
+    monkeypatch.delenv("FLIGHTBOT_PROXY_IDLE_TIMEOUT_SECONDS", raising=False)
+    assert MODULE._idle_timeout_seconds() == 180
+
+    monkeypatch.setenv("FLIGHTBOT_PROXY_IDLE_TIMEOUT_SECONDS", "45")
+    assert MODULE._idle_timeout_seconds() == 60
+
+    monkeypatch.setenv("FLIGHTBOT_PROXY_IDLE_TIMEOUT_SECONDS", "invalid")
+    assert MODULE._idle_timeout_seconds() == 180

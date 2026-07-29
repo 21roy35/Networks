@@ -50,13 +50,17 @@ def _with_proxy_auth(header: bytes, authorization: str) -> bytes:
     return b"\r\n".join(lines) + b"\r\n\r\n" + tail
 
 
-def _tunnel(left: socket.socket, right: socket.socket) -> None:
+def _idle_timeout_seconds() -> int:
     raw_idle_timeout = os.environ.get(
-        "FLIGHTBOT_PROXY_IDLE_TIMEOUT_SECONDS", "45").strip()
+        "FLIGHTBOT_PROXY_IDLE_TIMEOUT_SECONDS", "180").strip()
     try:
-        idle_timeout = max(15, min(int(raw_idle_timeout), 300))
+        return max(60, min(int(raw_idle_timeout), 300))
     except (TypeError, ValueError):
-        idle_timeout = 45
+        return 180
+
+
+def _tunnel(left: socket.socket, right: socket.socket) -> None:
+    idle_timeout = _idle_timeout_seconds()
     selector = selectors.DefaultSelector()
     selector.register(left, selectors.EVENT_READ, right)
     selector.register(right, selectors.EVENT_READ, left)
@@ -65,9 +69,9 @@ def _tunnel(left: socket.socket, right: socket.socket) -> None:
             events = selector.select(timeout=idle_timeout)
             if not events:
                 # Residential proxy providers commonly discard an apparently
-                # idle CONNECT mapping without sending FIN. Closing first
-                # makes Chrome establish a fresh tunnel before a delayed OTP
-                # Verify click instead of reusing a silently stale mapping.
+                # idle CONNECT mapping without sending FIN. Three minutes
+                # still retires those mappings, but does not truncate GACA's
+                # unusually slow chunked Step 4 HTML response.
                 return
             for key, _ in events:
                 source = key.fileobj
