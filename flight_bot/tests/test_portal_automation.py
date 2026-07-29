@@ -2029,6 +2029,73 @@ def test_gaca_nafath_dismisses_cookie_banner_before_submit():
     assert events[1][1]["no_wait_after"] is True
 
 
+def test_gaca_gender_supports_current_radio_variant(monkeypatch):
+    class Missing:
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return 0
+
+    class Radio:
+        def __init__(self, value, label):
+            self.value = value
+            self.label = label
+            self.checked = False
+
+        def get_attribute(self, name):
+            return self.value if name == "value" else ""
+
+        def evaluate(self, _script):
+            return self.label
+
+        def check(self, **_kwargs):
+            self.checked = True
+
+        def click(self, **_kwargs):
+            self.checked = True
+
+        def is_checked(self):
+            return self.checked
+
+    class Radios:
+        def __init__(self):
+            self.items = [Radio("FEMALE", "Female"), Radio("MALE", "Male")]
+
+        def count(self):
+            return len(self.items)
+
+        def nth(self, index):
+            return self.items[index]
+
+    radios = Radios()
+
+    class Page:
+        def locator(self, selector):
+            if selector == "input[type='radio'][name='gender']":
+                return radios
+            return Missing()
+
+        def wait_for_function(self, *_args, **_kwargs):
+            return True
+
+        def wait_for_timeout(self, _milliseconds):
+            return None
+
+        def get_by_role(self, *_args, **_kwargs):
+            return Missing()
+
+    monkeypatch.setattr(portal_automation, "_select", lambda *_args: False)
+    monkeypatch.setattr(
+        portal_automation, "_selectize_by_label", lambda *_args: False)
+
+    assert portal_automation._select_gaca_gender(
+        Page(), {"title": "Mr", "gender": "Male"}) is True
+    assert radios.items[1].checked is True
+    assert radios.items[0].checked is False
+
+
 def test_gaca_nafath_walks_tab_and_national_id_screen(monkeypatch):
     class Page:
         url = "https://myeservices.gaca.gov.sa/eservices/login"

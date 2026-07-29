@@ -3846,7 +3846,7 @@ def _gaca_gender_choices(payload: dict) -> list[str]:
 
 
 def _select_gaca_gender(page, payload: dict) -> bool:
-    """Set GACA Gender on select[name=gender] (values are MALE/FEMALE)."""
+    """Set GACA Gender across its select and radio form variants."""
     choices = _gaca_gender_choices(payload)
     female = any(re.search(r"Female|FEMALE|أنثى|انثى|^F\$", c, re.I)
                  for c in choices)
@@ -3855,13 +3855,60 @@ def _select_gaca_gender(page, payload: dict) -> bool:
     select = page.locator("select[name='gender'], select#gender")
     try:
         page.wait_for_function(
-            """wanted => Array.from(
-                document.querySelectorAll(
-                    "select[name='gender'] option, select#gender option")
-            ).some(option => String(option.value || '').toUpperCase() === wanted)""",
+            """wanted => {
+                const selectReady = Array.from(
+                    document.querySelectorAll(
+                        "select[name='gender'] option, select#gender option")
+                ).some(option =>
+                    String(option.value || '').toUpperCase() === wanted);
+                const radioReady = Array.from(
+                    document.querySelectorAll(
+                        "input[type='radio'][name='gender']")
+                ).some(input => {
+                    const labels = input.labels
+                        ? Array.from(input.labels).map(label =>
+                            (label.innerText || '').trim()).join(' ')
+                        : '';
+                    return String(input.value || '').toUpperCase() === wanted
+                        || labels.toUpperCase() === wanted;
+                });
+                return selectReady || radioReady;
+            }""",
             wanted_value,
-            timeout=7000,
+            timeout=30_000,
         )
+    except Exception:
+        pass
+    radios = page.locator("input[type='radio'][name='gender']")
+    try:
+        for index in range(min(radios.count(), 10)):
+            radio = radios.nth(index)
+            value = str(radio.get_attribute("value") or "").strip().upper()
+            label = str(radio.evaluate(
+                """el => el.labels
+                    ? Array.from(el.labels).map(item =>
+                        (item.innerText || '').trim()).join(' ')
+                    : ''""") or "").strip()
+            if value != wanted_value and label.casefold() != wanted_label.casefold():
+                continue
+            try:
+                radio.check(force=True)
+            except Exception:
+                radio.click(force=True)
+            page.wait_for_timeout(250)
+            if radio.is_checked():
+                return True
+    except Exception:
+        pass
+    try:
+        aria_radio = page.get_by_role(
+            "radio", name=re.compile(rf"^{re.escape(wanted_label)}$", re.I))
+        if aria_radio.count():
+            aria_radio.first.click(force=True)
+            page.wait_for_timeout(250)
+            if (not hasattr(aria_radio.first, "is_checked")
+                    or aria_radio.first.is_checked()):
+                return True
     except Exception:
         pass
     if select.count():
