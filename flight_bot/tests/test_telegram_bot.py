@@ -1454,6 +1454,39 @@ def test_seven_day_no_response_auto_escalates_once(coordinator, monkeypatch):
     assert any("automatically escalating" in item["text"] for item in api.messages)
 
 
+def test_auto_escalation_silently_recognizes_active_gaca_job(
+        coordinator, monkeypatch):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.set_overrides(
+        flight["id"], {"flight_date": datetime.now().date().isoformat()})
+    flight = db.get_flight(flight["id"])
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Seat complaint",
+        "submitted", reference="CAS-700020",
+        details="The seat door was broken.")
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE complaints SET created_at=datetime('now', '-8 days') "
+            "WHERE reference='CAS-700020'")
+    airline = db.complaints_for_flight(flight["flight_key"])[0]
+    db.add_complaint(
+        flight["flight_key"], "gaca", None, "Active GACA escalation",
+        "filing", details="The seat door was broken.",
+        parent_complaint_id=int(airline["id"]))
+    monkeypatch.setattr(
+        telegram_bot, "missing_portal_fields", lambda _payload: [])
+
+    assert bot._launch_gaca(
+        db.get_flight(flight["id"]), automatic=True) is False
+
+    assert not any(
+        "already underway or on record" in item["text"]
+        for item in api.messages)
+
+
 def test_manual_gaca_submission_cannot_bypass_seven_day_gate(
         coordinator, monkeypatch):
     bot, api = coordinator

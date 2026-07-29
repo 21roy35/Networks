@@ -3093,9 +3093,14 @@ class TelegramCoordinator:
                 strategy.get("requested_remedy") or ""),
         )
         if complaint_id is None:
-            self.notify(
-                "A GACA escalation for this flight is already underway or on "
-                "record. I will not submit it again.")
+            # The monitor checks due airline cases while an existing portal
+            # worker is still progressing. That is normal idempotency, not a
+            # new GACA rejection, so automatic cycles must stay quiet. Keep a
+            # response for an explicit/manual duplicate request.
+            if not automatic:
+                self.notify(
+                    "A GACA escalation for this flight is already underway or "
+                    "on record. I will not submit it again.")
             return False
         airline_id = prior["id"]
         auto_key = f"auto-gaca:{airline_id}"

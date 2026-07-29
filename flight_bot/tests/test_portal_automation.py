@@ -2238,6 +2238,61 @@ def test_gaca_missing_category_level_uses_ghala_exact_live_option(monkeypatch):
     assert calls[-1][2]["flight_number"] == "SV520"
 
 
+def test_gaca_heuristic_does_not_hide_main_options_from_ghala(monkeypatch):
+    calls = []
+
+    def choose(_incident, options, _analysis, _flight):
+        calls.append(options)
+        return {
+            "category": "On Board Services",
+            "rationale": "The occupied-lavatory privacy incident happened onboard.",
+        }
+
+    monkeypatch.setattr(portal_automation, "_CATEGORY_HANDLER", choose)
+    payload = {
+        "incident": "قام أحد أفراد الطاقم بفتح باب دورة المياه أثناء وجودي فيها.",
+        "ai_analysis": {"category": "service"},
+    }
+
+    selected = portal_automation._choose_gaca_live_option(
+        payload,
+        ["Customer Service", "Flights", "On Board Services"],
+        "Customer Service",
+        level="main",
+    )
+
+    assert selected == "On Board Services"
+    assert calls == [["Customer Service", "Flights", "On Board Services"]]
+    assert payload["_gaca_category_ai_trace"][-1] == {
+        "level": "main",
+        "options": ["Customer Service", "Flights", "On Board Services"],
+        "heuristic_fallback": "Customer Service",
+        "decision": "On Board Services",
+        "rationale": (
+            "The occupied-lavatory privacy incident happened onboard."),
+        "accepted": True,
+    }
+
+
+def test_gaca_explicit_retry_category_stays_authoritative(monkeypatch):
+    monkeypatch.setattr(
+        portal_automation, "_CATEGORY_HANDLER",
+        lambda *_args: pytest.fail("Ghala must not replace a saved retry path"))
+    payload = {
+        "selected_complaint_category": (
+            "On Board Services › Cabin Services › Amenity Kits"),
+    }
+
+    selected = portal_automation._choose_gaca_live_option(
+        payload,
+        ["Customer Service", "On Board Services"],
+        "On Board Services",
+        level="main",
+    )
+
+    assert selected == "On Board Services"
+
+
 def test_gaca_retry_reuses_exact_previously_selected_category():
     assert portal_automation._gaca_categories({
         "incident": "No amenity kit was provided on flight SV520.",

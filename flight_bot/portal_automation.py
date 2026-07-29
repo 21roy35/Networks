@@ -3090,45 +3090,76 @@ def _choose_gaca_live_option(
         payload: dict,
         options: list[str],
         preferred: str = "",
+        level: str = "",
 ) -> str:
-    """Choose one exact rendered GACA option without falling to row one."""
+    """Choose one exact rendered GACA option without falling to row one.
+
+    A user/saved category is authoritative on a retry. Deterministic keyword
+    mappings are only fallbacks: Ghala must see the live choices first,
+    especially when the incident is written in Arabic and English-only
+    keyword matching would otherwise collapse to ``Customer Service``.
+    """
     rendered = list(dict.fromkeys(
         re.sub(r"\s+", " ", str(option or "")).strip()
         for option in options
         if re.sub(r"\s+", " ", str(option or "")).strip()
     ))
     preferred = re.sub(r"\s+", " ", str(preferred or "")).strip()
-    if preferred:
+    explicit = bool(
+        payload.get("gaca_category")
+        or payload.get("portal_category")
+        or payload.get("selected_complaint_category")
+    )
+
+    def preferred_match() -> str:
+        if not preferred:
+            return ""
         exact = next((option for option in rendered
                       if option.casefold() == preferred.casefold()), "")
         if exact:
             return exact
-        soft = next((option for option in rendered
+        return next((option for option in rendered
                      if (preferred.casefold() in option.casefold()
                          or option.casefold() in preferred.casefold())), "")
-        if soft:
-            return soft
-    if not (_CATEGORY_HANDLER and rendered):
+
+    if explicit and (selected := preferred_match()):
+        return selected
+    if not rendered:
         return ""
     try:
-        flight = {
-            key: payload.get(key) for key in (
-                "airline_code", "flight_number", "flight_date",
-                "origin", "destination")
-            if payload.get(key) not in (None, "", [])
-        }
-        decision = _CATEGORY_HANDLER(
-            str(payload.get("incident") or ""),
-            rendered,
-            payload.get("ai_analysis") or {},
-            flight,
-        ) or {}
+        decision = {}
+        if _CATEGORY_HANDLER:
+            flight = {
+                key: payload.get(key) for key in (
+                    "airline_code", "flight_number", "flight_date",
+                    "origin", "destination")
+                if payload.get(key) not in (None, "", [])
+            }
+            decision = _CATEGORY_HANDLER(
+                str(payload.get("incident") or ""),
+                rendered,
+                payload.get("ai_analysis") or {},
+                flight,
+            ) or {}
         requested = str(decision.get("category") or "").strip()
-        return next((option for option in rendered
-                     if option.casefold() == requested.casefold()), "")
+        selected = next((option for option in rendered
+                         if option.casefold() == requested.casefold()), "")
+        trace = payload.setdefault("_gaca_category_ai_trace", [])
+        if isinstance(trace, list):
+            trace.append({
+                "level": str(level or ""),
+                "options": rendered,
+                "heuristic_fallback": preferred,
+                "decision": requested,
+                "rationale": str(decision.get("rationale") or "")[:240],
+                "accepted": bool(selected),
+            })
+            del trace[:-9]
+        if selected:
+            return selected
     except Exception:
         logger.exception("Ghala GACA category selection failed")
-        return ""
+    return preferred_match()
 
 
 def _gaca_live_select_options(page, select_id: str) -> list[str]:
@@ -3284,7 +3315,8 @@ def _select_gaca_category_tree(page, payload: dict) -> tuple[str, str, str]:
         pass
     main, sub, detail = _gaca_categories(payload)
     main_options = _gaca_live_select_options(page, "categorySelect")
-    main = _choose_gaca_live_option(payload, main_options, main) or main
+    main = _choose_gaca_live_option(
+        payload, main_options, main, level="main") or main
     exact_main = _select_gaca_category_value(
         page, "categorySelect", main,
         [r"baggage", r"on board", r"flight", r"customer"])
@@ -3317,7 +3349,8 @@ def _select_gaca_category_tree(page, payload: dict) -> tuple[str, str, str]:
         else r"(?!x)x",
     ]
     if sub_options:
-        sub = _choose_gaca_live_option(payload, sub_options, sub)
+        sub = _choose_gaca_live_option(
+            payload, sub_options, sub, level="sub")
         sub = _select_gaca_category_value(
             page, "subCategorySelect", sub,
             sub_fallbacks)
@@ -3378,7 +3411,8 @@ def _select_gaca_category_tree(page, payload: dict) -> tuple[str, str, str]:
         else r"(?!x)x",
     ]
     if detail_options:
-        detail = _choose_gaca_live_option(payload, detail_options, detail)
+        detail = _choose_gaca_live_option(
+            payload, detail_options, detail, level="detail")
         detail = _select_gaca_category_value(
             page, "subSubCategorySelect", detail,
             detail_fallbacks)
