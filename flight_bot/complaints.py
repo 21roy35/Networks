@@ -49,6 +49,27 @@ def _names(full_name: str) -> tuple[str, str, str]:
     return parts[0], " ".join(parts[1:-1]), parts[-1]
 
 
+def _gaca_reference_email_alias(email: str, airline_reference: str) -> str:
+    """Tag a Gmail address with the carrier reference for GACA threading."""
+    import re
+
+    match = re.fullmatch(
+        r"([^@\s]+)@(gmail\.com|googlemail\.com)",
+        str(email or "").strip(),
+        re.I,
+    )
+    if not match:
+        return str(email or "").strip()
+    tag = re.sub(
+        r"[^A-Za-z0-9]", "",
+        re.sub(r"^C_", "", str(airline_reference or "").strip(), flags=re.I),
+    )
+    if not tag:
+        return str(email or "").strip()
+    base_local = match.group(1).split("+", 1)[0]
+    return f"{base_local}+{tag}@{match.group(2).lower()}"
+
+
 def _clean_passenger_name(value: str) -> str:
     """Remove parser labels that can trail a passenger's booking name."""
     import re
@@ -368,6 +389,9 @@ def complaint_payload(flight: dict, user: dict, kind: str, incident: str,
     complaint_incident = str(
         (ai_analysis or {}).get("summary") or incident).strip()
     contact_email = identity.get("email") or user.get("email") or ""
+    if kind == "gaca":
+        contact_email = _gaca_reference_email_alias(
+            contact_email, airline_reference)
     contact_phone = identity.get("phone") or user.get("phone") or ""
     contact_country_code = (identity.get("country_code")
                             or user.get("country_code") or "")

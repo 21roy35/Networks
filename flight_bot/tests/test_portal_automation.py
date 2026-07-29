@@ -777,6 +777,43 @@ def test_gaca_payload_cannot_skip_the_airline_reference():
             "The carrier did not resolve the cancelled flight.")
 
 
+def test_gaca_email_uses_carrier_reference_alias_without_existing_tag():
+    saved = profile()
+    saved["email"] = "icrackgames101+muh@gmail.com"
+
+    payload = complaint_payload(
+        sample_flight(),
+        saved,
+        "gaca",
+        "The airline did not resolve the broken entertainment screen.",
+        airline_reference="C_2760788",
+        airline_complaint_date="2026-07-15",
+    )
+
+    assert payload["email"] == "icrackgames101+2760788@gmail.com"
+
+
+def test_reference_alias_is_gaca_only_and_does_not_rewrite_other_domains():
+    saved = profile()
+    saved["email"] = "passenger+family@example.com"
+    gaca = complaint_payload(
+        sample_flight(),
+        saved,
+        "gaca",
+        "The airline did not resolve the broken entertainment screen.",
+        airline_reference="C_2760788",
+    )
+    airline = complaint_payload(
+        sample_flight(),
+        dict(saved, email="icrackgames101+muh@gmail.com"),
+        "airline",
+        "The entertainment screen was broken throughout the flight.",
+    )
+
+    assert gaca["email"] == "passenger+family@example.com"
+    assert airline["email"] == "icrackgames101+muh@gmail.com"
+
+
 def test_only_official_registry_hosts_are_accepted():
     assert _is_official_url("https://help.flynas.com/en")
     assert _is_official_url("https://myeservices.gaca.gov.sa/service")
