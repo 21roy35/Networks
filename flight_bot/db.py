@@ -312,6 +312,12 @@ def init_db():
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA busy_timeout = 30000")
         conn.executescript(_SCHEMA)
+        # Remove legacy/false account rows that lack both an official GACA
+        # reference and an original airline complaint reference.
+        conn.execute(
+            """DELETE FROM gaca_account_cases
+               WHERE length(trim(COALESCE(reference, ''))) = 0
+                 AND length(trim(COALESCE(airline_reference, ''))) = 0""")
         columns = {row["name"] for row in
                    conn.execute("PRAGMA table_info(complaints)")}
         if "reference" not in columns:

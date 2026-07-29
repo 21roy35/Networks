@@ -177,7 +177,7 @@ def normalize_gaca_case(record: dict) -> dict | None:
     flight_source = _labeled(
         fields, r"flightnumber", r"flightno", r"رقمالرحلة")
     flight = _flight_number(flight_source)
-    if not flight:
+    if not flight and (reference or airline_ref):
         flights = {_flight_number(match.group(0))
                    for match in _FLIGHT_RE.finditer(blob)}
         flights.discard("")
@@ -187,7 +187,7 @@ def normalize_gaca_case(record: dict) -> dict | None:
     ticket_source = _labeled(
         fields, r"ticketnumber", r"eticket", r"رقمالتذكرة")
     ticket = _ticket_number(ticket_source)
-    if not ticket:
+    if not ticket and (reference or airline_ref):
         tickets = {match.group(1) for match in _TICKET_RE.finditer(blob)}
         if len(tickets) == 1:
             ticket = tickets.pop()
@@ -247,9 +247,10 @@ def normalize_gaca_case(record: dict) -> dict | None:
             "pairs": record.get("pairs") or [],
         },
     }
-    if not case["reference"] and not any((
-            case["airline_reference"], case["flight_number"],
-            case["ticket_number"], case["pnr"])):
+    # GACA account rows expose either the regulator case reference or the
+    # original airline complaint reference. A public information page that
+    # happens to contain text resembling a flight number is never a case.
+    if not case["reference"] and not case["airline_reference"]:
         return None
     case["case_key"] = (
         case["reference"]
@@ -505,6 +506,46 @@ def _same_gaca_url(url: str) -> bool:
     )
 
 
+def _gaca_account_signed_in(page) -> bool:
+    """Distinguish the public home page from an authenticated account."""
+    if portal_automation._is_gaca_login_page(page):
+        return False
+    snapshot = _page_snapshot(page)
+    for link in snapshot.get("links") or []:
+        href = str(link.get("href") or "")
+        text = str(link.get("text") or "")
+        if (re.search(r"/login(?:/|$)", href, re.I)
+                and re.fullmatch(r"\s*(?:login|sign\s*in|دخول)\s*", text, re.I)):
+            return False
+    blob = " ".join((
+        str(snapshot.get("text") or ""),
+        " ".join(
+            f"{link.get('text', '')} {link.get('href', '')}"
+            for link in snapshot.get("links") or []
+        ),
+    ))
+    return bool(re.search(
+        r"logout|sign\s*out|dashboard|my\s*(?:requests?|complaints?|"
+        r"applications?)|account|profile|تسجيل\s*الخروج|طلباتي|حسابي",
+        blob,
+        re.I,
+    ))
+
+
+def _open_exposed_login(page) -> bool:
+    snapshot = _page_snapshot(page)
+    for link in snapshot.get("links") or []:
+        href = str(link.get("href") or "")
+        text = str(link.get("text") or "")
+        if (_same_gaca_url(href)
+                and re.search(r"/login(?:/|$)", href, re.I)
+                and re.search(r"login|sign\s*in|دخول", text, re.I)):
+            page.goto(href, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(800)
+            return True
+    return False
+
+
 def _candidate_url(link: dict, *, detail: bool = False) -> bool:
     href = str(link.get("href") or "")
     text = " ".join((str(link.get("text") or ""), href)).casefold()
@@ -530,6 +571,8 @@ def _collect_account_records(page, max_cases: int) -> list[dict]:
     origin = gaca_normal_browser.GACA_HOME
     page.goto(origin, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(1200)
+    if not _gaca_account_signed_in(page):
+        raise PermissionError("GACA account sign-in expired during sync.")
     queue = [str(page.url)]
     visited: set[str] = set()
     detail_urls: list[str] = []
@@ -543,7 +586,7 @@ def _collect_account_records(page, max_cases: int) -> list[dict]:
         if str(page.url) != url:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(900)
-        if portal_automation._is_gaca_login_page(page):
+        if not _gaca_account_signed_in(page):
             raise PermissionError("GACA account sign-in expired during sync.")
         snapshot = _page_snapshot(page)
         records = list(snapshot.get("records") or [])
@@ -573,7 +616,7 @@ def _collect_account_records(page, max_cases: int) -> list[dict]:
         visited.add(url)
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(800)
-        if portal_automation._is_gaca_login_page(page):
+        if not _gaca_account_signed_in(page):
             raise PermissionError("GACA account sign-in expired during sync.")
         snapshot = _page_snapshot(page)
         case = normalize_gaca_case(snapshot)
@@ -661,12 +704,21 @@ def sync_gaca_account(
                     timeout=60000,
                 )
                 page.wait_for_timeout(1000)
-                if portal_automation._is_gaca_login_page(page):
+                if not _gaca_account_signed_in(page):
                     if not allow_login:
                         result = GacaAccountSyncResult(
                             "auth_required",
                             "The saved GACA session expired. Send /gaca in "
                             "Telegram to start a fresh Nafath login.")
+                        db.save_gaca_account_sync(
+                            result.status, result.message)
+                        return result
+                    if (not portal_automation._is_gaca_login_page(page)
+                            and not _open_exposed_login(page)):
+                        result = GacaAccountSyncResult(
+                            "auth_required",
+                            "GACA exposed no safe account login link. Nothing "
+                            "was submitted or changed.")
                         db.save_gaca_account_sync(
                             result.status, result.message)
                         return result
@@ -679,6 +731,20 @@ def sync_gaca_account(
                             "auth_required",
                             "GACA sign-in was not completed. Nothing was "
                             "submitted or changed.")
+                        db.save_gaca_account_sync(
+                            result.status, result.message)
+                        return result
+                    page.goto(
+                        gaca_normal_browser.GACA_HOME,
+                        wait_until="domcontentloaded",
+                        timeout=60000,
+                    )
+                    page.wait_for_timeout(800)
+                    if not _gaca_account_signed_in(page):
+                        result = GacaAccountSyncResult(
+                            "auth_required",
+                            "Nafath returned, but the GACA account did not "
+                            "become signed in. Nothing was changed.")
                         db.save_gaca_account_sync(
                             result.status, result.message)
                         return result

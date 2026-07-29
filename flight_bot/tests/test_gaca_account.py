@@ -50,6 +50,17 @@ def test_normalize_gaca_detail_extracts_regulator_and_airline_facts():
     assert case["passenger_name"] == "Mansour Albu Asais"
 
 
+def test_public_information_page_is_not_imported_as_a_case():
+    assert normalize_gaca_case({
+        "url": "https://myeservices.gaca.gov.sa/eservices/about",
+        "title": "About",
+        "text": (
+            "No. 12 of 2024. General aviation services are available "
+            "through the public website."),
+        "pairs": [],
+    }) is None
+
+
 def test_mapper_uses_airline_reference_before_shared_family_contact_data():
     mansour = _flight(
         "mansour-flight", "SV1671", "2026-06-15", "7V5F9V",
