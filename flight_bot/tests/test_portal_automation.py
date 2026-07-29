@@ -2181,6 +2181,60 @@ def test_gaca_adapter_walks_all_four_steps(monkeypatch):
     assert any("step 4 of 4" in message for _stage, message in updates)
 
 
+def test_gaca_incomplete_step4_reloads_once_before_filling(monkeypatch):
+    class Page:
+        url = (
+            "https://myeservices.gaca.gov.sa/eservices/public/qpe/"
+            "complaint-airline/step4?detailsId=2642710")
+
+        def __init__(self):
+            self.reloads = 0
+
+        def get_by_role(self, *_args, **_kwargs):
+            return object()
+
+        def reload(self, **kwargs):
+            self.reloads += 1
+            assert kwargs == {
+                "wait_until": "domcontentloaded",
+                "timeout": 60_000,
+            }
+
+    page = Page()
+    states = iter([None, object()])
+    monkeypatch.setattr(
+        portal_automation, "_wait_for_any_visible",
+        lambda *_args, **_kwargs: next(states))
+
+    assert portal_automation._ensure_gaca_step4_ready(page) is not None
+    assert page.reloads == 1
+
+
+def test_gaca_incomplete_step4_stops_after_one_safe_reload(monkeypatch):
+    class Page:
+        url = (
+            "https://myeservices.gaca.gov.sa/eservices/public/qpe/"
+            "complaint-airline/step4?detailsId=2642710")
+
+        def __init__(self):
+            self.reloads = 0
+
+        def get_by_role(self, *_args, **_kwargs):
+            return object()
+
+        def reload(self, **_kwargs):
+            self.reloads += 1
+
+    page = Page()
+    monkeypatch.setattr(
+        portal_automation, "_wait_for_any_visible",
+        lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="remained incomplete"):
+        portal_automation._ensure_gaca_step4_ready(page)
+    assert page.reloads == 1
+
+
 def test_claude_baggage_category_maps_to_saudia_quality_option():
     assert portal_automation._saudia_complaint_category({
         "incident": "My property was damaged during handling.",

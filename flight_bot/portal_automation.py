@@ -4033,6 +4033,41 @@ def _gaca_dwell(page, started: float, env_name: str, default: int) -> None:
         page.wait_for_timeout(round(remaining * 1000))
 
 
+def _ensure_gaca_step4_ready(page):
+    """Recover one incomplete final-page stream before filling any data.
+
+    GACA occasionally terminates the chunked Step 4 response after rendering
+    the first controls but before the Submit button and reCAPTCHA scripts.
+    Treating that partial DOM as a changed Submit control creates a pointless
+    Telegram prompt. Reloading the same server-side wizard step once is safe
+    because the complaint has not been posted and no Step 4 fields have been
+    entered yet.
+    """
+    submit = page.get_by_role(
+        "button", name=re.compile(r"^Submit$", re.I))
+    ready = _wait_for_any_visible(page, submit, 12_000)
+    if ready is not None:
+        return ready
+    if "/complaint-airline/step4" not in str(page.url or ""):
+        raise RuntimeError(
+            "GACA did not reach its final complaint-information step; "
+            "nothing was submitted.")
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=60_000)
+    except Exception as exc:
+        raise RuntimeError(
+            "GACA's final complaint page arrived incomplete and did not "
+            "reload safely; nothing was submitted.") from exc
+    submit = page.get_by_role(
+        "button", name=re.compile(r"^Submit$", re.I))
+    ready = _wait_for_any_visible(page, submit, 20_000)
+    if ready is None:
+        raise RuntimeError(
+            "GACA's final complaint page remained incomplete after one safe "
+            "reload; nothing was submitted.")
+    return ready
+
+
 def _prepare_gaca(page, payload: dict, update):
     update("opening", "Opening GACA’s official Airline Complaint service…")
     if not _wait_for_gaca_login(page, update, payload):
@@ -4325,6 +4360,7 @@ def _prepare_gaca(page, payload: dict, update):
                 f"({_gaca_step2_invalid_summary(page) or 'category invalid'}; "
                 f"{category_state}; URL={page.url}).")
 
+    _ensure_gaca_step4_ready(page)
     step4_started = time.monotonic()
     update("filling", "GACA step 4 of 4: filling flight and complaint details…")
     origin = str(payload.get("origin") or "").strip().upper()
@@ -4408,9 +4444,13 @@ def _prepare_gaca(page, payload: dict, update):
         inputs = page.locator("input[type='file']")
         if inputs.count():
             inputs.first.set_input_files(attachments)
-    _wait_for_any_visible(
+    submit_ready = _wait_for_any_visible(
         page, page.get_by_role("button", name=re.compile(r"^Submit$", re.I)),
         7000)
+    if submit_ready is None:
+        raise RuntimeError(
+            "GACA's final Submit control disappeared before review; nothing "
+            "was submitted and the saved complaint can retry safely.")
     update(
         "reviewing",
         "GACA step 4 of 4 is complete: flight details, complaint text, and "
