@@ -55,3 +55,12 @@ def test_proxy_idle_timeout_keeps_slow_gaca_response_alive(monkeypatch):
 
     monkeypatch.setenv("FLIGHTBOT_PROXY_IDLE_TIMEOUT_SECONDS", "invalid")
     assert MODULE._idle_timeout_seconds() == 180
+
+
+def test_proxy_city_pin_is_explicit_opt_in(monkeypatch):
+    monkeypatch.setenv("FLIGHTBOT_GACA_PROXY_CITY", "riyadh")
+    monkeypatch.delenv("FLIGHTBOT_GACA_PROXY_PIN_CITY", raising=False)
+    assert MODULE._target_city() == ""
+
+    monkeypatch.setenv("FLIGHTBOT_GACA_PROXY_PIN_CITY", "true")
+    assert MODULE._target_city() == "riyadh"

@@ -22,6 +22,20 @@ from urllib.parse import unquote, urlparse
 MAX_HEADER = 128 * 1024
 
 
+def _target_city() -> str:
+    """Use a city-pinned pool only when it is explicitly enabled.
+
+    The Saudi country pool previously completed GACA's whole wizard. A later
+    Riyadh-only pin produced repeatable TLS truncation on the large Step 4
+    response, so keep the narrower pool opt-in.
+    """
+    enabled = os.environ.get(
+        "FLIGHTBOT_GACA_PROXY_PIN_CITY", "").strip().casefold()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return ""
+    return os.environ.get("FLIGHTBOT_GACA_PROXY_CITY", "").strip()
+
+
 def _read_header(sock: socket.socket) -> tuple[bytes, bytes]:
     data = bytearray()
     while b"\r\n\r\n" not in data:
@@ -202,8 +216,7 @@ def main() -> int:
     ProxyHandler.upstream_port = parsed.port
     ProxyHandler.upstream_username = unquote(parsed.username)
     ProxyHandler.upstream_password = unquote(parsed.password)
-    ProxyHandler.target_city = os.environ.get(
-        "FLIGHTBOT_GACA_PROXY_CITY", "").strip()
+    ProxyHandler.target_city = _target_city()
     session_file = os.environ.get(
         "FLIGHTBOT_GACA_PROXY_SESSION_FILE", "").strip()
     ProxyHandler.session_file = Path(session_file) if session_file else None
