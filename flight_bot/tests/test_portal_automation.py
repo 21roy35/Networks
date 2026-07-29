@@ -226,6 +226,16 @@ def test_gaca_rate_limit_pauses_only_matching_passenger_for_24_hours(
             },
             "max_attempts": 100000,
         })
+    db.save_portal_job({
+        "id": "gaca-held-same-passenger",
+        "kind": "gaca",
+        "status": "held",
+        "payload": {
+            "kind": "gaca",
+            "national_id": "1111111111",
+            "passenger_name": "held passenger job",
+        },
+    })
     assert db.claim_portal_job("gaca-current") is not None
     before = db.time.time()
 
@@ -239,6 +249,7 @@ def test_gaca_rate_limit_pauses_only_matching_passenger_for_24_hours(
     current = db.get_portal_job("gaca-current")
     same_passenger = db.get_portal_job("gaca-same-passenger")
     family_member = db.get_portal_job("gaca-family-member")
+    held = db.get_portal_job("gaca-held-same-passenger")
     airline = db.get_portal_job("airline-job")
     assert 24 * 3600 - 5 <= first_due - before <= 24 * 3600 + 5
     assert current["status"] == "retry_wait"
@@ -246,6 +257,8 @@ def test_gaca_rate_limit_pauses_only_matching_passenger_for_24_hours(
     assert same_passenger["status"] == "retry_wait"
     assert same_passenger["next_attempt_at"] == first_due + 24 * 3600
     assert family_member["status"] == "queued"
+    assert held["status"] == "held"
+    assert held["next_attempt_at"] is None
     assert airline["status"] == "queued"
     assert db.gaca_identity_circuit_until(
         identity_key=current["identity_key"]) == first_due

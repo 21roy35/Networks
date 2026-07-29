@@ -722,7 +722,7 @@ def defer_gaca_identity_jobs(
             """SELECT id FROM portal_jobs
                WHERE kind='gaca' AND identity_key=? AND terminal=0
                  AND status NOT IN (
-                     'submitted', 'superseded', 'cancelled')
+                     'submitted', 'superseded', 'cancelled', 'held')
                ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END,
                         COALESCE(next_attempt_at, 0), created_at, id""",
             (key, str(current_job_id)),
