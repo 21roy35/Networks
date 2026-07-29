@@ -1483,8 +1483,46 @@ def test_auto_escalation_silently_recognizes_active_gaca_job(
         db.get_flight(flight["id"]), automatic=True) is False
 
     assert not any(
-        "already underway or on record" in item["text"]
+        "existing GACA filing" in item["text"]
         for item in api.messages)
+
+
+def test_manual_gaca_duplicate_reports_real_active_job_state(
+        coordinator, monkeypatch):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    airline_id = db.add_complaint(
+        flight["flight_key"], "airline", None, "Seat complaint",
+        "submitted", reference="CAS-700022",
+        details="The seat door was broken.")
+    gaca_id = db.add_complaint(
+        flight["flight_key"], "gaca", None, "Active GACA escalation",
+        "filing", details="The seat door was broken.",
+        parent_complaint_id=airline_id)
+    db.save_portal_job({
+        "id": "active-manual-gaca",
+        "kind": "gaca",
+        "flight_key": flight["flight_key"],
+        "complaint_id": gaca_id,
+        "status": "verification",
+        "message": "Waiting for the required ticket number",
+        "terminal": False,
+        "payload": {"kind": "gaca"},
+    })
+    monkeypatch.setattr(
+        telegram_bot, "missing_portal_fields", lambda _payload: [])
+
+    assert bot._launch_gaca(
+        db.get_flight(flight["id"]), automatic=False,
+        prior_complaint=db.get_complaint(airline_id)) is False
+
+    assert api.messages[-1]["text"] == (
+        "The existing GACA filing is still verification: "
+        "Waiting for the required ticket number. "
+        "I did not start a second submission.")
+    assert "on record" not in api.messages[-1]["text"]
 
 
 def test_old_filing_with_active_portal_job_is_not_replaced(
@@ -1541,7 +1579,7 @@ def test_old_filing_with_active_portal_job_is_not_replaced(
     ]
     assert [item["id"] for item in gaca_rows] == [gaca_id]
     assert not any(
-        "already underway or on record" in item["text"]
+        "existing GACA filing" in item["text"]
         for item in api.messages)
 
 

@@ -2988,9 +2988,14 @@ class TelegramCoordinator:
             # complaint reservation. Avoid both duplicate AI work and a second
             # GACA reservation while the first browser is still progressing.
             if not automatic:
+                job_status = str(
+                    active_portal_job.get("status") or "active").replace("_", " ")
+                job_message = str(
+                    active_portal_job.get("message") or "").strip()
+                detail = f": {job_message}." if job_message else "."
                 self.notify(
-                    "A GACA escalation for this flight is already underway or "
-                    "on record. I will not submit it again.")
+                    f"The existing GACA filing is still {job_status}{detail} "
+                    "I did not start a second submission.")
             return False
         now = self._flight_local_now()
         incident_day = parse_flight_time(
@@ -3114,9 +3119,19 @@ class TelegramCoordinator:
             # new GACA rejection, so automatic cycles must stay quiet. Keep a
             # response for an explicit/manual duplicate request.
             if not automatic:
-                self.notify(
-                    "A GACA escalation for this flight is already underway or "
-                    "on record. I will not submit it again.")
+                existing = db.active_complaint_for_flight(
+                    flight["flight_key"], "gaca") or {}
+                existing_status = str(
+                    existing.get("status") or "active").replace("_", " ")
+                existing_reference = str(existing.get("reference") or "").strip()
+                if existing_reference:
+                    self.notify(
+                        "This GACA complaint was already submitted. "
+                        f"Reference: {existing_reference}. I did not submit it again.")
+                else:
+                    self.notify(
+                        "An existing GACA filing reservation is still "
+                        f"{existing_status}. I did not start a second submission.")
             return False
         airline_id = prior["id"]
         auto_key = f"auto-gaca:{airline_id}"

@@ -3152,6 +3152,8 @@ def _choose_gaca_live_option(
                 "heuristic_fallback": preferred,
                 "decision": requested,
                 "rationale": str(decision.get("rationale") or "")[:240],
+                "rationale_valid": decision.get("rationale_valid"),
+                "api_attempts": list(decision.get("api_attempts") or [])[:2],
                 "accepted": bool(selected),
             })
             del trace[:-9]

@@ -107,6 +107,63 @@ def test_portal_vision_places_png_before_the_untrusted_page_text():
     assert content[0]["source"]["media_type"] == "image/png"
 
 
+def test_category_retries_placeholder_rationale_and_audits_raw_attempts():
+    class SequencedSession:
+        def __init__(self):
+            self.calls = []
+            self.results = [
+                {"category": "On Board Services", "rationale": "placeholder"},
+                {
+                    "category": "On Board Services",
+                    "rationale": (
+                        "The occupied-lavatory privacy incident is onboard "
+                        "crew conduct."),
+                },
+            ]
+
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            value = self.results.pop(0)
+            return FakeResponse({
+                "content": [{"type": "text", "text": json.dumps(value)}],
+            })
+
+    session = SequencedSession()
+    assistant = ClaudeAssistant(enabled_config(), session=session)
+    actual = assistant.choose_complaint_category(
+        "A crew member opened the occupied lavatory door.",
+        ["Customer Service", "On Board Services"],
+        {"category": "service"},
+        {"flight_number": "RX28"},
+    )
+
+    assert actual["category"] == "On Board Services"
+    assert actual["rationale_valid"] is True
+    assert actual["api_attempts"] == [
+        {
+            "category": "On Board Services",
+            "rationale": "placeholder",
+            "category_valid": True,
+            "rationale_valid": False,
+        },
+        {
+            "category": "On Board Services",
+            "rationale": (
+                "The occupied-lavatory privacy incident is onboard "
+                "crew conduct."),
+            "category_valid": True,
+            "rationale_valid": True,
+        },
+    ]
+    assert len(session.calls) == 2
+    request = session.calls[0][1]["json"]
+    rationale_schema = request["output_config"]["format"]["schema"][
+        "properties"]["rationale"]
+    assert rationale_schema["minLength"] == 20
+    prompt = request["messages"][0]["content"][-1]["text"]
+    assert "never return placeholder" in prompt
+
+
 def test_sms_distillation_copies_only_visible_otp_and_reference():
     result = {
         "otp": "839201", "reference": "C_2777654",

@@ -2391,6 +2391,8 @@ def test_gaca_heuristic_does_not_hide_main_options_from_ghala(monkeypatch):
         "decision": "On Board Services",
         "rationale": (
             "The occupied-lavatory privacy incident happened onboard."),
+        "rationale_valid": None,
+        "api_attempts": [],
         "accepted": True,
     }
 

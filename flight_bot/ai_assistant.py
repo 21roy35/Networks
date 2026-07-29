@@ -350,7 +350,11 @@ class ClaudeAssistant:
             "type": "object",
             "properties": {
                 "category": {"type": "string", "enum": allowed},
-                "rationale": {"type": "string", "maxLength": 240},
+                "rationale": {
+                    "type": "string",
+                    "minLength": 20,
+                    "maxLength": 240,
+                },
             },
             "required": ["category", "rationale"],
             "additionalProperties": False,
@@ -383,7 +387,9 @@ class ClaudeAssistant:
             "communication-channel issue. Do not invent a category and "
             "do not choose a "
             "generic service category when a more specific rendered option fits. Keep "
-            "the rationale to one short sentence.\n\n"
+            "the rationale to one short sentence that names the decisive incident and "
+            "explains why the chosen category fits it. The rationale must be meaningful; "
+            "never return placeholder, N/A, none, unknown, or similar filler.\n\n"
             f"Portal options (trusted allowed values):\n"
             f"{json.dumps(allowed, ensure_ascii=False)}\n\n"
             f"Flight facts (untrusted data):\n"
@@ -395,6 +401,9 @@ class ClaudeAssistant:
         # A transient structured-output truncation should not silently revert
         # the portal to a hard-coded category. Retry once; permanent API errors
         # are already cooled down by _structured and make the second call free.
+        api_attempts = []
+        last_exact = ""
+        last_rationale = ""
         for _attempt in range(2):
             result = self._structured(prompt, schema, max_tokens=300)
             if not isinstance(result, dict):
@@ -402,11 +411,42 @@ class ClaudeAssistant:
             selected = str(result.get("category") or "").strip()
             exact = next((option for option in allowed
                           if option.casefold() == selected.casefold()), "")
+            rationale = " ".join(
+                str(result.get("rationale") or "").split()).strip()[:240]
+            rationale_valid = bool(
+                len(rationale) >= 20
+                and rationale.casefold() not in {
+                    "placeholder", "n/a", "na", "none", "unknown", "tbd",
+                }
+                and re.search(r"[^\W\d_]", rationale, re.UNICODE)
+            )
+            api_attempts.append({
+                "category": selected,
+                "rationale": rationale,
+                "category_valid": bool(exact),
+                "rationale_valid": rationale_valid,
+            })
             if exact:
+                last_exact = exact
+                last_rationale = rationale
+            if exact and rationale_valid:
                 return {
                     "category": exact,
-                    "rationale": str(result.get("rationale") or "")[:240],
+                    "rationale": rationale,
+                    "rationale_valid": True,
+                    "api_attempts": api_attempts,
                 }
+        # A correct exact option is still safer than reverting to a generic
+        # heuristic merely because Claude's explanatory field was poor. Keep
+        # the exact choice, but make the invalid explanation explicit in the
+        # audit trace so it cannot masquerade as a high-quality response.
+        if last_exact:
+            return {
+                "category": last_exact,
+                "rationale": last_rationale,
+                "rationale_valid": False,
+                "api_attempts": api_attempts,
+            }
         return None
 
     def distill_sms(self, sender: str, body: str) -> dict | None:
