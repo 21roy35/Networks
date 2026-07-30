@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import sys
 from dataclasses import asdict
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from flight_bot.gaca_status import interpret_gaca_remediation
 
