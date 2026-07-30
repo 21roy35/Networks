@@ -5031,7 +5031,7 @@ def _riyadh_air_submission_result(
             retry_safe=True,
         )
     accepted = bool(re.search(
-        r"(?:case|request).{0,80}(?:created|received|submitted)"
+        r"(?:case|request|concern).{0,80}(?:created|received|submitted)"
         r"(?:\s+successfully)?|successfully.{0,80}"
         r"(?:created|received|submitted)|thank you.{0,120}"
         r"(?:case|request)",
@@ -5435,6 +5435,7 @@ def _await_confirmation(page, before_url: str, update,
             r"successfully submitted|request (?:was )?received|"
             r"complaint (?:was )?received|case (?:was )?"
             r"(?:created|received|submitted)|"
+            r"concern (?:(?:is|was) )?received successfully|"
             r"تم (?:استلام|إرسال)|رقم (?:الطلب|الشكوى)",
             text, re.I))
         if not success and re.search(r"thank you|شكرا", text, re.I):

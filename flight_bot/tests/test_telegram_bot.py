@@ -12,6 +12,7 @@ from flight_bot.config import DEFAULTS
 from flight_bot.pipeline import ingest, load_demo
 from flight_bot.portal_automation import PortalResult, _annotate_grid, _parse_cells
 from flight_bot.gaca_account import GacaAccountSyncResult
+from flight_bot.gaca_status import GacaCaseResult
 from flight_bot.telegram_bot import TelegramAPI, TelegramCoordinator
 from flight_bot import telegram_bot
 from flight_bot.web_access import verify_web_token
@@ -126,6 +127,24 @@ def test_saudia_confirmation_prefers_case_reference_over_emd_voucher():
     assert reference == "C_2737927"
 
 
+def test_riyadh_air_confirmation_accepts_long_number_only_in_case_context():
+    assert telegram_bot._airline_confirmation_reference(
+        "Your Riyadh Air case was received",
+        "Case number: 26073012345678901",
+        "RX",
+    ) == "26073012345678901"
+    assert telegram_bot._airline_confirmation_reference(
+        "Your Riyadh Air itinerary",
+        "E-ticket number: 26073012345678901",
+        "RX",
+    ) == ""
+    assert telegram_bot._airline_confirmation_reference(
+        "Your case was received",
+        "Case number: 26073012345678901",
+        "SV",
+    ) == ""
+
+
 def test_telegram_transport_errors_never_echo_bot_token():
     class FailedSession:
         def post(self, *_args, **_kwargs):
@@ -176,6 +195,131 @@ def test_notification_outage_does_not_abort_portal_work(
 
     assert bot.notify("Portal work is starting") == {}
     assert bot._send_photo(b"image", "Portal screenshot") == {}
+
+
+def test_gaca_sms_checker_saves_verified_response_and_explains_bad_reference(
+        coordinator, monkeypatch):
+    bot, api = coordinator
+    airline_id = db.begin_complaint(
+        "RX|28|2026-06-16", "airline", "Airline complaint", "Incident")
+    db.finish_complaint(airline_id, "submitted", "NOT-A-CASE")
+    gaca_id = db.begin_complaint(
+        "RX|28|2026-06-16", "gaca", "GACA complaint", "Incident",
+        parent_complaint_id=airline_id)
+    db.finish_complaint(gaca_id, "submitted", "C076574")
+    sms_id, _created = db.save_sms_message({
+        "fingerprint": "gaca-status-sms-45",
+        "sender": "GACA CARE",
+        "received_at": "2026-07-30T09:16:00+03:00",
+        "body": "Closed C076574. Details: https://pxpticket.gaca.gov.sa/",
+    })
+    db.queue_gaca_status_check(
+        "C076574", "https://pxpticket.gaca.gov.sa/",
+        trigger_sms_id=sms_id, urgent=True)
+    monkeypatch.setattr(
+        telegram_bot,
+        "check_gaca_case",
+        lambda *_args, **_kwargs: GacaCaseResult(
+            "rejected",
+            "rejected",
+            (
+                "Case status: rejected\n"
+                "Provided solution: The supplied airline reference is not a "
+                "complaint number."
+            ),
+            "GACA rejected the case.",
+            {},
+        ),
+    )
+
+    bot.process_gaca_status_checks()
+
+    stored = db.get_complaint(gaca_id)
+    assert stored["status"] == "rejected"
+    assert "not a complaint number" in stored["provider_response_text"]
+    assert db.list_gaca_status_checks()[0]["status"] == "checked"
+    messages = "\n".join(item["text"] for item in api.messages)
+    assert "GACA response retrieved" in messages
+    assert "will not reuse that value" in messages
+
+
+def test_gaca_airline_prerequisite_creates_one_fresh_airline_filing(
+        coordinator, monkeypatch):
+    bot, api = coordinator
+    flight_key = "RXORDER|RX28|2026-06-16"
+    db.replace_flights([{
+        "flight_key": flight_key,
+        "airline_code": "RX",
+        "airline_name": "Riyadh Air",
+        "pnr": "RXORDER",
+        "flight_number": "RX28",
+        "flight_numbers": ["RX28"],
+        "flight_date": "2026-06-16",
+        "origin": "JED",
+        "destination": "RUH",
+        "passenger": "Test Passenger",
+        "email_ids": [],
+    }])
+    airline_id = db.begin_complaint(
+        flight_key,
+        "airline",
+        "Airline complaint",
+        "Original onboard service and privacy incident.",
+        issue_summary="Privacy and service failures.",
+        requested_resolution_summary="Fair financial compensation.",
+    )
+    db.finish_complaint(airline_id, "submitted", "ORDER-NOT-CASE")
+    gaca_id = db.begin_complaint(
+        flight_key,
+        "gaca",
+        "GACA escalation",
+        "Escalation",
+        parent_complaint_id=airline_id,
+    )
+    db.finish_complaint(gaca_id, "submitted", "C076574")
+    db.set_complaint_response(
+        gaca_id,
+        response_text=(
+            "Case status: canceled\nProvided solution: "
+            "يجب أولاً تقديم الشكوى لدى الناقل الجوي، ثم الانتظار 7 أيام."
+        ),
+        response_summary="File with the airline first.",
+    )
+    launched = []
+
+    def start(payload, on_complete, on_update):
+        launched.append(payload)
+        on_complete(PortalResult(
+            "submitted",
+            "Riyadh Air accepted the case.",
+            "26073012345678901",
+        ))
+
+    monkeypatch.setattr(telegram_bot, "start_portal_job", start)
+    replacement_id = bot.refile_airline_after_gaca_prerequisite(
+        gaca_id,
+        incident_override=(
+            "انتهاك خصوصيتي بدورة المياه؛ الطعام بارد؛ "
+            "باب المقعد مكسور. أطلب تعويضاً."
+        ),
+    )
+
+    assert replacement_id
+    assert db.get_complaint(airline_id)["status"] == "reference_rejected"
+    assert db.get_complaint(gaca_id)["status"] == "canceled"
+    replacement = db.get_complaint(replacement_id)
+    assert replacement["status"] == "submitted"
+    assert replacement["reference"] == "26073012345678901"
+    assert replacement["parent_complaint_id"] == airline_id
+    assert launched[0]["portal_complaint_id"] == replacement_id
+    assert launched[0]["airline_code"] == "RX"
+
+    same_id = bot.refile_airline_after_gaca_prerequisite(gaca_id)
+    assert same_id == replacement_id
+    assert len(launched) == 1
+    messages = "\n".join(item["text"] for item in api.messages)
+    assert "fresh seven-day GACA timer" in messages
+    assert "did not create a duplicate" in messages
 
 
 def test_otp_is_relayed_and_deleted_after_use(coordinator):

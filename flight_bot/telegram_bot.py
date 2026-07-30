@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import queue
 import re
 import threading
@@ -29,6 +30,13 @@ from .config import TELEGRAM_EVIDENCE_DIR, passenger_profile_key
 from .flight_status import (get_flight_status, live_landed, parse_flight_time,
                             refresh_flight_status, schedule_has_finished)
 from .gaca_account import sync_gaca_account
+from .gaca_status import (
+    GacaStatusError,
+    check_gaca_case,
+    extract_gaca_details_url,
+    normalize_gaca_phone,
+    requires_airline_complaint,
+)
 from .mail_client import fetch_recent_verification_message
 from .pipeline import rebuild_flights, scan_mailbox
 from .portal_automation import (PortalResult, _extract_reference, set_ai_handler,
@@ -83,7 +91,8 @@ def _clean_excerpt(value: str, limit: int = 1300) -> str:
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
-def _airline_confirmation_reference(subject: str, body: str) -> str:
+def _airline_confirmation_reference(
+        subject: str, body: str, airline_code: str = "") -> str:
     """Extract case ids, including Saudia's real Ticket C_123456 format.
 
     Plain ticket numbers are accepted only from complaint-lifecycle subjects,
@@ -97,6 +106,19 @@ def _airline_confirmation_reference(subject: str, body: str) -> str:
         r"(?<![A-Z0-9])C[_-](\d{6,})(?!\d)", blob, re.I)
     if explicit:
         return f"C_{explicit.group(1)}"
+    if str(airline_code or "").strip().upper() == "RX":
+        # Riyadh Air's Power Pages confirmation uses a long numeric public
+        # case id. Accept it only beside explicit case/request/reference
+        # wording and only while reconciling a known Riyadh Air complaint.
+        riyadh = re.search(
+            r"\b(?:case|request|reference)"
+            r"(?:\s+(?:number|no\.?|id))?\s*(?:is|:|#|-)?\s*"
+            r"(\d{12,20})\b",
+            blob,
+            re.I,
+        )
+        if riyadh:
+            return riyadh.group(1)
     reference = _extract_reference(blob)
     if reference and not (
         reference.isdigit() and len(reference) > 9
@@ -367,6 +389,8 @@ class TelegramCoordinator:
         self._gaca_sync_lock = threading.Lock()
         self._gaca_sync_thread: threading.Thread | None = None
         self._last_gaca_sync = 0.0
+        self._gaca_status_lock = threading.Lock()
+        self._gaca_status_thread: threading.Thread | None = None
         # Legacy floor kept for migrations/tests; FIFO response matching is disabled.
         self._fifo_response_floor = db.initialize_fifo_response_floor()
 
@@ -406,6 +430,7 @@ class TelegramCoordinator:
         ).start()
         threading.Thread(target=self._monitor_loop, name="telegram-monitor",
                          daemon=True).start()
+        self._backfill_gaca_status_checks()
         return self
 
     def _register_commands(self):
@@ -611,6 +636,360 @@ class TelegramCoordinator:
         else:
             self.notify(text)
 
+    @staticmethod
+    def _gaca_status_sms_is_urgent(body: str) -> bool:
+        return bool(re.search(
+            r"\b(?:closed|rejected|resolved|decision)\b|"
+            r"تم\s+إغلاق|مغلقة|مرفوض",
+            str(body or ""),
+            re.I,
+        ))
+
+    def _backfill_gaca_status_checks(self) -> None:
+        """Index existing GACA Details SMS messages without replaying checks."""
+        seen = set()
+        for sms in db.list_sms_messages(500):
+            blob = " ".join((
+                str(sms.get("sender") or ""),
+                str(sms.get("body") or ""),
+            ))
+            if "gaca" not in blob.casefold() and "الطيران المدني" not in blob:
+                continue
+            details_url = extract_gaca_details_url(sms.get("body") or "")
+            match = re.search(r"(?<![A-Z0-9])C\d{6,12}(?!\d)", blob, re.I)
+            reference = match.group(0).upper() if match else ""
+            if not details_url or not reference or reference in seen:
+                continue
+            seen.add(reference)
+            db.queue_gaca_status_check(
+                reference,
+                details_url,
+                trigger_sms_id=int(sms["id"]),
+                urgent=self._gaca_status_sms_is_urgent(
+                    str(sms.get("body") or "")),
+            )
+        self._kick_gaca_status_worker()
+
+    def queue_gaca_status_check(
+            self,
+            reference: str,
+            details_url: str,
+            *,
+            sms_id: int | None = None,
+            urgent: bool = False) -> int | None:
+        """Queue a verified GACA SMS Details link for background checking."""
+        check_id = db.queue_gaca_status_check(
+            reference,
+            details_url,
+            trigger_sms_id=sms_id,
+            urgent=urgent,
+        )
+        if check_id and urgent:
+            self.notify(
+                f"GACA says {reference} has a final status. FlightDeck is "
+                "opening the official Details workflow now to retrieve the "
+                "actual response.")
+        if check_id:
+            self._kick_gaca_status_worker()
+        return check_id
+
+    def _kick_gaca_status_worker(self) -> None:
+        if not db.has_due_gaca_status_check():
+            return
+        with self._lock:
+            if (
+                self._gaca_status_thread
+                and self._gaca_status_thread.is_alive()
+            ):
+                return
+            self._gaca_status_thread = threading.Thread(
+                target=self.process_gaca_status_checks,
+                name="gaca-status-check",
+                daemon=True,
+            )
+            self._gaca_status_thread.start()
+
+    def process_gaca_status_checks(self) -> None:
+        """Check one due GACA case through reCAPTCHA and the SMS OTP relay."""
+        if not self._gaca_status_lock.acquire(blocking=False):
+            return
+        try:
+            check = db.claim_due_gaca_status_check()
+            if not check:
+                return
+            complaint_id = int(check["complaint_id"])
+            complaint = db.get_complaint(complaint_id) or {}
+            job = db.latest_portal_job_for_complaint(complaint_id) or {}
+            payload = job.get("payload") or {}
+            identity = self.config.get("user") or {}
+            phone = normalize_gaca_phone(
+                str(payload.get("country_code")
+                    or identity.get("country_code") or ""),
+                str(payload.get("phone") or identity.get("phone") or ""),
+            )
+
+            def update(stage: str, message: str) -> None:
+                self.notify(
+                    f"GACA checker · {stage.replace('_', ' ').title()}\n"
+                    f"{message}")
+
+            try:
+                result = check_gaca_case(
+                    str(check.get("reference") or ""),
+                    phone,
+                    captcha_solver=self.captcha.solve,
+                    verification_handler=self.request_verification,
+                    proxy_url=(
+                        os.environ.get(
+                            "FLIGHTBOT_GACA_LOCAL_PROXY", "").strip()
+                        or os.environ.get(
+                            "FLIGHTBOT_GACA_PROXY", "").strip()
+                        or os.environ.get(
+                            "FLIGHTBOT_BROWSER_PROXY", "").strip()
+                    ),
+                    update=update,
+                )
+            except GacaStatusError as exc:
+                db.retry_gaca_status_check(int(check["id"]), str(exc))
+                self.notify(
+                    "GACA status check needs attention and was scheduled for "
+                    f"a safe retry: {exc}")
+                return
+            except Exception as exc:
+                logger.exception("GACA status checker failed")
+                db.retry_gaca_status_check(
+                    int(check["id"]), type(exc).__name__)
+                self.notify(
+                    "GACA's status service failed unexpectedly. FlightDeck "
+                    "kept the complaint record unchanged and scheduled a "
+                    "bounded retry.")
+                return
+
+            analysis = None
+            if self.ai.enabled and result.response_text:
+                analysis = self.ai.analyze_response(
+                    f"GACA case {check['reference']} status",
+                    result.response_text,
+                    str(check["reference"]),
+                    "GACA",
+                )
+            summary = str(
+                (analysis or {}).get("summary") or result.message).strip()
+            db.finish_gaca_status_check(
+                int(check["id"]),
+                case_status=result.case_status,
+                response_text=result.response_text,
+                response_summary=summary,
+            )
+            db.set_complaint_response(
+                complaint_id,
+                response_text=result.response_text,
+                response_summary=summary,
+            )
+            if result.case_status in {
+                    "closed", "rejected", "canceled", "solved"}:
+                db.finish_complaint(
+                    complaint_id,
+                    result.case_status,
+                    str(check.get("reference") or "") or None,
+                )
+            self.notify(
+                f"✅ GACA response retrieved for {check['reference']}\n"
+                f"Status: {result.case_status.replace('_', ' ')}\n"
+                f"{summary[:2600]}"
+            )
+            invalid_airline_reference = bool(re.search(
+                r"not (?:a|an).{0,40}(?:complaint|case).{0,30}"
+                r"(?:number|reference)|"
+                r"(?:complaint|case).{0,40}(?:number|reference).{0,40}"
+                r"(?:invalid|incorrect)|"
+                r"ليس.{0,40}رقم.{0,30}شكوى|"
+                r"رقم.{0,40}شكوى.{0,40}(?:غير صحيح|غير صالح)|"
+                r"تقديم.{0,50}شكوى.{0,50}شركة الطيران",
+                result.response_text,
+                re.I,
+            )) or requires_airline_complaint(result.response_text)
+            if invalid_airline_reference:
+                self.notify(
+                    "GACA rejected the airline-reference evidence. FlightDeck "
+                    "will not reuse that value for another escalation; a real "
+                    "airline portal case must be filed and its new reference "
+                    "must complete a fresh seven-day waiting period.")
+        finally:
+            self._gaca_status_lock.release()
+
+    def refile_airline_after_gaca_prerequisite(
+            self,
+            gaca_complaint_id: int,
+            *,
+            incident_override: str = "") -> int | None:
+        """Replace rejected airline evidence with one real portal filing.
+
+        GACA sometimes closes a case because the supplied value is an order
+        or ticket identifier rather than evidence of a complaint filed with
+        the carrier. Preserve both historical references, retire only the bad
+        evidence row, and create one airline child whose own submission date
+        starts a fresh seven-day escalation window.
+        """
+        regulator = db.get_complaint(int(gaca_complaint_id)) or {}
+        if (
+            regulator.get("kind") != "gaca"
+            or not requires_airline_complaint(
+                str(regulator.get("provider_response_text") or ""))
+        ):
+            self.notify(
+                "The saved GACA outcome does not explicitly require a fresh "
+                "airline complaint, so FlightDeck made no lineage change.")
+            return None
+        parent_id = int(regulator.get("parent_complaint_id") or 0)
+        prior = db.get_complaint(parent_id) if parent_id else None
+        if not prior or prior.get("kind") != "airline":
+            self.notify(
+                "The GACA case has no exact parent airline filing to replace. "
+                "Nothing was submitted.")
+            return None
+        flight = db.get_flight_by_key(str(regulator.get("flight_key") or ""))
+        if not flight:
+            self.notify(
+                "The flight linked to GACA's response is unavailable. "
+                "Nothing was submitted.")
+            return None
+
+        children = [
+            item for item in db.complaints_for_flight(flight["flight_key"])
+            if item.get("kind") == "airline"
+            and int(item.get("parent_complaint_id") or 0) == parent_id
+            and item.get("status") in {
+                "filing", "submitted", "filed", "sent",
+                "accepted_pending_reference",
+            }
+        ]
+        if children:
+            self.notify(
+                "The replacement airline complaint already exists. "
+                "FlightDeck did not create a duplicate.")
+            return int(children[-1]["id"])
+
+        incident = str(
+            incident_override
+            or prior.get("original_text")
+            or prior.get("details")
+            or ""
+        ).strip()
+        try:
+            payload = complaint_payload(
+                flight,
+                self.config["user"],
+                "airline",
+                incident,
+                attachments=prior.get("attachments") or [],
+                passenger_profiles=self.config.get("passengers") or {},
+            )
+        except ValueError as exc:
+            self.notify(f"Could not prepare the airline complaint: {exc}")
+            return None
+        missing = missing_portal_fields(payload)
+        if missing:
+            self.notify(
+                "The replacement airline complaint still needs: "
+                + ", ".join(missing) + ". Nothing was submitted.")
+            return None
+
+        db.finish_complaint(
+            int(regulator["id"]),
+            "canceled",
+            str(regulator.get("reference") or "") or None,
+        )
+        db.finish_complaint(
+            parent_id,
+            "reference_rejected",
+            str(prior.get("reference") or "") or None,
+        )
+        complaint_id = db.begin_complaint(
+            flight["flight_key"],
+            "airline",
+            payload["subject"],
+            incident,
+            prior.get("attachments") or [],
+            submitted_text=payload.get("description") or "",
+            parent_complaint_id=parent_id,
+            issue_summary=str(prior.get("issue_summary") or incident),
+            requested_resolution_summary=str(
+                prior.get("requested_resolution_summary")
+                or "Fair financial compensation for the service failures."),
+        )
+        if complaint_id is None:
+            self.notify(
+                "Another active airline filing appeared before the replacement "
+                "could be reserved. FlightDeck did not create a duplicate.")
+            return None
+        payload.update(
+            portal_complaint_id=complaint_id,
+            replaces_invalid_reference=str(prior.get("reference") or ""),
+            replacement_for_gaca_complaint=int(regulator["id"]),
+        )
+        self.notify(
+            f"GACA closed {regulator.get('reference') or 'the escalation'} "
+            "because the airline must receive the complaint first. FlightDeck "
+            f"preserved that history and is filing one fresh complaint through "
+            f"{payload['airline_name']}'s official website now.")
+
+        def finish_record(status: str, reference_value: str | None = None):
+            db.finish_complaint(
+                complaint_id,
+                status,
+                reference_value,
+                submitted_text=payload.get("description") or None,
+                portal_category=(
+                    payload.get("selected_complaint_category") or None),
+            )
+
+        def complete(result: PortalResult):
+            if result.status == "submitted":
+                finish_record("submitted", result.reference or None)
+                db.update_survey_status(flight["flight_key"], "filed")
+                self.notify(
+                    "The replacement airline complaint was submitted."
+                    + (
+                        f" Reference: {result.reference}."
+                        if result.reference else ""
+                    )
+                    + " Its fresh seven-day GACA timer starts from this "
+                    "submission; the rejected order/ticket value will not be "
+                    "reused.")
+            elif result.status == "accepted_pending_reference":
+                finish_record("accepted_pending_reference")
+                db.update_survey_status(
+                    flight["flight_key"], "needs_attention")
+                self.notify(
+                    "The airline accepted the fresh complaint. FlightDeck is "
+                    "recovering its real case reference from the confirmation "
+                    "email/SMS and will not submit a duplicate. The seven-day "
+                    "window is tied to this new filing.")
+            else:
+                finish_record("failed")
+                db.update_survey_status(
+                    flight["flight_key"], "needs_attention")
+                self.notify(
+                    "The replacement airline filing needs attention: "
+                    f"{result.message}")
+
+        try:
+            start_portal_job(
+                payload,
+                on_complete=complete,
+                on_update=self.portal_progress_handler(),
+            )
+        except Exception as exc:
+            logger.exception("Could not launch replacement airline complaint")
+            finish_record("failed")
+            self.notify(
+                "The replacement airline job could not start. The rejected "
+                "reference remains preserved and no complaint was submitted: "
+                f"{type(exc).__name__}.")
+            return None
+        return complaint_id
+
     def request_verification(self, challenge: dict):
         waiter = VerificationWaiter(challenge.get("kind") or "verification")
         with self._lock:
@@ -730,6 +1109,7 @@ class TelegramCoordinator:
                 self.refresh_watched_flights()
                 self.send_due_surveys()
                 self.check_complaint_responses()
+                self.process_gaca_status_checks()
                 self.ask_for_pending_references()
                 self.resume_pending_parent_escalations()
                 self.auto_escalate_due_complaints()
@@ -3639,7 +4019,10 @@ class TelegramCoordinator:
                         for domain in domains):
                     continue
                 captured_reference = _airline_confirmation_reference(
-                    event.get("subject") or "", event.get("body") or "")
+                    event.get("subject") or "",
+                    event.get("body") or "",
+                    str(flight.get("airline_code") or ""),
+                )
                 if not captured_reference:
                     continue
                 if captured_reference.casefold() in known_references:

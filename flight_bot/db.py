@@ -256,6 +256,25 @@ CREATE TABLE IF NOT EXISTS gaca_account_sync (
     screenshot_file TEXT
 );
 
+CREATE TABLE IF NOT EXISTS gaca_status_checks (
+    id INTEGER PRIMARY KEY,
+    complaint_id INTEGER NOT NULL UNIQUE
+        REFERENCES complaints(id) ON DELETE CASCADE,
+    reference TEXT NOT NULL,
+    details_url TEXT NOT NULL,
+    trigger_sms_id INTEGER REFERENCES sms_messages(id),
+    status TEXT NOT NULL DEFAULT 'queued',
+    case_status TEXT,
+    response_text TEXT,
+    response_summary TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    next_attempt_at REAL,
+    created_at TEXT DEFAULT (datetime('now', 'localtime')),
+    updated_at TEXT DEFAULT (datetime('now', 'localtime')),
+    checked_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS ai_profile_cache (
     passenger_key TEXT PRIMARY KEY,
     evidence_hash TEXT NOT NULL,
@@ -315,6 +334,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_gaca_account_reference_unique
     WHERE reference IS NOT NULL AND length(trim(reference)) > 0;
 CREATE INDEX IF NOT EXISTS idx_gaca_account_mapping
     ON gaca_account_cases(mapping_status, mapped_flight_key, last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_gaca_status_checks_due
+    ON gaca_status_checks(status, next_attempt_at, updated_at);
 CREATE INDEX IF NOT EXISTS idx_flight_status_observations_lookup
     ON flight_status_observations(flight_key, observed_at DESC, id DESC);
 """
@@ -559,6 +580,173 @@ def list_sms_messages(limit: int = 100) -> list[dict]:
         rows = conn.execute(
             "SELECT * FROM sms_messages ORDER BY id DESC LIMIT ?",
             (max(1, min(int(limit), 500)),)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def queue_gaca_status_check(
+        reference: str,
+        details_url: str,
+        *,
+        trigger_sms_id: int | None = None,
+        urgent: bool = False) -> int | None:
+    """Schedule the official SMS Details check for one known GACA case."""
+    reference = str(reference or "").strip()
+    if not reference or not details_url:
+        return None
+    due = time.time() if urgent else time.time() + 24 * 60 * 60
+    with connect() as conn:
+        complaint = conn.execute(
+            """SELECT id FROM complaints
+               WHERE kind='gaca' AND lower(trim(reference))=lower(trim(?))
+               ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (reference,),
+        ).fetchone()
+        if not complaint:
+            return None
+        existing = conn.execute(
+            """SELECT id, trigger_sms_id, status, next_attempt_at
+               FROM gaca_status_checks WHERE complaint_id=?""",
+            (int(complaint["id"]),),
+        ).fetchone()
+        if existing and trigger_sms_id is not None:
+            prior_sms = int(existing["trigger_sms_id"] or 0)
+            if int(trigger_sms_id) <= prior_sms:
+                return int(existing["id"])
+        if existing:
+            next_due = due
+            if not urgent and existing["next_attempt_at"] is not None:
+                next_due = min(float(existing["next_attempt_at"]), due)
+            conn.execute(
+                """UPDATE gaca_status_checks
+                   SET reference=?, details_url=?,
+                       trigger_sms_id=COALESCE(?, trigger_sms_id),
+                       status='queued', next_attempt_at=?, last_error=NULL,
+                       updated_at=datetime('now', 'localtime')
+                   WHERE id=?""",
+                (
+                    reference, details_url, trigger_sms_id,
+                    next_due, int(existing["id"]),
+                ),
+            )
+            return int(existing["id"])
+        cursor = conn.execute(
+            """INSERT INTO gaca_status_checks
+                   (complaint_id, reference, details_url, trigger_sms_id,
+                    status, next_attempt_at)
+               VALUES (?, ?, ?, ?, 'queued', ?)""",
+            (
+                int(complaint["id"]), reference, details_url,
+                trigger_sms_id, due,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def claim_due_gaca_status_check() -> dict | None:
+    """Lease one due GACA status lookup; stale interrupted checks recover."""
+    now = time.time()
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """UPDATE gaca_status_checks
+               SET status='retry_wait', next_attempt_at=?,
+                   last_error='interrupted status check recovered',
+                   updated_at=datetime('now', 'localtime')
+               WHERE status='checking'
+                 AND updated_at < datetime('now', 'localtime', '-20 minutes')""",
+            (now,),
+        )
+        row = conn.execute(
+            """SELECT * FROM gaca_status_checks
+               WHERE status IN ('queued', 'retry_wait')
+                 AND COALESCE(next_attempt_at, 0) <= ?
+               ORDER BY COALESCE(next_attempt_at, 0), id
+               LIMIT 1""",
+            (now,),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            """UPDATE gaca_status_checks
+               SET status='checking', attempts=attempts+1,
+                   updated_at=datetime('now', 'localtime')
+               WHERE id=?""",
+            (int(row["id"]),),
+        )
+        claimed = conn.execute(
+            "SELECT * FROM gaca_status_checks WHERE id=?",
+            (int(row["id"]),),
+        ).fetchone()
+    return dict(claimed) if claimed else None
+
+
+def has_due_gaca_status_check() -> bool:
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM gaca_status_checks
+               WHERE status IN ('queued', 'retry_wait')
+                 AND COALESCE(next_attempt_at, 0) <= ?
+               LIMIT 1""",
+            (time.time(),),
+        ).fetchone()
+    return bool(row)
+
+
+def finish_gaca_status_check(
+        check_id: int,
+        *,
+        case_status: str,
+        response_text: str,
+        response_summary: str = "") -> None:
+    """Store the verified regulator outcome and schedule open cases daily."""
+    case_status = str(case_status or "unknown")
+    terminal = case_status in {"closed", "rejected", "canceled", "solved"}
+    with connect() as conn:
+        conn.execute(
+            """UPDATE gaca_status_checks
+               SET status=?, case_status=?, response_text=?,
+                   response_summary=?, last_error=NULL,
+                   next_attempt_at=?, checked_at=datetime('now', 'localtime'),
+                   updated_at=datetime('now', 'localtime')
+               WHERE id=?""",
+            (
+                "checked" if terminal else "retry_wait",
+                case_status,
+                str(response_text or ""),
+                str(response_summary or ""),
+                None if terminal else time.time() + 24 * 60 * 60,
+                int(check_id),
+            ),
+        )
+
+
+def retry_gaca_status_check(check_id: int, error: str) -> None:
+    """Retry transient checker failures without repeatedly requesting OTPs."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT attempts FROM gaca_status_checks WHERE id=?",
+            (int(check_id),),
+        ).fetchone()
+        attempts = max(1, int((row or {"attempts": 1})["attempts"] or 1))
+        delay = min(6 * 60 * 60, 15 * 60 * (2 ** min(attempts - 1, 4)))
+        conn.execute(
+            """UPDATE gaca_status_checks
+               SET status='retry_wait', last_error=?, next_attempt_at=?,
+                   updated_at=datetime('now', 'localtime')
+               WHERE id=?""",
+            (str(error or "")[:1000], time.time() + delay, int(check_id)),
+        )
+
+
+def list_gaca_status_checks(limit: int = 100) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT s.*, c.flight_key
+               FROM gaca_status_checks s
+               JOIN complaints c ON c.id=s.complaint_id
+               ORDER BY s.updated_at DESC, s.id DESC LIMIT ?""",
+            (max(1, min(int(limit), 500)),),
+        ).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -2103,6 +2291,58 @@ def reconcile_portal_confirmation(complaint_id: int, reference: str) -> bool:
     return True
 
 
+def reconcile_airline_portal_acceptance(
+        job_id: str,
+        *,
+        accepted_at: str = "",
+        message: str = "") -> bool:
+    """Record a readable airline acceptance that returned no reference.
+
+    Only an airline job already quarantined after Submit (or marked
+    confirmation-unknown) is eligible, and neither record may already own a
+    reference. The caller must have official-page evidence of acceptance.
+    """
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """SELECT p.complaint_id, p.updated_at
+               FROM portal_jobs p
+               JOIN complaints c ON c.id=p.complaint_id
+               WHERE p.id=?
+                 AND p.kind='airline'
+                 AND p.status IN ('quarantined', 'confirmation_unknown')
+                 AND c.kind='airline'
+                 AND COALESCE(p.reference, '')=''
+                 AND COALESCE(c.reference, '')=''""",
+            (str(job_id),),
+        ).fetchone()
+        if not row:
+            return False
+        timestamp = str(accepted_at or row["updated_at"] or "").strip()
+        acceptance_message = str(message or "").strip() or (
+            "The airline displayed a readable acceptance confirmation. "
+            "FlightDeck is waiting for the public case reference and will "
+            "not submit a duplicate."
+        )
+        conn.execute(
+            """UPDATE complaints
+               SET status='accepted_pending_reference',
+                   created_at=COALESCE(NULLIF(?, ''), created_at)
+               WHERE id=?""",
+            (timestamp, int(row["complaint_id"])),
+        )
+        conn.execute(
+            """UPDATE portal_jobs
+               SET status='accepted_pending_reference', terminal=1,
+                   message=?, next_attempt_at=NULL, lease_until=NULL,
+                   last_error=NULL,
+                   updated_at=datetime('now', 'localtime')
+               WHERE id=?""",
+            (acceptance_message, str(job_id)),
+        )
+    return True
+
+
 def upsert_gaca_account_case(case: dict, mapping: dict | None = None) -> bool:
     """Persist one read-only case imported from the signed-in GACA account."""
     mapping = dict(mapping or {})
@@ -2617,6 +2857,7 @@ def reset():
         conn.execute("DELETE FROM flight_status_observations")
         conn.execute("DELETE FROM complaint_responses")
         conn.execute("DELETE FROM complaint_response_state")
+        conn.execute("DELETE FROM gaca_status_checks")
         conn.execute("DELETE FROM gaca_account_cases")
         conn.execute("DELETE FROM gaca_account_sync")
         conn.execute("DELETE FROM flight_emails")

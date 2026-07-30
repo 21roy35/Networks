@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from flight_bot.airlines import SAUDI_CARRIERS, airline_for_domain
-from flight_bot import portal_automation
+from flight_bot import db, portal_automation
 from flight_bot.linker import link_emails
 from flight_bot.mail_client import _search_queries
 from flight_bot.parser import BOOKING, parse_email
@@ -133,12 +133,92 @@ def test_riyadh_air_helpers_normalize_case_fields_and_confirmation():
     assert accepted.status == "submitted"
     assert accepted.reference == "23062606433818524"
 
+    accepted_without_reference = portal_automation._riyadh_air_submission_result({
+        "seen": True,
+        "status": 200,
+        "text": "Your concern is received successfully",
+    })
+    assert accepted_without_reference.status == "accepted_pending_reference"
+
     rejected = portal_automation._riyadh_air_submission_result({
         "seen": True,
         "status": 200,
         "text": "The CAPTCHA code is incorrect.",
     })
     assert rejected.status == "verification_expired"
+
+
+def test_readable_riyadh_acceptance_reconciles_quarantine_without_duplicate(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightbot.db")
+    db.init_db()
+    complaint_id = db.begin_complaint(
+        "RXORDER|RX28|2026-06-16",
+        "airline",
+        "Riyadh Air complaint",
+        "Onboard issue",
+    )
+    db.finish_complaint(complaint_id, "failed")
+    db.save_portal_job({
+        "id": "rx-acceptance",
+        "kind": "airline",
+        "airline_code": "RX",
+        "flight_key": "RXORDER|RX28|2026-06-16",
+        "complaint_id": complaint_id,
+        "status": "quarantined",
+        "message": "Confirmation was not detected.",
+        "terminal": True,
+    })
+
+    assert db.reconcile_airline_portal_acceptance(
+        "rx-acceptance",
+        accepted_at="2026-07-30 08:19:20",
+    )
+    complaint = db.get_complaint(complaint_id)
+    job = db.get_portal_job("rx-acceptance")
+    assert complaint["status"] == "accepted_pending_reference"
+    assert complaint["created_at"] == "2026-07-30 08:19:20"
+    assert job["status"] == "accepted_pending_reference"
+    assert bool(job["terminal"]) is True
+    assert job["last_error"] is None
+    assert not db.reconcile_airline_portal_acceptance("rx-acceptance")
+
+
+def test_riyadh_visible_concern_received_banner_is_acceptance(monkeypatch):
+    class Hidden:
+        first = None
+
+        def count(self):
+            return 0
+
+    class Page:
+        url = (
+            "https://rxcreatecase.powerappsportals.com/en-us/Create-Case/")
+
+        def is_closed(self):
+            return False
+
+        def get_by_role(self, *_args, **_kwargs):
+            return Hidden()
+
+    monkeypatch.setattr(
+        portal_automation, "_request_blocked", lambda _page: False)
+    monkeypatch.setattr(
+        portal_automation, "_body_text",
+        lambda _page: "Your concern is received successfully")
+    monkeypatch.setattr(
+        portal_automation, "_page_screenshot", lambda _page: b"success")
+
+    result = portal_automation._await_confirmation(
+        Page(),
+        "https://rxcreatecase.powerappsportals.com/en-us/Create-Case/",
+        lambda *_args: None,
+        payload={"kind": "airline", "airline_code": "RX"},
+        timeout_seconds=5,
+        submission_capture={},
+    )
+    assert result.status == "accepted_pending_reference"
+    assert result.reference == ""
 
 
 def test_riyadh_air_form_and_image_captcha_are_completed_deterministically(

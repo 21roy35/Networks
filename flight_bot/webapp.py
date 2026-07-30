@@ -24,6 +24,7 @@ from .compensation import (ELIGIBLE, POSSIBLY, assess, effective)
 from .complaints import (airline_complaint, complaint_payload, gaca_complaint,
                          missing_portal_fields)
 from .flight_status import refresh_flight_status
+from .gaca_status import extract_gaca_details_url
 from .mail_client import eta_text
 from .config import (passenger_profile_key, save_passenger_profile,
                      save_user_profile)
@@ -677,6 +678,21 @@ def create_app(config: dict) -> Flask:
         db.link_sms_mail_event(sms_id, event_id)
         attached_complaint_id = attach_sms_reference(
             reference, trusted_sender, body, event_id)
+        status_check_id = None
+        details_url = extract_gaca_details_url(body)
+        if telegram and details_url and _is_gaca_sms(trusted_sender, body):
+            urgent = bool(re.search(
+                r"\b(?:closed|rejected|resolved|decision)\b|"
+                r"تم\s+إغلاق|مغلقة|مرفوض",
+                body,
+                re.I,
+            ))
+            status_check_id = telegram.queue_gaca_status_check(
+                reference,
+                details_url,
+                sms_id=sms_id,
+                urgent=urgent,
+            )
         if telegram:
             if attached_complaint_id:
                 final_notifier = getattr(
@@ -698,6 +714,7 @@ def create_app(config: dict) -> Flask:
         return jsonify(
             ok=True, duplicate=False, mail_event_id=event_id,
             reference=reference, attached_complaint_id=attached_complaint_id,
+            gaca_status_check_id=status_check_id,
         )
 
     @app.context_processor
