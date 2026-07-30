@@ -2864,7 +2864,8 @@ class TelegramCoordinator:
                 finish_record("accepted_pending_reference")
                 db.update_survey_status(flight_key, "needs_attention")
                 self.notify(
-                    "Saudia accepted the complaint without returning its "
+                    f"{payload['airline_name']} accepted the complaint without "
+                    "returning its "
                     "reference on the page. I will check email first; if the "
                     "reference is still missing after the mailbox scan, I will "
                     "ask you for the SMS in Telegram. I will not submit a duplicate.")

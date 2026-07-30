@@ -27,7 +27,11 @@ AIRLINES = {
         # ICAO callsign is unavailable; the official IATA designator is RX.
         "icao": "",
         "domains": ["riyadhair.com"],
-        "complaint_url": "https://www.riyadhair.com/en/help/contact-us",
+        # Riyadh Air's customer case form is hosted on its dedicated,
+        # production Microsoft Power Pages tenant.
+        "complaint_url": (
+            "https://rxcreatecase.powerappsportals.com/en-us/Create-Case/"
+        ),
     },
     "EK": {
         "name": "Emirates",

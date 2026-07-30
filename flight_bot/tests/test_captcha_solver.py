@@ -140,3 +140,38 @@ def test_2captcha_uses_v3_task_with_page_action():
         "pageAction": "submit",
         "apiDomain": "google.com",
     }
+
+
+def test_2captcha_reads_conventional_image_captcha():
+    config = deepcopy(DEFAULTS)
+    config["captcha"].update({
+        "enabled": True,
+        "api_key": "test-key",
+        "poll_interval_seconds": 5,
+        "timeout_seconds": 60,
+    })
+    session = Session([
+        {"errorId": 0, "taskId": 765},
+        {
+            "errorId": 0,
+            "status": "ready",
+            "solution": {"text": "AbC91"},
+        },
+    ])
+    solver = TwoCaptchaSolver(config, session=session, sleeper=lambda _n: None)
+
+    result = solver.solve({
+        "kind": "image_captcha",
+        "image": b"captcha-png",
+        "case_sensitive": True,
+        "min_length": 4,
+        "max_length": 10,
+    })
+
+    assert result["token"] == "AbC91"
+    task = session.requests[0][1]["task"]
+    assert task["type"] == "ImageToTextTask"
+    assert task["case"] is True
+    assert task["minLength"] == 4
+    assert task["maxLength"] == 10
+    assert task["body"] == "Y2FwdGNoYS1wbmc="

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import time
 
 import requests
@@ -77,9 +78,36 @@ class TwoCaptchaSolver:
 
     def solve(self, challenge: dict) -> dict:
         """Dispatch a rendered challenge to the matching 2Captcha task."""
-        if str(challenge.get("kind") or "").lower() == "hcaptcha":
+        kind = str(challenge.get("kind") or "").lower()
+        if kind == "hcaptcha":
             return self.solve_hcaptcha(challenge)
+        if kind in {"image", "image_captcha", "text_captcha"}:
+            return self.solve_image(challenge)
         return self.solve_recaptcha(challenge)
+
+    def solve_image(self, challenge: dict) -> dict:
+        """Return the text rendered in a conventional CAPTCHA image."""
+        if not self.enabled:
+            raise CaptchaSolverError("2Captcha is not configured.")
+        body = challenge.get("body") or challenge.get("image") or b""
+        if isinstance(body, bytes):
+            body = base64.b64encode(body).decode("ascii")
+        body = str(body or "").strip()
+        if body.startswith("data:") and "," in body:
+            body = body.split(",", 1)[1]
+        if not body:
+            raise CaptchaSolverError("The CAPTCHA image is unavailable.")
+        task = {
+            "type": "ImageToTextTask",
+            "body": body,
+            "phrase": bool(challenge.get("phrase", False)),
+            "case": bool(challenge.get("case_sensitive", True)),
+            "numeric": int(challenge.get("numeric") or 0),
+            "math": bool(challenge.get("math", False)),
+            "minLength": max(0, int(challenge.get("min_length") or 0)),
+            "maxLength": max(0, int(challenge.get("max_length") or 0)),
+        }
+        return self._solve_task(task, ("text",))
 
     def solve_recaptcha(self, challenge: dict) -> dict:
         """Return a reCAPTCHA token and non-secret task metadata."""

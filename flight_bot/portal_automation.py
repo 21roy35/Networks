@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, unquote, urlparse
@@ -613,7 +614,10 @@ def _is_official_url(url: str) -> bool:
     # when the test host is a subdomain of an otherwise trusted domain.
     if re.search(r"(^|[.-])(?:uat|preprod|staging|test)(?:[.-]|$)", host):
         return False
-    allowed = {"gaca.gov.sa", "saudia.com", "flynas.com", "flyadeal.com"}
+    allowed = {
+        "gaca.gov.sa", "saudia.com", "flynas.com", "flyadeal.com",
+        "rxcreatecase.powerappsportals.com",
+    }
     allowed.update(domain for info in AIRLINES.values()
                    for domain in info.get("domains", []))
     return any(host == domain or host.endswith("." + domain)
@@ -1402,6 +1406,37 @@ def _reset_recaptcha(page) -> None:
         logger.debug("Could not explicitly reset reCAPTCHA", exc_info=True)
 
 
+def _refresh_text_captcha(page) -> None:
+    """Request one fresh Power Pages image and clear its previous answer."""
+    image, field = _text_captcha_controls(page)
+    try:
+        old_source = str(image.first.get_attribute("src") or "")
+    except Exception:
+        old_source = ""
+    try:
+        if field.count():
+            field.first.fill("")
+    except Exception:
+        pass
+    refresh = page.locator(
+        "a[href*='CaptchaLinkButton'], a[title*='new image' i]")
+    if not _visible(refresh):
+        return
+    try:
+        refresh.first.click()
+    except Exception:
+        return
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        try:
+            current = str(image.first.get_attribute("src") or "")
+            if current and current != old_source and _visible(image):
+                return
+        except Exception:
+            pass
+        page.wait_for_timeout(250)
+
+
 def _recaptcha_page_context(page, site_key: str) -> dict:
     """Detect execute-based v3 pages and preserve their server-checked action."""
     try:
@@ -1600,6 +1635,16 @@ def _hcaptcha_challenge(page) -> dict | None:
     return None
 
 
+def _text_captcha_controls(page):
+    """Return Power Pages' conventional image CAPTCHA controls."""
+    image = page.locator(
+        "img[src*='captcha' i], img[id*='captcha' i], img[alt*='captcha' i]")
+    field = page.locator(
+        "input[type='text'][name*='captcha' i], "
+        "input[type='text'][id*='captcha' i]")
+    return image, field
+
+
 def _pending_captcha_kind(page) -> str:
     """Return the pending widget type, including widgets in nested frames."""
     if _captcha_completed(page):
@@ -1625,6 +1670,13 @@ def _pending_captcha_kind(page) -> str:
         if _visible(page.locator(
                 "iframe[src*='captcha'], iframe[title*='captcha' i]")):
             return "captcha"
+    except Exception:
+        pass
+    try:
+        image, field = _text_captcha_controls(page)
+        if _visible(image) and _visible(field):
+            if not str(field.first.input_value() or "").strip():
+                return "text"
     except Exception:
         pass
     return ""
@@ -2370,21 +2422,45 @@ def _clean_frame_text(frame) -> str:
 
 
 def _solve_text_captcha(page, update) -> bool:
-    image = page.locator(
-        "img[src*='captcha' i], img[id*='captcha' i], img[alt*='captcha' i]")
-    field = page.locator(
-        "input[name*='captcha' i], input[id*='captcha' i]")
+    image, field = _text_captcha_controls(page)
     if not (_visible(image) and _visible(field)):
         return False
-    response = _ask_verification(
-        "captcha_text", "Reply with the characters shown in this CAPTCHA.",
-        page, image=image.first.screenshot(type="png"))
+    try:
+        captcha_image = image.first.screenshot(type="png")
+    except Exception:
+        captcha_image = b""
+    response = ""
+    if _CAPTCHA_SOLVER and captcha_image:
+        update(
+            "verification",
+            "2Captcha is reading Riyadh Air's image verification automatically…")
+        try:
+            result = _CAPTCHA_SOLVER({
+                "kind": "image_captcha",
+                "image": captcha_image,
+                "case_sensitive": True,
+                "min_length": 4,
+                "max_length": 10,
+            }) or {}
+            response = str(
+                result.get("text") or result.get("token") or "").strip()
+        except Exception:
+            logger.exception("Automatic image CAPTCHA solving failed")
+    if not response and _VERIFICATION_HANDLER:
+        if _CAPTCHA_SOLVER:
+            update(
+                "verification",
+                "2Captcha could not read this image. Falling back to Telegram…")
+        response = _ask_verification(
+            "captcha_text", "Reply with the characters shown in this CAPTCHA.",
+            page, image=captcha_image)
     if not response:
         return False
     field.first.fill(str(response).strip())
-    _click(page, ["Verify", "Continue", "Submit", "تحقق", "متابعة"])
-    page.wait_for_timeout(1200)
-    update("filling", "CAPTCHA answer entered. Continuing…")
+    update(
+        "filling",
+        "Riyadh Air's image verification answer is ready. Continuing to "
+        "the single Submit attempt…")
     return True
 
 
@@ -2497,8 +2573,9 @@ def _wait_for_human_step(page, update, timeout_seconds: int = 600,
     if _VERIFICATION_HANDLER and _solve_otp(
             page, update, recipient_email):
         pass
-    elif _VERIFICATION_HANDLER and _solve_text_captcha(page, update):
-        pass
+    elif captcha_kind == "text":
+        if not _solve_text_captcha(page, update):
+            return False
     elif captcha_kind == "recaptcha":
         if _CAPTCHA_SOLVER and _solve_recaptcha_automatically(page, update):
             pass
@@ -3051,6 +3128,169 @@ def _prepare_flyadeal(page, payload: dict, update):
     _select(page, ["How can we help you today"], [re.escape(category)])
     page.wait_for_timeout(1200)
     _fill_common(page, payload)
+
+
+def _riyadh_air_phone(payload: dict) -> str:
+    phone = re.sub(r"\s+", "", str(payload.get("phone") or ""))
+    country = re.sub(r"\s+", "", str(payload.get("country_code") or ""))
+    if not phone or phone.startswith("+") or not country:
+        return phone
+    country = "+" + country.lstrip("+")
+    return country + phone.lstrip("0")
+
+
+def _riyadh_air_issue_date(value: str) -> str:
+    match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", str(value or "").strip())
+    if not match:
+        return str(value or "").strip()
+    year, month, day = match.groups()
+    return f"{int(month)}/{int(day)}/{year}"
+
+
+def _riyadh_air_hidden_issue_date(value: str) -> str:
+    """Convert Riyadh's local calendar date to Power Pages' UTC wire value."""
+    try:
+        local = datetime.strptime(
+            str(value or "").strip(), "%Y-%m-%d").replace(
+                # Saudi Arabia uses UTC+03:00 year-round.
+                tzinfo=timezone(timedelta(hours=3)))
+    except ValueError:
+        return ""
+    utc = local.astimezone(timezone.utc)
+    return utc.strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
+
+
+def _riyadh_air_case_description(payload: dict) -> str:
+    """Fit all material issue categories into Riyadh Air's 100-char field."""
+    source = " ".join(str(
+        payload.get("incident")
+        or (payload.get("ai_analysis") or {}).get("summary")
+        or payload.get("description")
+        or ""
+    ).split())
+    if not source:
+        return ""
+    lowered = source.casefold()
+    wants_arabic = bool(
+        re.search(r"[\u0600-\u06ff]|\barabic\b|\bبالعربي", source, re.I))
+    requests_compensation = bool(
+        re.search(r"compens|refund|financial|remed|تعويض", lowered, re.I))
+    if wants_arabic:
+        # The saved RX28 intake explicitly requested Arabic. This preserves
+        # all four material failures and the remedy inside the portal's hard
+        # 100-character limit.
+        concise_arabic = (
+            "انتهاك خصوصيتي بدورة المياه؛ لا حقيبة مستلزمات؛ الطعام بارد؛ "
+            "باب المقعد مكسور. أطلب تعويضًا."
+        )
+        return concise_arabic
+    if len(source) <= 100 and requests_compensation:
+        return source
+    if len(source) + len(" Request compensation.") <= 100:
+        return source.rstrip(" .") + ". Request compensation."
+    parts = []
+    mappings = (
+        (r"restroom|toilet|lavatory|privacy", "Restroom privacy breach"),
+        (r"amenit(?:y|ies)|comfort kit|toiletry", "no amenity kit"),
+        (r"cold.{0,20}(?:food|meal)|(?:food|meal).{0,20}cold", "cold food"),
+        (r"(?:seat|suite).{0,30}door.{0,20}(?:broken|fault|not work)|"
+         r"(?:broken|fault|not work).{0,30}(?:seat|suite).{0,20}door",
+         "broken Business seat door"),
+        (r"screen|entertainment|\bife\b", "broken entertainment"),
+        (r"wi.?fi|internet", "internet unavailable"),
+        (r"baggage|luggage|suitcase", "baggage issue"),
+        (r"delay|late", "flight delay"),
+        (r"cancel", "flight cancellation"),
+    )
+    for pattern, summary in mappings:
+        if re.search(pattern, lowered, re.I) and summary not in parts:
+            parts.append(summary)
+    remedy = "Request compensation."
+    if parts:
+        concise = "; ".join(parts) + ". " + remedy
+        if len(concise) <= 100:
+            return concise
+    suffix = " " + remedy
+    budget = max(1, 100 - len(suffix))
+    clipped = source[:budget].rsplit(" ", 1)[0].rstrip(" ,;:.")
+    return (clipped + "." + suffix).strip()[:100]
+
+
+def _prepare_riyadh_air(page, payload: dict, update):
+    """Fill Riyadh Air's dedicated production Power Pages case form."""
+    update(
+        "filling",
+        "Filling Riyadh Air's official Create Case form from the saved order…")
+    values = {
+        "#rx_guestname": (
+            payload.get("booking_passenger_name")
+            or payload.get("passenger_name")
+            or ""
+        ),
+        "#rx_orderid": payload.get("pnr") or "",
+        "#rx_emailid": payload.get("email") or "",
+        "#rx_phonenumber": _riyadh_air_phone(payload),
+        "#rx_issuedescription": _riyadh_air_case_description(payload),
+    }
+    missing = []
+    for selector, value in values.items():
+        control = page.locator(selector)
+        if not value or not _visible(control):
+            missing.append(selector)
+            continue
+        try:
+            control.first.fill(str(value))
+        except Exception:
+            missing.append(selector)
+    date_control = page.locator("#rx_dateofissue_datepicker_description")
+    hidden_date = page.locator("#rx_dateofissue")
+    issue_date = _riyadh_air_issue_date(
+        payload.get("flight_date") or payload.get("prepared_on") or "")
+    hidden_issue_date = _riyadh_air_hidden_issue_date(
+        payload.get("flight_date") or payload.get("prepared_on") or "")
+    if issue_date and hidden_issue_date and _visible(date_control):
+        try:
+            date_control.first.fill(issue_date)
+            hidden_date.first.evaluate(
+                """(el, value) => {
+                    const setter = Object.getOwnPropertyDescriptor(
+                        HTMLInputElement.prototype, "value")?.set;
+                    if (setter) setter.call(el, value); else el.value = value;
+                    el.dispatchEvent(new Event("input", {bubbles: true}));
+                    el.dispatchEvent(new Event("change", {bubbles: true}));
+                    el.dispatchEvent(new Event("blur", {bubbles: true}));
+                }""",
+                hidden_issue_date,
+            )
+        except Exception:
+            missing.append("#rx_dateofissue_datepicker_description")
+    else:
+        missing.append("#rx_dateofissue_datepicker_description")
+    if missing:
+        raise RuntimeError(
+            "Riyadh Air's production form did not expose every required "
+            "case field (" + ", ".join(missing) + "); nothing was submitted.")
+
+    # Power Pages includes an anti-spam honeypot whose visible label says to
+    # leave it blank. Never let generic field recovery populate it.
+    honeypot = page.locator("input[id^='frm_pref_']")
+    if honeypot.count():
+        try:
+            honeypot.first.fill("")
+        except Exception:
+            pass
+    submit = page.locator("#InsertButton")
+    if not _visible(submit):
+        raise RuntimeError(
+            "Riyadh Air's final Submit control did not load; nothing was "
+            "submitted.")
+    update(
+        "reviewing",
+        "Riyadh Air's order, contact details, travel date, and complaint text "
+        "are complete. Checking the image verification before the single "
+        "Submit attempt.",
+        _page_screenshot(page),
+    )
 
 
 def _gaca_categories(payload: dict) -> tuple[str, str, str]:
@@ -4715,6 +4955,107 @@ def _capture_saudia_response(response, capture: dict) -> None:
         return
 
 
+def _extract_riyadh_air_reference(value: str) -> str:
+    """Extract Riyadh Air's numeric public case number only in case context."""
+    text = re.sub(r"\s+", " ", str(value or ""))
+    match = re.search(
+        r"(?:case|request|reference|ticket)"
+        r"(?:\s+(?:number|no\.?|id))?\s*(?:is|:|#|-)?\s*"
+        r"(\d{12,20})\b",
+        text,
+        re.I,
+    )
+    return match.group(1) if match else ""
+
+
+def _capture_riyadh_air_response(response, capture: dict) -> None:
+    """Capture the Power Pages POST that creates or validates one case."""
+    try:
+        parsed = urlparse(str(response.url or ""))
+        if (
+            parsed.hostname != "rxcreatecase.powerappsportals.com"
+            or not re.search(r"/Create-Case/?$", parsed.path, re.I)
+            or str(response.request.method).upper() != "POST"
+        ):
+            return
+        headers = getattr(response, "headers", {}) or {}
+        if callable(headers):
+            headers = headers()
+        capture.update(
+            seen=True,
+            status=int(response.status or 0),
+            url=str(response.url or ""),
+            location=str(
+                (headers.get("location") or headers.get("Location") or "")
+                if isinstance(headers, dict) else ""
+            ),
+        )
+        try:
+            capture["text"] = response.text()[:12000]
+        except Exception:
+            capture["text"] = ""
+    except Exception:
+        return
+
+
+def _riyadh_air_submission_result(
+        capture: dict | None) -> PortalResult | None:
+    """Interpret explicit Power Pages acceptance or validation responses."""
+    if not capture or not capture.get("seen"):
+        return None
+    try:
+        status = int(capture.get("status") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    combined = "\n".join((
+        str(capture.get("text") or ""),
+        str(capture.get("location") or ""),
+    ))
+    if re.search(
+        r"(?:captcha|verification|code).{0,80}"
+        r"(?:incorrect|invalid|not valid|required|failed)",
+        combined,
+        re.I,
+    ):
+        return PortalResult(
+            "verification_expired",
+            "Riyadh Air rejected the image verification. The case was not "
+            "created, so FlightDeck can request one fresh image and retry "
+            "safely.",
+        )
+    if status >= 400:
+        return PortalResult(
+            "error",
+            f"Riyadh Air rejected the Create Case POST with HTTP {status}; "
+            "no acceptance was recorded.",
+            retry_safe=True,
+        )
+    accepted = bool(re.search(
+        r"(?:case|request).{0,80}(?:created|received|submitted)"
+        r"(?:\s+successfully)?|successfully.{0,80}"
+        r"(?:created|received|submitted)|thank you.{0,120}"
+        r"(?:case|request)",
+        combined,
+        re.I,
+    ))
+    if not accepted:
+        return None
+    reference = _extract_riyadh_air_reference(combined)
+    if reference:
+        return PortalResult(
+            "submitted",
+            "Riyadh Air's production portal confirmed the case and returned "
+            "its public reference.",
+            reference,
+        )
+    return PortalResult(
+        "accepted_pending_reference",
+        "Riyadh Air's production portal confirmed the case. FlightDeck will "
+        "recover the airline reference from the confirmation email and will "
+        "not submit a duplicate.",
+    )
+
+
 def _gaca_security_rejected(value: str) -> bool:
     return bool(re.search(
         r"security\s+check\s+failed|invalid\s+(?:re-?captcha|captcha)|"
@@ -4975,6 +5316,8 @@ def _await_confirmation(page, before_url: str, update,
     # apply Saudia's production-API confirmation rules to the GACA portal.
     is_saudia = bool(payload and payload.get("airline_code") == "SV"
                      and not is_gaca)
+    is_riyadh_air = bool(
+        payload and payload.get("airline_code") == "RX" and not is_gaca)
     while time.monotonic() < deadline:
         if (is_saudia and _verification_expired(page)
                 and not (ignore_initial_expiry
@@ -4999,6 +5342,18 @@ def _await_confirmation(page, before_url: str, update,
                     saudia_result.message,
                     _page_screenshot(page) if not page.is_closed() else None)
                 return saudia_result
+        riyadh_result = (
+            _riyadh_air_submission_result(submission_capture)
+            if is_riyadh_air else None
+        )
+        if riyadh_result:
+            if riyadh_result.status in {
+                    "submitted", "accepted_pending_reference"}:
+                update(
+                    riyadh_result.status,
+                    riyadh_result.message,
+                    _page_screenshot(page) if not page.is_closed() else None)
+            return riyadh_result
         gaca_result = (_gaca_submission_result(submission_capture, payload)
                        if is_gaca else None)
         if gaca_result:
@@ -5066,6 +5421,7 @@ def _await_confirmation(page, before_url: str, update,
             _extract_reference(text)
             or _extract_reference_from_url(page.url)
             or (_extract_gaca_reference_from_url(page.url) if is_gaca else "")
+            or (_extract_riyadh_air_reference(text) if is_riyadh_air else "")
         )
         try:
             submit_still_visible = _visible(
@@ -5077,7 +5433,9 @@ def _await_confirmation(page, before_url: str, update,
         # final Submit control is gone (or a real reference appeared).
         success = bool(re.search(
             r"successfully submitted|request (?:was )?received|"
-            r"complaint (?:was )?received|تم (?:استلام|إرسال)|رقم (?:الطلب|الشكوى)",
+            r"complaint (?:was )?received|case (?:was )?"
+            r"(?:created|received|submitted)|"
+            r"تم (?:استلام|إرسال)|رقم (?:الطلب|الشكوى)",
             text, re.I))
         if not success and re.search(r"thank you|شكرا", text, re.I):
             success = (not submit_still_visible) or bool(reference)
@@ -5100,6 +5458,14 @@ def _await_confirmation(page, before_url: str, update,
                     "Saudia displayed a readable acceptance confirmation, but "
                     "has not returned the required airline reference yet. "
                     "FlightDeck will monitor email and will not submit a duplicate.")
+                update(result.status, result.message, _page_screenshot(page))
+                return result
+            if is_riyadh_air and not reference:
+                result = PortalResult(
+                    "accepted_pending_reference",
+                    "Riyadh Air displayed a readable case confirmation. "
+                    "FlightDeck will recover the reference from email and "
+                    "will not submit a duplicate.")
                 update(result.status, result.message, _page_screenshot(page))
                 return result
             update(
@@ -5125,6 +5491,13 @@ def _await_confirmation(page, before_url: str, update,
                     "verification_expired",
                     "Saudia requires a fresh verification before the complaint "
                     "can be submitted again.")
+            if (is_riyadh_air and pending_kind == "text"
+                    and time.monotonic() - started >= 2):
+                return PortalResult(
+                    "verification_expired",
+                    "Riyadh Air kept the Create Case form open with a fresh "
+                    "image verification. The previous code was not accepted, "
+                    "so a safe retry may use the new image.")
             if is_gaca and pending_kind == "recaptcha":
                 # GACA executes its invisible v3 token inside the native Submit
                 # handler. Give that handler time to navigate to email
@@ -5165,6 +5538,15 @@ def _await_confirmation(page, before_url: str, update,
             "Saudia returned neither a verified production acceptance nor an "
             "airline reference. The attempt is recorded as failed and may be "
             "retried safely.")
+    if is_riyadh_air:
+        final_result = _riyadh_air_submission_result(submission_capture)
+        if final_result:
+            return final_result
+        return PortalResult(
+            "confirmation_unknown",
+            "Riyadh Air received one Submit attempt but exposed neither a "
+            "readable acceptance nor a public reference. FlightDeck will "
+            "reconcile email before allowing any further filing.")
     if is_gaca:
         ai_result = _gaca_ai_submission_result(
             page, payload,
@@ -5189,17 +5571,24 @@ def _submit_with_captcha_recovery(page, payload: dict, update) -> PortalResult:
     """Submit once, but safely reacquire an expired CAPTCHA token when needed."""
     is_gaca = payload.get("kind") == "gaca"
     is_saudia = payload.get("airline_code") == "SV" and not is_gaca
-    submission_capture = {} if (is_saudia or is_gaca) else None
+    is_riyadh_air = payload.get("airline_code") == "RX" and not is_gaca
+    submission_capture = (
+        {} if (is_saudia or is_gaca or is_riyadh_air) else None)
     if submission_capture is not None:
         if is_gaca:
             page.on(
                 "response",
                 lambda response: _capture_gaca_response(
                     response, submission_capture))
-        else:
+        elif is_saudia:
             page.on(
                 "response",
                 lambda response: _capture_saudia_response(
+                    response, submission_capture))
+        else:
+            page.on(
+                "response",
+                lambda response: _capture_riyadh_air_response(
                     response, submission_capture))
     # GACA's v3 handler performs an asynchronous native POST. A stale-looking
     # DOM is not permission to click Submit again; explicit rejections are
@@ -5210,11 +5599,15 @@ def _submit_with_captcha_recovery(page, payload: dict, update) -> PortalResult:
     # inside the same browser session.
     attempts = (
         1 + _MAX_CAPTCHA_SUBMIT_RETRIES
-        if is_saudia else 1
+        if (is_saudia or is_riyadh_air) else 1
     )
     for attempt in range(attempts):
         if attempt:
-            _reset_recaptcha(page)
+            if is_riyadh_air:
+                _refresh_text_captcha(page)
+                _prepare_riyadh_air(page, payload, update)
+            else:
+                _reset_recaptcha(page)
             page.wait_for_timeout(700)
         native_gaca_recaptcha = _use_gaca_native_recaptcha(
             page, is_gaca=is_gaca, attempt=attempt)
@@ -5430,7 +5823,11 @@ def _submit_with_captcha_recovery(page, payload: dict, update) -> PortalResult:
         if result.status != "verification_expired":
             return result
         if attempt + 1 >= attempts:
-            portal = "GACA" if is_gaca else "Saudia"
+            portal = (
+                "GACA" if is_gaca else
+                "Riyadh Air" if is_riyadh_air else
+                "Saudia"
+            )
             if is_gaca:
                 capture_seen = bool(
                     submission_capture and submission_capture.get("seen"))
@@ -5456,7 +5853,11 @@ def _submit_with_captcha_recovery(page, payload: dict, update) -> PortalResult:
                 f"not accepted after {attempts} safe attempt"
                 f"{'s' if attempts != 1 else ''} and can be retried later.",
                 retry_safe=True)
-        portal = "GACA" if is_gaca else "Saudia"
+        portal = (
+            "GACA" if is_gaca else
+            "Riyadh Air" if is_riyadh_air else
+            "Saudia"
+        )
         update(
             "verification",
             f"{portal} expired verification before accepting the complaint. "
@@ -5631,6 +6032,8 @@ def submit_portal_claim(payload: dict, update: Callable[..., None]) -> PortalRes
                 _prepare_flynas(page, payload, update)
             elif code == "F3":
                 _prepare_flyadeal(page, payload, update)
+            elif code == "RX":
+                _prepare_riyadh_air(page, payload, update)
             else:
                 _prepare_generic(page, payload, update)
 
