@@ -163,7 +163,9 @@ def _is_aviation_sms(sender: str, body: str, reference: str = "") -> bool:
         return True
     if re.search(
         r"\bflight\b|boarding\s*pass|airport|baggage|luggage|\bpnr\b|"
-        r"guest\s+relations|comment\s+ref|رحلة|مطار|أمتعة|امتعة",
+        r"guest\s+relations|comment\s+ref|"
+        r"رحلة\s+جوية|رقم\s+الرحلة|الرحلة\s+رقم|"
+        r"مطار|أمتعة|امتعة",
         folded,
         re.I,
     ):
@@ -171,6 +173,44 @@ def _is_aviation_sms(sender: str, body: str, reference: str = "") -> bool:
     # Saudia's acknowledgement format is carrier-specific even when the
     # shortcut omits the sender label.
     return bool(re.fullmatch(r"(?i)C_\d{6,}", str(reference or "").strip()))
+
+
+def _sms_timestamp(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+    except ValueError:
+        cleaned = re.sub(r"\s+at\s+", " ", text, flags=re.I)
+        for pattern in ("%b %d, %Y %H:%M:%S", "%b %d, %Y %H:%M"):
+            try:
+                return datetime.strptime(cleaned, pattern)
+            except ValueError:
+                continue
+    return None
+
+
+def _near_duplicate_sms(body: str, received_at: str) -> int | None:
+    """Collapse iOS duplicate deliveries that drift by a few minutes."""
+    normalized = re.sub(r"\s+", " ", str(body or "")).strip().casefold()
+    current = _sms_timestamp(received_at)
+    for saved in db.list_sms_messages(30):
+        prior_body = re.sub(
+            r"\s+", " ", str(saved.get("body") or "")
+        ).strip().casefold()
+        if prior_body != normalized:
+            continue
+        prior = _sms_timestamp(
+            str(saved.get("received_at") or saved.get("created_at") or "")
+        )
+        if current and prior and abs((current - prior).total_seconds()) <= 300:
+            return int(saved["id"])
+        if not current and prior and abs(
+                (datetime.now() - prior).total_seconds()) <= 300:
+            return int(saved["id"])
+    return None
 
 
 def _is_gaca_sms(sender: str, body: str) -> bool:
@@ -656,6 +696,13 @@ def create_app(config: dict) -> Flask:
             return jsonify(
                 ok=True, ignored=True, reason="otp", otp=otp,
                 duplicate=not is_new, consumed=consumed,
+            )
+        near_duplicate_id = _near_duplicate_sms(body, received_at)
+        if near_duplicate_id is not None:
+            return jsonify(
+                ok=True,
+                duplicate=True,
+                duplicate_of_sms_id=near_duplicate_id,
             )
         sms_id, created = db.save_sms_message({
             "fingerprint": fingerprint, "sender": sender,

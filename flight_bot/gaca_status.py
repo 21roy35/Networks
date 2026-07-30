@@ -40,6 +40,17 @@ class GacaCaseResult:
     data: dict
 
 
+@dataclass(frozen=True)
+class GacaRemediation:
+    """One explicit next step grounded in GACA's verified response."""
+
+    action: str
+    reason: str
+    requested_information: str = ""
+    suggested_category: str = ""
+    automatic: bool = False
+
+
 def extract_gaca_details_url(value: str) -> str:
     """Return only GACA's official SMS Details URL."""
     for candidate in re.findall(r"https?://[^\s<>\"]+", str(value or ""), re.I):
@@ -77,12 +88,108 @@ def requires_airline_complaint(response_text: str) -> bool:
         r".{0,100}(?:airline|air carrier)|"
         r"(?:file|submit|raise|lodge).{0,80}(?:complaint|case)"
         r".{0,100}(?:airline|air carrier).{0,100}(?:first|before)|"
+        r"(?:supplied|provided|airline|carrier).{0,50}"
+        r"(?:reference|number).{0,50}(?:is\s+)?not.{0,30}"
+        r"(?:complaint|case)\s+(?:number|reference)|"
+        r"(?:airline|carrier).{0,40}(?:complaint|case).{0,40}"
+        r"(?:number|reference).{0,40}(?:invalid|incorrect)|"
         r"يجب\s+أولاً\s+تقديم\s+الشكوى\s+لدى\s+الناقل\s+الجوي|"
         r"تقديم\s+الشكوى\s+(?:أولاً\s+)?(?:إلى|لدى)\s+"
         r"(?:شركة|الناقل)\s+(?:الطيران|الجوي)",
         value,
         re.I,
     ))
+
+
+def interpret_gaca_remediation(
+        response_text: str,
+        *,
+        case_status: str = "",
+        data: dict | None = None) -> GacaRemediation:
+    """Map a verified GACA result to one bounded complaint action."""
+    data = data or {}
+    value = " ".join(str(response_text or "").split())
+    if requires_airline_complaint(value):
+        return GacaRemediation(
+            "airline_prerequisite",
+            "GACA explicitly requires a fresh complaint with the airline first.",
+            automatic=True,
+        )
+
+    wrong_category = re.search(
+        r"\b(?:wrong|incorrect|invalid|inappropriate)\s+"
+        r"(?:complaint\s+)?(?:category|classification|type)\b|"
+        r"\b(?:re-?submit|re-?file|file)\b.{0,100}"
+        r"\b(?:correct|appropriate)\s+(?:category|classification)\b|"
+        r"(?:التصنيف|الفئة|نوع\s+الشكوى).{0,30}"
+        r"(?:غير\s+صحيح|خاطئ|غير\s+مناسب)|"
+        r"(?:إعادة|اعدادة|اعد)\s+تقديم.{0,80}"
+        r"(?:التصنيف|الفئة)\s+(?:الصحيح|المناسب)",
+        value,
+        re.I,
+    )
+    if wrong_category:
+        suggested = ""
+        match = re.search(
+            r"(?:re-?submit|re-?file|file)\s+(?:it\s+)?under\s+"
+            r"(?:the\s+)?(?:category\s*)?[:\-]?\s*"
+            r"[\"']?([^.;\n]{3,100})|"
+            r"(?:suggested|correct|appropriate)\s+"
+            r"(?:category|classification)\s*[:\-]\s*"
+            r"[\"']?([^.;\n]{3,100})|"
+            r"(?:category|classification)\s*:\s*"
+            r"[\"']?([^.;\n]{3,100})|"
+            r"(?:ضمن|تحت)\s+(?:تصنيف|فئة)\s*[:\-]?\s*"
+            r"[\"']?([^،.;\n]{3,100})",
+            value,
+            re.I,
+        )
+        if match:
+            suggested = " ".join(
+                str(next(
+                    (group for group in match.groups() if group),
+                    "",
+                )).split()
+            ).strip(" \"'")
+        return GacaRemediation(
+            "correct_category",
+            "GACA explicitly says the complaint used the wrong category.",
+            suggested_category=suggested,
+            automatic=True,
+        )
+
+    info_note = " ".join(str(
+        data.get("notesRegardingAdditionalInfoFromTheTravel") or ""
+    ).split())
+    if not info_note:
+        match = re.search(
+            r"(?:Additional-information request|additional information"
+            r"(?: required| requested)?|معلومات\s+إضافية|بيانات\s+إضافية)"
+            r"\s*[:\-]\s*(.{3,1200})",
+            value,
+            re.I,
+        )
+        if match:
+            info_note = " ".join(match.group(1).split())
+    if info_note or str(case_status).casefold() == "needs_information":
+        return GacaRemediation(
+            "provide_information",
+            "GACA is waiting for additional information from the passenger.",
+            requested_information=info_note,
+            automatic=False,
+        )
+
+    if str(case_status).casefold() in {"solved"}:
+        return GacaRemediation(
+            "record_resolution",
+            "GACA marked the complaint solved.",
+            automatic=True,
+        )
+    return GacaRemediation(
+        "review",
+        "No explicit corrective filing instruction was found.",
+        automatic=False,
+    )
 
 
 def _response_json(response) -> object:

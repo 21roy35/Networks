@@ -34,6 +34,7 @@ from .gaca_status import (
     GacaStatusError,
     check_gaca_case,
     extract_gaca_details_url,
+    interpret_gaca_remediation,
     normalize_gaca_phone,
     requires_airline_complaint,
 )
@@ -431,6 +432,7 @@ class TelegramCoordinator:
         threading.Thread(target=self._monitor_loop, name="telegram-monitor",
                          daemon=True).start()
         self._backfill_gaca_status_checks()
+        self._backfill_gaca_remediations()
         return self
 
     def _register_commands(self):
@@ -670,6 +672,29 @@ class TelegramCoordinator:
             )
         self._kick_gaca_status_worker()
 
+    def _backfill_gaca_remediations(self) -> None:
+        """Apply explicit instructions from status checks saved before upgrade."""
+        for check in reversed(db.list_gaca_status_checks(500)):
+            if str(check.get("status") or "") != "checked":
+                continue
+            response_text = str(check.get("response_text") or "").strip()
+            if not response_text:
+                continue
+            complaint_id = int(check.get("complaint_id") or 0)
+            if not complaint_id:
+                continue
+            remediation = interpret_gaca_remediation(
+                response_text,
+                case_status=str(check.get("case_status") or ""),
+            )
+            if remediation.action in {
+                    "airline_prerequisite", "correct_category",
+                    "record_resolution"}:
+                self._handle_gaca_remediation(
+                    complaint_id,
+                    remediation,
+                )
+
     def queue_gaca_status_check(
             self,
             reference: str,
@@ -767,11 +792,10 @@ class TelegramCoordinator:
 
             analysis = None
             if self.ai.enabled and result.response_text:
-                analysis = self.ai.analyze_response(
-                    f"GACA case {check['reference']} status",
-                    result.response_text,
-                    str(check["reference"]),
+                analysis = self.ai.interpret_authority_response(
                     "GACA",
+                    str(check["reference"]),
+                    result.response_text,
                 )
             summary = str(
                 (analysis or {}).get("summary") or result.message).strip()
@@ -798,25 +822,122 @@ class TelegramCoordinator:
                 f"Status: {result.case_status.replace('_', ' ')}\n"
                 f"{summary[:2600]}"
             )
-            invalid_airline_reference = bool(re.search(
-                r"not (?:a|an).{0,40}(?:complaint|case).{0,30}"
-                r"(?:number|reference)|"
-                r"(?:complaint|case).{0,40}(?:number|reference).{0,40}"
-                r"(?:invalid|incorrect)|"
-                r"ليس.{0,40}رقم.{0,30}شكوى|"
-                r"رقم.{0,40}شكوى.{0,40}(?:غير صحيح|غير صالح)|"
-                r"تقديم.{0,50}شكوى.{0,50}شركة الطيران",
+            remediation = interpret_gaca_remediation(
                 result.response_text,
-                re.I,
-            )) or requires_airline_complaint(result.response_text)
-            if invalid_airline_reference:
-                self.notify(
-                    "GACA rejected the airline-reference evidence. FlightDeck "
-                    "will not reuse that value for another escalation; a real "
-                    "airline portal case must be filed and its new reference "
-                    "must complete a fresh seven-day waiting period.")
+                case_status=result.case_status,
+                data=result.data,
+            )
+            self._handle_gaca_remediation(
+                complaint_id,
+                remediation,
+                ai_analysis=analysis,
+            )
         finally:
             self._gaca_status_lock.release()
+
+    def _handle_gaca_remediation(
+            self,
+            gaca_complaint_id: int,
+            remediation,
+            *,
+            ai_analysis: dict | None = None,
+    ) -> None:
+        """Execute one verified GACA instruction with durable deduplication."""
+        action = str(remediation.action or "review")
+        marker = f"gaca-remediation:{int(gaca_complaint_id)}:{action}"
+        if action == "airline_prerequisite":
+            if not db.mark_event_seen(marker):
+                return
+            self.notify(
+                "GACA explicitly requires a real airline complaint first. "
+                "FlightDeck will not reuse that value; it is preserving the "
+                "rejected evidence and opening one corrected airline child "
+                "automatically.")
+            self.refile_airline_after_gaca_prerequisite(gaca_complaint_id)
+            return
+        if action == "correct_category":
+            if not db.mark_event_seen(marker):
+                return
+            self._refile_gaca_after_category_feedback(
+                gaca_complaint_id,
+                suggested_category=str(
+                    remediation.suggested_category or ""),
+            )
+            return
+        if action == "provide_information":
+            if not db.mark_event_seen(marker):
+                return
+            request_text = str(
+                remediation.requested_information or "").strip()
+            ai_items = (ai_analysis or {}).get("requested_information") or []
+            if not request_text and ai_items:
+                request_text = "; ".join(
+                    str(item).strip() for item in ai_items if str(item).strip()
+                )
+            self.notify(
+                "GACA is waiting for additional passenger information"
+                + (f":\n{request_text[:2200]}" if request_text else ".")
+                + "\n\nThe public SMS-details checker is read-only, so "
+                  "FlightDeck did not create a duplicate complaint. Send the "
+                  "requested fact or file in Telegram and it will be attached "
+                  "to the exact case for the next supported portal step."
+            )
+            return
+        if action == "record_resolution":
+            db.mark_event_seen(marker)
+            return
+        # Ghala may explain the response, but a model-only recommendation never
+        # creates a remote complaint without explicit regulator instructions.
+        db.mark_event_seen(marker)
+
+    def _refile_gaca_after_category_feedback(
+            self,
+            gaca_complaint_id: int,
+            *,
+            suggested_category: str = "",
+    ) -> bool:
+        """Open one corrected GACA filing when GACA explicitly rejects category."""
+        regulator = db.get_complaint(int(gaca_complaint_id)) or {}
+        parent_id = int(regulator.get("parent_complaint_id") or 0)
+        prior = db.get_complaint(parent_id) if parent_id else None
+        flight = db.get_flight_by_key(str(regulator.get("flight_key") or ""))
+        if (
+            regulator.get("kind") != "gaca"
+            or not prior
+            or prior.get("kind") != "airline"
+            or not flight
+        ):
+            self.notify(
+                "GACA requested a category correction, but the exact airline "
+                "parent or flight record is missing. Nothing was submitted.")
+            return False
+        suffix = (
+            "GACA closed the earlier escalation because its complaint category "
+            "was incorrect. This is the corrected escalation using the category "
+            "that matches the original incident."
+        )
+        if suggested_category:
+            suffix += (
+                " GACA's response identified the appropriate category as "
+                f"{suggested_category}."
+            )
+        self.notify(
+            "GACA explicitly rejected the prior category. FlightDeck is "
+            "opening one corrected escalation from the same verified airline "
+            "complaint and will not retry the rejected form.")
+        started = self._launch_gaca(
+            flight,
+            incident_suffix=suffix,
+            prior_complaint=prior,
+        )
+        if not started:
+            active = db.active_complaint_for_flight(
+                flight["flight_key"], "gaca")
+            if not active:
+                self.notify(
+                    "The corrected GACA filing could not start. The feedback "
+                    "and original complaint remain preserved for review.")
+        return started
 
     def refile_airline_after_gaca_prerequisite(
             self,

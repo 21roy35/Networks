@@ -4,6 +4,7 @@ from flight_bot.gaca_status import (
     GacaStatusError,
     check_gaca_case,
     extract_gaca_details_url,
+    interpret_gaca_remediation,
     normalize_gaca_phone,
     requires_airline_complaint,
 )
@@ -48,6 +49,41 @@ def test_gaca_details_link_is_strict_and_phone_is_normalized():
         "يجب أولاً تقديم الشكوى لدى الناقل الجوي، ثم الانتظار 7 أيام.")
     assert not requires_airline_complaint(
         "The airline must pay compensation within seven days.")
+
+
+def test_gaca_remediation_requires_explicit_verified_instruction():
+    prerequisite = interpret_gaca_remediation(
+        "The supplied reference is not a complaint number. You must first "
+        "file a complaint with the airline and wait seven days.",
+        case_status="canceled",
+    )
+    assert prerequisite.action == "airline_prerequisite"
+    assert prerequisite.automatic is True
+
+    category = interpret_gaca_remediation(
+        "This case was filed under the wrong category. Please resubmit under "
+        "category: Baggage Damage.",
+        case_status="rejected",
+    )
+    assert category.action == "correct_category"
+    assert "Baggage Damage" in category.suggested_category
+
+    information = interpret_gaca_remediation(
+        "Case status: needs_information",
+        case_status="needs_information",
+        data={
+            "notesRegardingAdditionalInfoFromTheTravel":
+                "Upload the baggage report and damage photographs.",
+        },
+    )
+    assert information.action == "provide_information"
+    assert "baggage report" in information.requested_information
+
+    plain_closure = interpret_gaca_remediation(
+        "The complaint is closed.",
+        case_status="closed",
+    )
+    assert plain_closure.action == "review"
 
 
 def test_gaca_checker_solves_captcha_relays_otp_and_reads_solution():

@@ -75,6 +75,39 @@ def test_internal_sms_requires_secret_and_is_deduplicated(tmp_path, monkeypatch)
     assert "123456789" in event["subject"]
 
 
+def test_internal_sms_deduplicates_same_body_across_adjacent_minutes(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightbot.db")
+    config = deepcopy(DEFAULTS)
+    config["sms"]["ingest_secret"] = "shared-test-secret"
+    application = webapp.create_app(config)
+    application.config.update(TESTING=True)
+    client = application.test_client()
+    headers = {"X-SMS-Secret": "shared-test-secret"}
+    text = (
+        "Dear Guest, we will review your comment ref. C_2778782 "
+        "and respond as soon as possible."
+    )
+
+    first = client.post("/api/internal/sms", json={
+        "sender": "Saudia",
+        "received_at": "2026-07-30T16:45:00+03:00",
+        "message_id": "shortcut-copy-a",
+        "text": text,
+    }, headers=headers)
+    second = client.post("/api/internal/sms", json={
+        "sender": "",
+        "received_at": "2026-07-30T16:47:00+03:00",
+        "message_id": "shortcut-copy-b",
+        "text": text,
+    }, headers=headers)
+
+    assert first.json["duplicate"] is False
+    assert second.json["duplicate"] is True
+    assert second.json["duplicate_of_sms_id"]
+    assert len(db.list_sms_messages()) == 1
+
+
 def test_internal_sms_attaches_saudia_reference_to_flight_page(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightbot.db")
     config = deepcopy(DEFAULTS)
@@ -411,6 +444,13 @@ def test_internal_sms_ignores_non_aviation_shortcut_traffic(
     }
     assert db.list_sms_messages() == []
     assert db.list_mail_events() == []
+
+
+def test_generic_government_service_journey_is_not_an_aviation_sms():
+    assert not webapp._is_aviation_sms(
+        "Riyadh 940",
+        "نشكرك على تقييم رحلتك في خدمة بلاغات مدينة الرياض.",
+    )
 
 
 def test_manual_corrections_are_validated_and_saved(client):

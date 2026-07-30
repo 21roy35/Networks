@@ -243,6 +243,90 @@ def test_gaca_sms_checker_saves_verified_response_and_explains_bad_reference(
     assert "will not reuse that value" in messages
 
 
+def test_gaca_checker_automatically_dispatches_verified_prerequisite_once(
+        coordinator, monkeypatch):
+    bot, _api = coordinator
+    airline_id = db.begin_complaint(
+        "RX|28|2026-06-16", "airline", "Airline complaint", "Incident")
+    db.finish_complaint(airline_id, "submitted", "NOT-A-CASE")
+    gaca_id = db.begin_complaint(
+        "RX|28|2026-06-16", "gaca", "GACA complaint", "Incident",
+        parent_complaint_id=airline_id)
+    db.finish_complaint(gaca_id, "submitted", "C076574")
+    sms_id, _created = db.save_sms_message({
+        "fingerprint": "gaca-auto-remediation",
+        "sender": "GACA CARE",
+        "received_at": "2026-07-30T09:16:00+03:00",
+        "body": "Closed C076574. Details: https://pxpticket.gaca.gov.sa/",
+    })
+    db.queue_gaca_status_check(
+        "C076574", "https://pxpticket.gaca.gov.sa/",
+        trigger_sms_id=sms_id, urgent=True)
+    monkeypatch.setattr(
+        telegram_bot,
+        "check_gaca_case",
+        lambda *_args, **_kwargs: GacaCaseResult(
+            "canceled",
+            "canceled",
+            (
+                "Case status: canceled\nProvided solution: You must first "
+                "file a complaint with the airline and wait seven days."
+            ),
+            "GACA canceled the case.",
+            {},
+        ),
+    )
+    dispatched = []
+    monkeypatch.setattr(
+        bot,
+        "refile_airline_after_gaca_prerequisite",
+        lambda complaint_id: dispatched.append(complaint_id) or 999,
+    )
+
+    bot.process_gaca_status_checks()
+    bot._handle_gaca_remediation(
+        gaca_id,
+        telegram_bot.interpret_gaca_remediation(
+            "You must first file a complaint with the airline."),
+    )
+
+    assert dispatched == [gaca_id]
+
+
+def test_startup_backfills_saved_verified_gaca_instruction_once(
+        coordinator, monkeypatch):
+    bot, _api = coordinator
+    airline_id = db.begin_complaint(
+        "RX|28|2026-06-16", "airline", "Airline complaint", "Incident")
+    db.finish_complaint(airline_id, "submitted", "NOT-A-CASE")
+    gaca_id = db.begin_complaint(
+        "RX|28|2026-06-16", "gaca", "GACA complaint", "Incident",
+        parent_complaint_id=airline_id)
+    db.finish_complaint(gaca_id, "submitted", "C076574")
+    db.queue_gaca_status_check(
+        "C076574", "https://pxpticket.gaca.gov.sa/", urgent=True)
+    check = db.claim_due_gaca_status_check()
+    db.finish_gaca_status_check(
+        int(check["id"]),
+        case_status="canceled",
+        response_text=(
+            "You must first file a complaint with the airline and wait "
+            "seven days."),
+        response_summary="Airline complaint required.",
+    )
+    dispatched = []
+    monkeypatch.setattr(
+        bot,
+        "refile_airline_after_gaca_prerequisite",
+        lambda complaint_id: dispatched.append(complaint_id) or 999,
+    )
+
+    bot._backfill_gaca_remediations()
+    bot._backfill_gaca_remediations()
+
+    assert dispatched == [gaca_id]
+
+
 def test_gaca_airline_prerequisite_creates_one_fresh_airline_filing(
         coordinator, monkeypatch):
     bot, api = coordinator
