@@ -119,6 +119,64 @@ def _wait_for_cdp(port: int, process: subprocess.Popen | None) -> None:
     raise RuntimeError("Normal Chrome did not expose its CDP endpoint.")
 
 
+def _start_normal_chrome(port: int, profile: Path) -> None:
+    """Start the dedicated Chrome process and wait for its CDP endpoint."""
+    global _NORMAL_CHROME_PROCESS
+    command = [
+        _chrome_binary(),
+        f"--remote-debugging-port={port}",
+        "--remote-allow-origins=*",
+        f"--user-data-dir={profile}",
+        "--profile-directory=Default",
+        f"--proxy-server={_local_proxy()}",
+        "--proxy-bypass-list=<-loopback>",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-dev-shm-usage",
+        "--window-size=1360,900",
+        GACA_HOME,
+    ]
+    logger.info("Starting normal Chrome for GACA on CDP port %s.", port)
+    _NORMAL_CHROME_PROCESS = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=_chrome_environment(),
+    )
+    _wait_for_cdp(port, _NORMAL_CHROME_PROCESS)
+
+
+def shutdown(browser=None) -> None:
+    """Close only FlightDeck's dedicated GACA Chrome process.
+
+    The browser profile is deliberately preserved so cookies and a valid
+    Nafath session remain reusable when Chrome is started again.
+    """
+    global _NORMAL_CHROME_PROCESS
+    if browser is not None:
+        try:
+            browser.close()
+        except Exception:
+            logger.debug(
+                "Could not close the GACA CDP browser cleanly.",
+                exc_info=True,
+            )
+    process = _NORMAL_CHROME_PROCESS
+    _NORMAL_CHROME_PROCESS = None
+    if process is None or process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=3)
+    except (OSError, ProcessLookupError):
+        pass
+
+
 def _proxy_session_file() -> Path | None:
     configured = os.environ.get(
         "FLIGHTBOT_GACA_PROXY_SESSION_FILE", "").strip()
@@ -219,37 +277,23 @@ def _sync_proxy_session_state(context, profile: Path) -> bool:
 
 def connect(playwright, *, profile_dir: Path):
     """Return a CDP-attached normal Chrome browser and its default context."""
-    global _NORMAL_CHROME_PROCESS
     port = _cdp_port()
     profile = _profile_dir(profile_dir)
     if not _cdp_ready(port):
-        command = [
-            _chrome_binary(),
-            f"--remote-debugging-port={port}",
-            "--remote-allow-origins=*",
-            f"--user-data-dir={profile}",
-            "--profile-directory=Default",
-            f"--proxy-server={_local_proxy()}",
-            "--proxy-bypass-list=<-loopback>",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-dev-shm-usage",
-            "--window-size=1360,900",
-            GACA_HOME,
-        ]
-        logger.info(
-            "Starting normal Chrome for GACA on CDP port %s.", port)
-        _NORMAL_CHROME_PROCESS = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            env=_chrome_environment(),
-        )
-        _wait_for_cdp(port, _NORMAL_CHROME_PROCESS)
-    browser = playwright.chromium.connect_over_cdp(
-        f"http://127.0.0.1:{port}", timeout=30_000)
+        _start_normal_chrome(port, profile)
+    try:
+        browser = playwright.chromium.connect_over_cdp(
+            f"http://127.0.0.1:{port}", timeout=30_000)
+    except Exception:
+        # A responsive /json/version endpoint does not guarantee that Chrome's
+        # browser thread can accept CDP sessions. Recycle the dedicated process
+        # once instead of retrying the same poisoned browser every 30 minutes.
+        logger.warning(
+            "The GACA Chrome CDP endpoint was unresponsive; recycling it once.")
+        shutdown()
+        _start_normal_chrome(port, profile)
+        browser = playwright.chromium.connect_over_cdp(
+            f"http://127.0.0.1:{port}", timeout=30_000)
     if not browser.contexts:
         raise RuntimeError("Normal Chrome did not expose a browser context.")
     context = browser.contexts[0]

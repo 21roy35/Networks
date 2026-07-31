@@ -1,4 +1,4 @@
-from flight_bot import db
+from flight_bot import db, gaca_account, gaca_normal_browser
 from flight_bot.gaca_account import (
     import_gaca_cases,
     map_gaca_case,
@@ -170,3 +170,107 @@ def test_account_import_reconciles_held_job_authoritatively(
     imported = db.list_gaca_account_cases()
     assert imported[0]["mapping_status"] == "reconciled"
     assert imported[0]["mapped_complaint_id"] == gaca_id
+
+
+def test_read_only_navigation_continues_after_slow_dom_content():
+    class Page:
+        def __init__(self):
+            self.goto_args = None
+            self.waited = []
+
+        def goto(self, *args, **kwargs):
+            self.goto_args = (args, kwargs)
+
+        def wait_for_load_state(self, *_args, **_kwargs):
+            raise RuntimeError("third-party resource still loading")
+
+        def wait_for_timeout(self, milliseconds):
+            self.waited.append(milliseconds)
+
+    page = Page()
+    gaca_account._navigate_read_only(page, "https://example.test", 750)
+
+    assert page.goto_args[1] == {
+        "wait_until": "commit",
+        "timeout": 30000,
+    }
+    assert page.waited == [750]
+
+
+def test_normal_browser_recycles_one_unresponsive_cdp_session(
+        tmp_path, monkeypatch):
+    context = object()
+
+    class Browser:
+        contexts = [context]
+
+    class Chromium:
+        def __init__(self):
+            self.calls = 0
+
+        def connect_over_cdp(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("stale CDP")
+            return Browser()
+
+    chromium = Chromium()
+    playwright = type("Playwright", (), {"chromium": chromium})()
+    recycled = []
+    launched = []
+    monkeypatch.setattr(gaca_normal_browser, "_cdp_port", lambda: 9225)
+    monkeypatch.setattr(
+        gaca_normal_browser, "_profile_dir", lambda _default: tmp_path)
+    monkeypatch.setattr(gaca_normal_browser, "_cdp_ready", lambda _port: True)
+    monkeypatch.setattr(
+        gaca_normal_browser, "shutdown",
+        lambda *_args, **_kwargs: recycled.append(True))
+    monkeypatch.setattr(
+        gaca_normal_browser, "_start_normal_chrome",
+        lambda port, profile: launched.append((port, profile)))
+    monkeypatch.setattr(
+        gaca_normal_browser, "_sync_proxy_session_state",
+        lambda *_args, **_kwargs: False)
+
+    browser, returned_context = gaca_normal_browser.connect(
+        playwright, profile_dir=tmp_path)
+
+    assert isinstance(browser, Browser)
+    assert returned_context is context
+    assert chromium.calls == 2
+    assert recycled == [True]
+    assert launched == [(9225, tmp_path)]
+
+
+def test_normal_browser_shutdown_preserves_profile_and_stops_process(
+        monkeypatch):
+    class Browser:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class Process:
+        def __init__(self):
+            self.terminated = False
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout):
+            assert timeout == 5
+
+    browser = Browser()
+    process = Process()
+    monkeypatch.setattr(
+        gaca_normal_browser, "_NORMAL_CHROME_PROCESS", process)
+
+    gaca_normal_browser.shutdown(browser)
+
+    assert browser.closed is True
+    assert process.terminated is True
+    assert gaca_normal_browser._NORMAL_CHROME_PROCESS is None

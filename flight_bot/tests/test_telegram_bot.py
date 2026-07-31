@@ -327,6 +327,64 @@ def test_startup_backfills_saved_verified_gaca_instruction_once(
     assert dispatched == [gaca_id]
 
 
+def test_automatic_gaca_account_sync_pauses_when_nafath_is_required(
+        coordinator, monkeypatch):
+    bot, _api = coordinator
+    db.save_gaca_account_sync(
+        "auth_required",
+        "The saved session expired. Send /gaca.")
+    started = []
+    monkeypatch.setattr(
+        bot,
+        "start_gaca_account_sync",
+        lambda **kwargs: started.append(kwargs) or True)
+
+    bot._maybe_sync_gaca_account()
+
+    assert started == []
+
+
+def test_gaca_account_sync_uses_exponential_error_backoff(
+        coordinator, monkeypatch):
+    bot, _api = coordinator
+    bot.config["gaca_account"].update({
+        "sync_minutes": 5,
+        "failure_backoff_max_minutes": 60,
+    })
+    monkeypatch.setattr(
+        telegram_bot,
+        "sync_gaca_account",
+        lambda *_args, **_kwargs: GacaAccountSyncResult(
+            "error", "GACA timed out safely."),
+    )
+
+    before = time.monotonic()
+    bot._run_gaca_account_sync(manual=False)
+    first_delay = bot._next_gaca_sync - before
+    before = time.monotonic()
+    bot._run_gaca_account_sync(manual=False)
+    second_delay = bot._next_gaca_sync - before
+
+    assert 300 <= first_delay < 305
+    assert 600 <= second_delay < 605
+
+
+def test_gaca_account_auth_result_stops_background_probes(
+        coordinator, monkeypatch):
+    bot, _api = coordinator
+    monkeypatch.setattr(
+        telegram_bot,
+        "sync_gaca_account",
+        lambda *_args, **_kwargs: GacaAccountSyncResult(
+            "auth_required", "Send /gaca."),
+    )
+
+    bot._run_gaca_account_sync(manual=False)
+
+    assert bot._next_gaca_sync == float("inf")
+    assert bot._gaca_sync_failures == 0
+
+
 def test_gaca_airline_prerequisite_creates_one_fresh_airline_filing(
         coordinator, monkeypatch):
     bot, api = coordinator

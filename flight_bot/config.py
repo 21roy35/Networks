@@ -88,6 +88,7 @@ DEFAULTS = {
     "gaca_account": {
         "enabled": True,
         "sync_minutes": 30,
+        "failure_backoff_max_minutes": 360,
         "max_cases": 200,
     },
     "ai": {

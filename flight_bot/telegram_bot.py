@@ -390,6 +390,8 @@ class TelegramCoordinator:
         self._gaca_sync_lock = threading.Lock()
         self._gaca_sync_thread: threading.Thread | None = None
         self._last_gaca_sync = 0.0
+        self._next_gaca_sync = 0.0
+        self._gaca_sync_failures = 0
         self._gaca_status_lock = threading.Lock()
         self._gaca_status_thread: threading.Thread | None = None
         # Legacy floor kept for migrations/tests; FIFO response matching is disabled.
@@ -1975,6 +1977,35 @@ class TelegramCoordinator:
 
         result = sync_gaca_account(
             self.config, progress, allow_login=manual)
+        settings = self.config.get("gaca_account") or {}
+        try:
+            interval = max(5, int(settings.get("sync_minutes", 30))) * 60
+        except (TypeError, ValueError):
+            interval = 30 * 60
+        try:
+            maximum = max(
+                interval,
+                int(settings.get(
+                    "failure_backoff_max_minutes", 360)) * 60,
+            )
+        except (TypeError, ValueError):
+            maximum = 360 * 60
+        now = time.monotonic()
+        if result.status == "error":
+            self._gaca_sync_failures += 1
+            delay = min(
+                maximum,
+                interval * (2 ** min(self._gaca_sync_failures - 1, 5)),
+            )
+            self._next_gaca_sync = now + delay
+        elif result.status == "auth_required":
+            # A background read cannot renew Nafath. Stop probing until the
+            # owner explicitly starts /gaca, avoiding overnight browser loops.
+            self._gaca_sync_failures = 0
+            self._next_gaca_sync = float("inf")
+        else:
+            self._gaca_sync_failures = 0
+            self._next_gaca_sync = now + interval
         if result.status == "success":
             should_report = manual or result.new_cases or result.cases_reconciled
             if should_report:
@@ -1998,11 +2029,18 @@ class TelegramCoordinator:
         settings = self.config.get("gaca_account") or {}
         if not settings.get("enabled", True):
             return
+        state = db.get_gaca_account_sync() or {}
+        if state.get("status") == "auth_required":
+            # Manual /gaca is the only useful next action. Automatic retries
+            # cannot approve Nafath and only create portal/browser load.
+            return
         try:
             interval = max(5, int(settings.get("sync_minutes", 30))) * 60
         except (TypeError, ValueError):
             interval = 30 * 60
         now = time.monotonic()
+        if now < self._next_gaca_sync:
+            return
         if now - self._last_gaca_sync < interval:
             return
         self._last_gaca_sync = now

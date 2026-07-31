@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -532,6 +533,31 @@ def _gaca_account_signed_in(page) -> bool:
     ))
 
 
+def _wait_for_gaca_account_state(page, timeout_ms: int = 10000) -> bool:
+    """Wait for the delayed account header or an explicit login screen."""
+    deadline = time.monotonic() + max(0, timeout_ms) / 1000
+    while True:
+        if _gaca_account_signed_in(page):
+            return True
+        if portal_automation._is_gaca_login_page(page):
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        page.wait_for_timeout(500)
+
+
+def _navigate_read_only(page, url: str, settle_ms: int = 900) -> None:
+    """Navigate without waiting indefinitely for GACA's heavy SPA resources."""
+    page.goto(url, wait_until="commit", timeout=30000)
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        # The useful account DOM is often ready even while a third-party
+        # resource keeps DOMContentLoaded pending.
+        logger.debug("GACA account page kept loading after document commit.")
+    page.wait_for_timeout(settle_ms)
+
+
 def _open_exposed_login(page) -> bool:
     snapshot = _page_snapshot(page)
     for link in snapshot.get("links") or []:
@@ -540,8 +566,7 @@ def _open_exposed_login(page) -> bool:
         if (_same_gaca_url(href)
                 and re.search(r"/login(?:/|$)", href, re.I)
                 and re.search(r"login|sign\s*in|دخول", text, re.I)):
-            page.goto(href, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(800)
+            _navigate_read_only(page, href, 800)
             return True
     return False
 
@@ -569,9 +594,8 @@ def _candidate_url(link: dict, *, detail: bool = False) -> bool:
 def _collect_account_records(page, max_cases: int) -> list[dict]:
     """Traverse only account links actually exposed by the signed-in portal."""
     origin = gaca_normal_browser.GACA_HOME
-    page.goto(origin, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(1200)
-    if not _gaca_account_signed_in(page):
+    _navigate_read_only(page, origin, 1200)
+    if not _wait_for_gaca_account_state(page):
         raise PermissionError("GACA account sign-in expired during sync.")
     queue = [str(page.url)]
     visited: set[str] = set()
@@ -584,9 +608,8 @@ def _collect_account_records(page, max_cases: int) -> list[dict]:
             continue
         visited.add(url)
         if str(page.url) != url:
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(900)
-        if not _gaca_account_signed_in(page):
+            _navigate_read_only(page, url, 900)
+        if not _wait_for_gaca_account_state(page):
             raise PermissionError("GACA account sign-in expired during sync.")
         snapshot = _page_snapshot(page)
         records = list(snapshot.get("records") or [])
@@ -614,9 +637,8 @@ def _collect_account_records(page, max_cases: int) -> list[dict]:
         if len(normalized) >= max_cases or url in visited:
             continue
         visited.add(url)
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(800)
-        if not _gaca_account_signed_in(page):
+        _navigate_read_only(page, url, 800)
+        if not _wait_for_gaca_account_state(page):
             raise PermissionError("GACA account sign-in expired during sync.")
         snapshot = _page_snapshot(page)
         case = normalize_gaca_case(snapshot)
@@ -686,25 +708,24 @@ def sync_gaca_account(
 
     max_cases = max(1, min(int(settings.get("max_cases", 200)), 1000))
     screenshot_file = ""
+    normal_browser = None
+    browser_attempted = False
     try:
         with portal_automation._BROWSER_LOCK:
             with sync_playwright() as playwright:
                 if not gaca_normal_browser.enabled():
                     raise RuntimeError(
                         "The persistent normal GACA browser is not enabled.")
-                _browser, context = gaca_normal_browser.connect(
+                browser_attempted = True
+                normal_browser, context = gaca_normal_browser.connect(
                     playwright, profile_dir=portal_automation._GACA_PROFILE_DIR)
                 page = gaca_normal_browser.gaca_page(context)
                 progress(
                     "opening",
                     "Opening your signed-in GACA account in read-only mode.")
-                page.goto(
-                    gaca_normal_browser.GACA_HOME,
-                    wait_until="domcontentloaded",
-                    timeout=60000,
-                )
-                page.wait_for_timeout(1000)
-                if not _gaca_account_signed_in(page):
+                _navigate_read_only(
+                    page, gaca_normal_browser.GACA_HOME, 1000)
+                if not _wait_for_gaca_account_state(page):
                     if not allow_login:
                         result = GacaAccountSyncResult(
                             "auth_required",
@@ -734,13 +755,9 @@ def sync_gaca_account(
                         db.save_gaca_account_sync(
                             result.status, result.message)
                         return result
-                    page.goto(
-                        gaca_normal_browser.GACA_HOME,
-                        wait_until="domcontentloaded",
-                        timeout=60000,
-                    )
-                    page.wait_for_timeout(800)
-                    if not _gaca_account_signed_in(page):
+                    _navigate_read_only(
+                        page, gaca_normal_browser.GACA_HOME, 800)
+                    if not _wait_for_gaca_account_state(page):
                         result = GacaAccountSyncResult(
                             "auth_required",
                             "Nafath returned, but the GACA account did not "
@@ -777,12 +794,28 @@ def sync_gaca_account(
         result = GacaAccountSyncResult(
             "auth_required", str(exc), screenshot_file=screenshot_file)
     except Exception as exc:
-        logger.exception("GACA account synchronization failed")
+        detail = re.sub(r"\s+", " ", str(exc)).strip()[:240]
+        if exc.__class__.__name__ == "TimeoutError":
+            logger.warning(
+                "GACA account synchronization timed out; the dedicated "
+                "browser will be recycled: %s",
+                detail,
+            )
+        else:
+            logger.exception("GACA account synchronization failed")
         result = GacaAccountSyncResult(
             "error",
-            f"GACA account synchronization stopped safely: {exc}",
+            "GACA account synchronization stopped safely: "
+            f"{detail or exc.__class__.__name__}",
             screenshot_file=screenshot_file,
         )
+    finally:
+        if browser_attempted:
+            # Account reads do not need a browser left rendering indefinitely.
+            # Reacquiring the global lock means a portal filing that started in
+            # the meantime finishes before this idle cleanup runs.
+            with portal_automation._BROWSER_LOCK:
+                gaca_normal_browser.shutdown(normal_browser)
     db.save_gaca_account_sync(
         result.status, result.message,
         screenshot_file=result.screenshot_file or None)
