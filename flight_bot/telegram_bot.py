@@ -402,6 +402,7 @@ class TelegramCoordinator:
         self._gaca_sync_failures = 0
         self._gaca_status_lock = threading.Lock()
         self._gaca_status_thread: threading.Thread | None = None
+        self._notification_cooldowns: dict[str, float] = {}
         # Legacy floor kept for migrations/tests; FIFO response matching is disabled.
         self._fifo_response_floor = db.initialize_fifo_response_floor()
 
@@ -461,11 +462,35 @@ class TelegramCoordinator:
         set_captcha_solver(None)
 
     def notify(self, text: str, buttons=None, force_reply: bool = False) -> dict:
+        normalized = " ".join(str(text or "").split())
+        cooldown_seconds = 0
+        if not buttons and not force_reply and normalized.startswith((
+                "This GACA complaint was already submitted.",
+                "An existing GACA filing reservation is still",
+                "The existing GACA filing is still")):
+            cooldown_seconds = 6 * 60 * 60
+        cooldown_key = ""
+        if cooldown_seconds:
+            cooldown_key = hashlib.sha256(
+                normalized.encode("utf-8")).hexdigest()
+            now = time.monotonic()
+            with self._lock:
+                last_sent = self._notification_cooldowns.get(cooldown_key, 0.0)
+                if last_sent and now - last_sent < cooldown_seconds:
+                    logger.info(
+                        "Coalesced repeated Telegram GACA state notice: %s",
+                        normalized[:180],
+                    )
+                    return {}
+                self._notification_cooldowns[cooldown_key] = now
         try:
             result = self.api.send_message(
                 self.chat_id, text, reply_markup=buttons,
                 force_reply=force_reply)
         except Exception as exc:
+            if cooldown_key:
+                with self._lock:
+                    self._notification_cooldowns.pop(cooldown_key, None)
             # A temporary Telegram outage must not abort an already-safe
             # provider/regulator workflow before the official portal opens.
             logger.warning(
@@ -3602,6 +3627,17 @@ class TelegramCoordinator:
             flight = db.get_flight_by_key(child["flight_key"])
             if not flight:
                 continue
+            # GACA filing idempotency is flight-wide, while older imported
+            # airline records can have fragmented lineage roots for the same
+            # incident. If a flight already has an active/submitted GACA case,
+            # consume the follow-up flag using that same invariant. Otherwise
+            # this monitor would rebuild the payload (and call Ghala) every
+            # minute, then announce the same duplicate reservation forever.
+            active_gaca = db.active_complaint_for_flight(
+                child["flight_key"], "gaca")
+            if active_gaca:
+                db.clear_parent_escalation_flag(int(child["id"]))
+                continue
             root_id = int(parent.get("root_complaint_id") or parent["id"])
             related_gaca = next((
                 item for item in db.complaints_for_flight(child["flight_key"])
@@ -3624,7 +3660,8 @@ class TelegramCoordinator:
                         + "because the original complaint was closed without "
                           "a satisfactory solution."
                     ),
-                    prior_complaint=parent):
+                    prior_complaint=parent,
+                    automatic=True):
                 db.clear_parent_escalation_flag(int(child["id"]))
 
     def _launch_gaca(self, flight: dict, incident_suffix: str = "",

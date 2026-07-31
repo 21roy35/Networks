@@ -2014,6 +2014,57 @@ def test_manual_gaca_duplicate_reports_real_active_job_state(
     assert "on record" not in api.messages[-1]["text"]
 
 
+def test_repeated_gaca_state_notice_is_coalesced(coordinator):
+    bot, api = coordinator
+    message = (
+        "This GACA complaint was already submitted. "
+        "Reference: C076100. I did not submit it again."
+    )
+
+    bot.notify(message)
+    bot.notify(message)
+
+    assert [item["text"] for item in api.messages] == [message]
+
+
+def test_parent_escalation_flag_is_consumed_by_existing_flight_gaca(
+        coordinator, monkeypatch):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    original = db.add_complaint(
+        flight["flight_key"], "airline", None, "Original complaint",
+        "closed", reference="C_700100", details="Broken screen.")
+    db.add_complaint(
+        flight["flight_key"], "gaca", None, "Existing GACA case",
+        "submitted", reference="C076100", details="Broken screen.",
+        parent_complaint_id=original)
+    parent = db.add_complaint(
+        flight["flight_key"], "airline", None, "Imported duplicate root",
+        "closed", reference="C_700101", details="Broken screen.")
+    child = db.begin_complaint(
+        flight["flight_key"], "airline", "Accepted follow-up",
+        "The issue remains unresolved.",
+        parent_complaint_id=parent,
+        escalate_parent_on_success=True,
+    )
+    assert child is not None
+    db.finish_complaint(child, "submitted", "C_700102")
+    monkeypatch.setattr(
+        bot,
+        "_launch_gaca",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("existing flight GACA must satisfy the flag")),
+    )
+
+    bot.resume_pending_parent_escalations()
+    bot.resume_pending_parent_escalations()
+
+    assert db.get_complaint(child)["escalate_parent_on_success"] == 0
+    assert not api.messages
+
+
 def test_old_filing_with_active_portal_job_is_not_replaced(
         coordinator, monkeypatch):
     bot, api = coordinator
