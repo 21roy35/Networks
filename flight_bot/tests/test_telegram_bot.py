@@ -946,6 +946,43 @@ def test_substantive_airline_response_offers_gaca_escalation(coordinator):
     assert len(db.complaints_for_flight(flight["flight_key"])) == 1
 
 
+def test_response_monitor_snapshots_event_markers_once(
+        coordinator, monkeypatch):
+    bot, api = coordinator
+    load_demo(log=lambda *_args, **_kwargs: None)
+    flight = next(item for item in db.list_flights()
+                  if item.get("airline_code") == "SV")
+    db.add_complaint(
+        flight["flight_key"], "airline", None, "Claim", "submitted",
+        reference="CAS-778900", details="Broken seat")
+    db.save_mail_event({
+        "message_id": "<snapshot-reply@example>",
+        "subject": "Case CAS-778900 resolved",
+        "sender": "customer.relations@saudia.com",
+        "date": datetime.now(),
+        "body": "We reviewed CAS-778900 and closed the case.",
+    })
+    original_list = db.list_event_keys
+    snapshots = []
+
+    def list_once():
+        snapshots.append(True)
+        return original_list()
+
+    monkeypatch.setattr(db, "list_event_keys", list_once)
+    monkeypatch.setattr(
+        db,
+        "event_seen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("response scan performed a per-pair DB lookup")),
+    )
+
+    bot.check_complaint_responses()
+
+    assert snapshots == [True]
+    assert len(api.messages) == 1
+
+
 def test_reference_less_resolutions_are_not_matched_by_fifo(coordinator):
     bot, api = coordinator
     load_demo(log=lambda *_args, **_kwargs: None)

@@ -1937,6 +1937,14 @@ def event_seen(event_key: str) -> bool:
             (event_key,)).fetchone() is not None
 
 
+def list_event_keys() -> set[str]:
+    """Load one monitor-cycle snapshot of all one-shot event markers."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT event_key FROM telegram_events").fetchall()
+    return {str(row["event_key"]) for row in rows}
+
+
 def mark_event_seen(event_key: str) -> bool:
     """Atomically claim a one-shot event; true only for the first caller."""
     with connect() as conn:

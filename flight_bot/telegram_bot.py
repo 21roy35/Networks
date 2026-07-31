@@ -190,8 +190,15 @@ def _gaca_case_fact_score(blob: str, complaint: dict) -> int:
     return score
 
 
-def reconcile_gaca_mail_events(events: list[dict], notify=None) -> int:
+def reconcile_gaca_mail_events(
+        events: list[dict], notify=None,
+        seen_event_keys: set[str] | None = None) -> int:
     """Attach regulator email references to the exact emailed escalation."""
+    seen_event_keys = (
+        seen_event_keys
+        if seen_event_keys is not None
+        else db.list_event_keys()
+    )
     pending = [
         complaint
         for complaint in db.list_complaints()
@@ -202,7 +209,7 @@ def reconcile_gaca_mail_events(events: list[dict], notify=None) -> int:
     reconciled = 0
     for event in events:
         marker = f"gaca-reference-captured:{event.get('id')}"
-        if db.event_seen(marker):
+        if marker in seen_event_keys:
             continue
         sender_domain = parseaddr(event.get("sender") or "")[1].rsplit(
             "@", 1)[-1].casefold()
@@ -237,6 +244,7 @@ def reconcile_gaca_mail_events(events: list[dict], notify=None) -> int:
         ):
             continue
         db.mark_event_seen(marker)
+        seen_event_keys.add(marker)
         pending = [
             item for item in pending
             if int(item["id"]) != int(complaint["id"])
@@ -4119,7 +4127,24 @@ class TelegramCoordinator:
 
     def check_complaint_responses(self):
         events = db.list_mail_events()
-        reconcile_gaca_mail_events(events, notify=self.notify)
+        seen_event_keys = db.list_event_keys()
+        reconcile_gaca_mail_events(
+            events, notify=self.notify,
+            seen_event_keys=seen_event_keys)
+
+        def event_seen(key: str) -> bool:
+            return key in seen_event_keys
+
+        def mark_event_seen(key: str) -> bool:
+            created = db.mark_event_seen(key)
+            seen_event_keys.add(key)
+            return created
+
+        def clear_event_seen(key: str) -> bool:
+            cleared = db.clear_event_seen(key)
+            seen_event_keys.discard(key)
+            return cleared
+
         substantive = re.compile(
             r"resolved|resolution|decision|outcome|approved|declined|denied|"
             r"refund|compensation|reimburse|remedy|credit|voucher|"
@@ -4166,7 +4191,7 @@ class TelegramCoordinator:
             created = parse_flight_time(complaint.get("created_at"))
             for event in events:
                 capture_key = f"reference-captured:{event['id']}"
-                if db.event_seen(capture_key):
+                if event_seen(capture_key):
                     continue
                 event_date = parse_flight_time(event.get("date"))
                 if created and event_date and event_date < created:
@@ -4188,11 +4213,11 @@ class TelegramCoordinator:
                     # A delayed/duplicated acknowledgement can be imported
                     # again after a restart. Never copy its already-owned
                     # reference onto another pending complaint.
-                    db.mark_event_seen(capture_key)
+                    mark_event_seen(capture_key)
                     continue
                 db.finish_complaint(
                     complaint["id"], "submitted", captured_reference)
-                db.mark_event_seen(capture_key)
+                mark_event_seen(capture_key)
                 complaint["reference"] = captured_reference
                 known_references.add(captured_reference.casefold())
                 self.notify(
@@ -4350,7 +4375,7 @@ class TelegramCoordinator:
         def notify_linked_message_pending(
                 complaint: dict, info: dict, analysis: dict | None) -> None:
             marker = f"closure-details-pending:{int(complaint['id'])}"
-            if not db.mark_event_seen(marker):
+            if not mark_event_seen(marker):
                 return
             flight = complaint.get("flight_data") or {}
             summary = str((analysis or {}).get("summary") or "").strip()
@@ -4366,7 +4391,7 @@ class TelegramCoordinator:
                   "the detailed email went to another inbox, forward or paste "
                   "it into Telegram.")
             if not delivered.get("message_id"):
-                db.clear_event_seen(marker)
+                clear_event_seen(marker)
 
         def notify_response(complaint: dict, info: dict, event: dict,
                             analysis: dict | None, match_method: str) -> None:
@@ -4445,8 +4470,8 @@ class TelegramCoordinator:
                              event.get("body") or ""))
             blob_folded = blob.casefold()
             for complaint in ordered_complaints:
-                if (db.event_seen(f"airline-responded:{complaint['id']}")
-                        or db.event_seen(f"closed:{complaint['flight_key']}")):
+                if (event_seen(f"airline-responded:{complaint['id']}")
+                        or event_seen(f"closed:{complaint['flight_key']}")):
                     continue
                 reference = str(complaint.get("reference") or "").casefold()
                 if not reference or reference not in blob_folded:
@@ -4468,10 +4493,10 @@ class TelegramCoordinator:
                 if not db.link_complaint_response(
                         complaint["id"], event["id"], "exact_reference"):
                     break
-                db.mark_event_seen(
+                mark_event_seen(
                     f"complaint-response:{complaint['id']}:{event['id']}")
-                db.mark_event_seen(f"airline-responded:{complaint['id']}")
-                db.clear_event_seen(
+                mark_event_seen(f"airline-responded:{complaint['id']}")
+                clear_event_seen(
                     f"closure-details-pending:{int(complaint['id'])}")
                 notify_response(
                     complaint, info, event, analysis, "exact_reference")
@@ -4497,8 +4522,8 @@ class TelegramCoordinator:
             # Strong booking-fact matches only (PNR/ticket, or flight+passenger).
             fact_matches = []
             for complaint in ordered_complaints:
-                if (db.event_seen(f"airline-responded:{complaint['id']}")
-                        or db.event_seen(f"closed:{complaint['flight_key']}")):
+                if (event_seen(f"airline-responded:{complaint['id']}")
+                        or event_seen(f"closed:{complaint['flight_key']}")):
                     continue
                 created = parse_flight_time(complaint.get("created_at"))
                 event_date = parse_flight_time(event.get("date"))
@@ -4522,11 +4547,11 @@ class TelegramCoordinator:
                 notify_linked_message_pending(complaint, info, analysis)
             if is_substantive and db.link_complaint_response(
                     complaint["id"], event["id"], "case_facts"):
-                db.mark_event_seen(
+                mark_event_seen(
                     f"complaint-response:{complaint['id']}:{event['id']}")
-                db.mark_event_seen(
+                mark_event_seen(
                     f"airline-responded:{complaint['id']}")
-                db.clear_event_seen(
+                clear_event_seen(
                     f"closure-details-pending:{int(complaint['id'])}")
                 notify_response(
                     complaint, info, event, analysis, "case_facts")
