@@ -200,7 +200,13 @@ def fetch_recent_verification_message(
     if not imap_cfg.get("user") or not imap_cfg.get("password"):
         return None
     since = since or datetime.now().astimezone()
-    search_since = (since - timedelta(seconds=30)).strftime("%d-%b-%Y")
+    # GACA can emit the OTP before its verification page becomes visible to
+    # the browser. On the live portal that gap has exceeded 30 seconds, so the
+    # handler's own start time is not a safe lower bound. Search a narrow
+    # three-minute overlap, then rely on exact recipient matching, newest-first
+    # ordering, and the caller's used-message guard to reject stale codes.
+    otp_lookback = timedelta(minutes=3)
+    search_since = (since - otp_lookback).strftime("%d-%b-%Y")
     conn = imaplib.IMAP4_SSL(
         imap_cfg.get("host") or "imap.gmail.com",
         int(imap_cfg.get("port") or 993))
@@ -246,7 +252,7 @@ def fetch_recent_verification_message(
             raw = message_to_raw(msg, raw_bytes=raw_bytes)
             sent_at = raw.get("date")
             if isinstance(sent_at, datetime):
-                threshold = since - timedelta(seconds=30)
+                threshold = since - otp_lookback
                 if sent_at.tzinfo is None and threshold.tzinfo is not None:
                     threshold = threshold.replace(tzinfo=None)
                 elif sent_at.tzinfo is not None and threshold.tzinfo is None:

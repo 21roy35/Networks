@@ -447,11 +447,27 @@ def _human_mouse_move(x: int, y: int) -> None:
         if separator and key in current and re.fullmatch(
                 r"-?\d+", value.strip()):
             current[key] = int(value.strip())
+    last_point = (current["X"], current["Y"])
+    target = (x, y)
+    if last_point == target:
+        # ``xdotool mousemove --sync`` waits for an actual motion event. When
+        # the cursor is already at Submit (common on a retry), no event can
+        # arrive and the command times out before the click. There is nothing
+        # to animate in that case; leave the pointer in place and click it.
+        return
     for step in range(1, 25):
         fraction = step / 24.0
         next_x = round(current["X"] + (x - current["X"]) * fraction)
         next_y = round(current["Y"] + (y - current["Y"]) * fraction)
-        _run_xdotool("mousemove", "--sync", next_x, next_y)
+        next_point = (next_x, next_y)
+        # Rounding short movements into 24 steps creates duplicate points.
+        # Sending a synchronous move to the current point has the same
+        # deadlock as the already-at-target case above. Deduplicate positions
+        # and use ordinary X11 moves; subprocess completion preserves order.
+        if next_point == last_point:
+            continue
+        _run_xdotool("mousemove", next_x, next_y)
+        last_point = next_point
         time.sleep(0.025)
 
 

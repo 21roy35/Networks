@@ -82,6 +82,26 @@ def _verification_code_from_text(value: str) -> str:
     return max(ranked, default=(0, ""))[1]
 
 
+def _verification_email_settle_delay(message: dict | None) -> float:
+    """Wait out small GACA mail/backend clock skew before using an OTP.
+
+    GACA can make the message visible over IMAP several seconds before the
+    message's own Date timestamp. Entering that code immediately has returned
+    the browser to Step 4; once the timestamp passes, the same flow succeeds.
+    Keep the wait bounded so a malformed or badly skewed header cannot stall
+    the Telegram verification fallback.
+    """
+    sent_at = (message or {}).get("date")
+    if not isinstance(sent_at, datetime):
+        return 0.0
+    now = datetime.now().astimezone()
+    if sent_at.tzinfo is None:
+        sent_at = sent_at.replace(tzinfo=now.tzinfo)
+    else:
+        sent_at = sent_at.astimezone(now.tzinfo)
+    return min(15.0, max(0.0, (sent_at - now).total_seconds() + 2.0))
+
+
 def _buttons(rows: list[list[tuple[str, str]]]) -> dict:
     return {"inline_keyboard": [[{"text": text, "callback_data": data}
                                  for text, data in row] for row in rows]}
@@ -1194,8 +1214,12 @@ class TelegramCoordinator:
                             code = re.sub(
                                 r"\D", "",
                                 str((distilled or {}).get("otp") or ""))
-                        if code and self.accept_verification_code(
-                                code, source="email"):
+                        settle_delay = _verification_email_settle_delay(message)
+                        if settle_delay and not waiter.event.is_set():
+                            waiter.event.wait(settle_delay)
+                        if (code and not waiter.event.is_set()
+                                and self.accept_verification_code(
+                                    code, source="email")):
                             if message_id:
                                 self._used_verification_emails.add(message_id)
                             self.notify(

@@ -1984,6 +1984,41 @@ def test_gaca_normal_browser_allows_truthful_timezone_override(monkeypatch):
     )
 
 
+def test_gaca_mouse_move_does_not_wait_when_already_at_target(monkeypatch):
+    calls = []
+
+    def fake_xdotool(*args, **_kwargs):
+        calls.append(args)
+        if args[0] == "getmouselocation":
+            return "X=541\nY=791\nSCREEN=0\nWINDOW=1"
+        return ""
+
+    monkeypatch.setattr(gaca_normal_browser, "_run_xdotool", fake_xdotool)
+
+    gaca_normal_browser._human_mouse_move(541, 791)
+
+    assert calls == [("getmouselocation", "--shell")]
+
+
+def test_gaca_mouse_move_skips_rounded_duplicate_positions(monkeypatch):
+    calls = []
+
+    def fake_xdotool(*args, **_kwargs):
+        calls.append(args)
+        if args[0] == "getmouselocation":
+            return "X=540\nY=790\nSCREEN=0\nWINDOW=1"
+        return ""
+
+    monkeypatch.setattr(gaca_normal_browser, "_run_xdotool", fake_xdotool)
+    monkeypatch.setattr(gaca_normal_browser.time, "sleep", lambda _delay: None)
+
+    gaca_normal_browser._human_mouse_move(541, 791)
+
+    moves = [call for call in calls if call[0] == "mousemove"]
+    assert moves == [("mousemove", 541, 791)]
+    assert all("--sync" not in call for call in moves)
+
+
 def test_gaca_normalizes_saudia_and_local_mobile_number():
     assert portal_automation._gaca_airline_label({
         "airline_code": "SV", "airline_name": "Saudia"
@@ -2766,6 +2801,74 @@ def test_gaca_normal_browser_uses_os_input_for_email_code(monkeypatch):
     assert used and used[0][1] == "9534"
 
 
+def test_gaca_visible_otp_takes_priority_over_stale_recaptcha(monkeypatch):
+    class Locator:
+        def __init__(self, kind):
+            self.kind = kind
+
+    class Page:
+        url = (
+            "https://myeservices.gaca.gov.sa/eservices/public/qpe/"
+            "verification/email"
+        )
+
+        def get_by_role(self, *_args, **_kwargs):
+            return Locator("submit")
+
+        def is_closed(self):
+            return False
+
+        def wait_for_timeout(self, _value):
+            pass
+
+    state = {"otp_solved": False}
+    page = Page()
+    monkeypatch.setattr(
+        portal_automation, "_visible",
+        lambda locator: getattr(locator, "kind", "") == "otp",
+    )
+    monkeypatch.setattr(
+        portal_automation, "_otp_fields", lambda _page: Locator("otp"))
+    monkeypatch.setattr(
+        portal_automation, "_pending_captcha_kind",
+        lambda _page: "recaptcha",
+    )
+    monkeypatch.setattr(
+        portal_automation, "_needs_human_step",
+        lambda _page: None if state["otp_solved"] else "Enter email code.",
+    )
+    monkeypatch.setattr(
+        portal_automation, "_body_text",
+        lambda _page: (
+            "Complaint successfully submitted."
+            if state["otp_solved"] else "Email Verification"
+        ),
+    )
+
+    def solve_otp(*_args, **_kwargs):
+        state["otp_solved"] = True
+        return True
+
+    monkeypatch.setattr(
+        portal_automation, "_wait_for_human_step", solve_otp)
+    monkeypatch.setattr(
+        portal_automation, "_page_screenshot", lambda _page: b"")
+    monkeypatch.setattr(
+        portal_automation, "_VERIFICATION_HANDLER", lambda _challenge: "9534")
+
+    result = portal_automation._await_confirmation(
+        page,
+        page.url,
+        lambda *_args: None,
+        payload={"kind": "gaca", "email": "alias@example.com"},
+        timeout_seconds=2,
+        submission_capture={},
+    )
+
+    assert state["otp_solved"] is True
+    assert result.status == "accepted_pending_reference"
+
+
 def test_saudia_backend_rejection_and_unconfirmed_timeout_are_failures():
     rejected = portal_automation._saudia_submission_result({
         "seen": True, "status": 500, "json": {"data": None},
@@ -2827,6 +2930,50 @@ def test_gaca_post_capture_distinguishes_rejection_and_acceptance():
     assert duplicate.status == "held"
     assert duplicate.error_code == "gaca_duplicate_existing"
     assert "will not be resubmitted" in duplicate.message
+
+
+def test_gaca_visible_duplicate_form_is_held_before_captcha_retry(monkeypatch):
+    class Submit:
+        first = None
+
+    class Page:
+        url = (
+            "https://myeservices.gaca.gov.sa/eservices/public/qpe/"
+            "complaint-airline/step4"
+        )
+
+        def is_closed(self):
+            return False
+
+        def get_by_role(self, *_args, **_kwargs):
+            return Submit()
+
+    ticks = iter((0.0, 1.0, 9.0))
+    duplicate = (
+        "You have already submitted a complaint with the same information"
+    )
+    monkeypatch.setattr(
+        portal_automation.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(portal_automation, "_visible", lambda _item: True)
+    monkeypatch.setattr(portal_automation, "_body_text", lambda _page: duplicate)
+    monkeypatch.setattr(
+        portal_automation, "_gaca_step2_invalid_summary",
+        lambda _page: "",
+    )
+    monkeypatch.setattr(
+        portal_automation, "_validation_summary", lambda _page: duplicate)
+
+    result = portal_automation._await_confirmation(
+        Page(),
+        Page.url,
+        lambda *_args: None,
+        payload={"kind": "gaca"},
+        timeout_seconds=120,
+        submission_capture={},
+    )
+
+    assert result.status == "held"
+    assert result.error_code == "gaca_duplicate_existing"
 
 
 def test_gaca_email_verification_redirect_distinguishes_rejection_and_acceptance():

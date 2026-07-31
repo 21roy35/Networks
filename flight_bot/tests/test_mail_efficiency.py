@@ -1,6 +1,6 @@
 from email.message import EmailMessage
 from email.utils import format_datetime
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -138,18 +138,24 @@ def test_old_cursor_runs_one_backfill_when_search_registry_changes(
 
 
 def test_verification_email_uses_exact_gmail_alias(monkeypatch):
-    def message(recipient, code, number):
+    started = datetime.now().astimezone()
+
+    def message(recipient, code, number, sent_at=started):
         value = EmailMessage()
         value["Message-ID"] = f"<otp-{number}@gaca.gov.sa>"
         value["From"] = "no-reply@gaca.gov.sa"
         value["To"] = recipient
-        value["Date"] = format_datetime(datetime.now().astimezone())
+        value["Date"] = format_datetime(sent_at)
         value["Subject"] = "GACA EServices - OTP Code"
         value.set_content(f"Verification Code: {code}")
         return value.as_bytes()
 
     messages = {
-        21: message("icrackgames101+2760788@gmail.com", "4821", 21),
+        # GACA may send before the page exposes the OTP prompt. This 90-second
+        # lead must remain inside the bounded overlap window.
+        21: message(
+            "icrackgames101+2760788@gmail.com", "4821", 21,
+            started - timedelta(seconds=90)),
         22: message("icrackgames101+other@gmail.com", "9999", 22),
     }
 
@@ -182,7 +188,7 @@ def test_verification_email_uses_exact_gmail_alias(monkeypatch):
 
     result = mail_client.fetch_recent_verification_message(
         config,
-        since=datetime.now().astimezone(),
+        since=started,
         recipient="icrackgames101+2760788@gmail.com",
     )
 

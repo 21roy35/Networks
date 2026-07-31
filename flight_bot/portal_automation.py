@@ -5478,6 +5478,19 @@ def _await_confirmation(page, before_url: str, update,
         # GACA: if Submit is still on-screen after the click, the portal did not
         # accept the post — refresh captcha instead of waiting out the timeout.
         if is_gaca and submit_still_visible and time.monotonic() - started >= 8:
+            duplicate_detail = (
+                _gaca_step2_invalid_summary(page)
+                or _validation_summary(page)
+                or text
+            )
+            if _gaca_duplicate_existing(duplicate_detail):
+                return PortalResult(
+                    "held",
+                    "GACA confirms that this exact complaint is already on "
+                    "record. FlightDeck stopped all further Submit attempts "
+                    "and will reconcile the official reference.",
+                    error_code="gaca_duplicate_existing",
+                )
             return PortalResult(
                 "verification_expired",
                 "GACA still shows the Submit form after the attempt; verification "
@@ -5499,10 +5512,13 @@ def _await_confirmation(page, before_url: str, update,
                     "Riyadh Air kept the Create Case form open with a fresh "
                     "image verification. The previous code was not accepted, "
                     "so a safe retry may use the new image.")
-            if is_gaca and pending_kind == "recaptcha":
+            if (is_gaca and pending_kind == "recaptcha"
+                    and not otp_visible):
                 # GACA executes its invisible v3 token inside the native Submit
                 # handler. Give that handler time to navigate to email
-                # verification before declaring the token stale.
+                # verification before declaring the token stale. The email-code
+                # page can retain the old invisible reCAPTCHA markup, so a
+                # visible OTP always takes precedence over that stale marker.
                 if time.monotonic() - started < 8:
                     time.sleep(1)
                     continue
@@ -5517,7 +5533,8 @@ def _await_confirmation(page, before_url: str, update,
                     recipient_email=str((payload or {}).get("email") or ""),
             ):
                 update("submitting", "Verification complete. Waiting for confirmation…")
-                if is_gaca and pending_kind == "recaptcha":
+                if (is_gaca and pending_kind == "recaptcha"
+                        and not otp_visible):
                     # After a mid-wait captcha solve, Submit must be clicked again.
                     return PortalResult(
                         "verification_expired",

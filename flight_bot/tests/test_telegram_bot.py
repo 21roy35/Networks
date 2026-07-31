@@ -515,6 +515,17 @@ def test_verification_code_ranking_ignores_footer_year():
     ) == "1078"
 
 
+def test_future_dated_gaca_otp_waits_until_backend_can_accept_it():
+    future = datetime.now().astimezone() + timedelta(seconds=5)
+
+    delay = telegram_bot._verification_email_settle_delay({"date": future})
+
+    assert 6.0 <= delay <= 7.1
+    assert telegram_bot._verification_email_settle_delay({
+        "date": datetime.now().astimezone() - timedelta(seconds=5),
+    }) == 0.0
+
+
 def test_sms_shortcut_can_complete_active_otp_waiter(coordinator):
     bot, _api = coordinator
     waiter = telegram_bot.VerificationWaiter("otp")
