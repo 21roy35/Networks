@@ -551,19 +551,20 @@ def create_app(config: dict) -> Flask:
                == reference.casefold() for item in complaints):
             return None
         if _is_gaca_sms(trusted_sender, body):
-            eligible_ids = db.gaca_confirmation_unknown_complaint_ids()
+            complaints_by_id = {
+                int(item.get("id") or 0): item
+                for item in complaints
+                if item.get("kind") == "gaca" and not item.get("reference")
+            }
+            # The database queue follows actual portal acceptance time, not
+            # complaint creation time.  This matters when an older dashboard
+            # complaint is submitted after a newer one.  GACA commonly sends
+            # bare references in the same order as those acceptances.
             pending = [
-                item for item in complaints
-                if item.get("kind") == "gaca"
-                and int(item.get("id") or 0) in eligible_ids
-                and not item.get("reference")
+                complaints_by_id[complaint_id]
+                for complaint_id in db.gaca_pending_reference_queue()
+                if complaint_id in complaints_by_id
             ]
-            # Retain only the newest ambiguous attempt for each flight. Older
-            # attempts are historical diagnostics, not separate claims.
-            newest_by_flight = {}
-            for item in pending:
-                newest_by_flight.setdefault(item.get("flight_key"), item)
-            pending = list(newest_by_flight.values())
             compact_body = re.sub(r"[^a-z0-9]", "", body.casefold())
             fact_matches = []
             for complaint in pending:
@@ -587,8 +588,11 @@ def create_app(config: dict) -> Flask:
                     fact_matches.append(complaint)
             if len(fact_matches) == 1:
                 pending = fact_matches
-            if len(pending) != 1:
+            if not pending:
                 return None
+            # Explicit flight/booking facts win.  Otherwise consume the oldest
+            # accepted portal job so a sequence of generic acknowledgements is
+            # reconciled deterministically without guessing from flight age.
             complaint = pending[0]
             if not db.reconcile_portal_confirmation(
                 int(complaint["id"]), reference

@@ -338,6 +338,71 @@ def test_gaca_sms_never_attaches_to_confirmed_pre_submit_failure(
     assert complaint["reference"] is None
 
 
+def test_reference_only_gaca_sms_follows_portal_acceptance_order(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightbot.db")
+    config = deepcopy(DEFAULTS)
+    config["sms"]["ingest_secret"] = "shared-test-secret"
+    application = webapp.create_app(config)
+    application.config.update(TESTING=True)
+    client = application.test_client()
+    first_key = "FIRST|SV1671|2026-07-05"
+    second_key = "SECOND|SV1650|2026-07-17"
+    db.replace_flights([
+        {
+            "flight_key": first_key, "airline_code": "SV",
+            "flight_number": "SV1671", "flight_numbers": ["SV1671"],
+            "flight_date": "2026-07-05", "pnr": "FIRST",
+            "email_ids": [],
+        },
+        {
+            "flight_key": second_key, "airline_code": "SV",
+            "flight_number": "SV1650", "flight_numbers": ["SV1650"],
+            "flight_date": "2026-07-17", "pnr": "SECOND",
+            "email_ids": [],
+        },
+    ])
+    # Create the second acceptance's complaint first to prove that complaint
+    # ids and dashboard creation times cannot control the reference mapping.
+    second_id = db.begin_complaint(second_key, "gaca", "Second acceptance")
+    db.finish_complaint(second_id, "accepted_pending_reference")
+    first_id = db.begin_complaint(first_key, "gaca", "First acceptance")
+    db.finish_complaint(first_id, "accepted_pending_reference")
+    db.save_portal_job({
+        "id": "accepted-second", "kind": "gaca",
+        "flight_key": second_key, "complaint_id": second_id,
+        "status": "accepted_pending_reference", "terminal": True,
+    })
+    db.save_portal_job({
+        "id": "accepted-first", "kind": "gaca",
+        "flight_key": first_key, "complaint_id": first_id,
+        "status": "accepted_pending_reference", "terminal": True,
+    })
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE portal_jobs SET updated_at=? WHERE id=?",
+            ("2026-07-31 23:44:29", "accepted-second"),
+        )
+        conn.execute(
+            "UPDATE portal_jobs SET updated_at=? WHERE id=?",
+            ("2026-07-31 23:27:35", "accepted-first"),
+        )
+
+    first_response = client.post("/api/internal/sms", json={
+        "sender": "GACA CARE", "message_id": "gaca-fifo-first",
+        "text": "GACA received your complaint. Reference C076900.",
+    }, headers={"X-SMS-Secret": "shared-test-secret"})
+    second_response = client.post("/api/internal/sms", json={
+        "sender": "GACA CARE", "message_id": "gaca-fifo-second",
+        "text": "GACA received your complaint. Reference C076901.",
+    }, headers={"X-SMS-Secret": "shared-test-secret"})
+
+    assert first_response.json["attached_complaint_id"] == first_id
+    assert second_response.json["attached_complaint_id"] == second_id
+    assert db.complaints_for_flight(first_key)[0]["reference"] == "C076900"
+    assert db.complaints_for_flight(second_key)[0]["reference"] == "C076901"
+
+
 def test_reference_only_sms_prefers_newest_pending_airline_complaint(
         tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "flightbot.db")

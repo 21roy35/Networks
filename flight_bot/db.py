@@ -2243,6 +2243,46 @@ def gaca_confirmation_unknown_complaint_ids() -> set[int]:
     }
 
 
+def gaca_pending_reference_queue() -> list[int]:
+    """Return unresolved GACA filings in portal-acceptance order.
+
+    GACA acknowledgement SMS messages do not always repeat a flight number,
+    PNR, or airline reference.  When several filings are awaiting their public
+    references, the portal job timestamp is the durable record of the order in
+    which GACA accepted them.  Complaint creation time is deliberately not
+    used: an older flight can be escalated after a newer dashboard record.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT p.complaint_id
+               FROM portal_jobs p
+               JOIN complaints c ON c.id = p.complaint_id
+               WHERE p.kind = 'gaca'
+                 AND p.status IN (
+                     'confirmation_unknown', 'accepted_pending_reference')
+                 AND c.kind = 'gaca'
+                 AND COALESCE(c.reference, '') = ''
+                 AND NOT EXISTS (
+                     SELECT 1
+                     FROM portal_jobs newer
+                     WHERE newer.complaint_id = p.complaint_id
+                       AND (
+                           newer.created_at > p.created_at
+                           OR (
+                               newer.created_at = p.created_at
+                               AND newer.id > p.id
+                           )
+                       )
+                 )
+               ORDER BY p.updated_at ASC, p.created_at ASC, p.id ASC"""
+        ).fetchall()
+    return [
+        int(row["complaint_id"])
+        for row in rows
+        if row["complaint_id"] is not None
+    ]
+
+
 def reconcile_portal_confirmation(complaint_id: int, reference: str) -> bool:
     """Atomically attach a regulator reference to a sent GACA complaint."""
     reference = str(reference or "").strip()
