@@ -664,6 +664,25 @@ def test_portal_progress_reports_stage_transitions_with_screenshots(coordinator)
     assert "Result: complaint submitted" in api.edits[-1]["text"]
 
 
+def test_portal_retry_message_states_submission_and_next_action(coordinator):
+    bot, api = coordinator
+    relay = bot.portal_progress_handler()
+
+    relay(
+        "retry_wait",
+        "GACA rejected the verification token. Retrying in about 15 minutes.",
+    )
+    deadline = time.time() + 2
+    while not api.messages and time.time() < deadline:
+        time.sleep(.01)
+
+    text = api.messages[0]["text"]
+    assert "Portal job paused" in text
+    assert "Submitted: No confirmed submission" in text
+    assert "Next: automatic retry is scheduled" in text
+    assert "Reason: GACA rejected the verification token" in text
+
+
 def test_reference_reconciliation_sends_one_final_screenshot(coordinator):
     bot, api = coordinator
     db.replace_flights([{

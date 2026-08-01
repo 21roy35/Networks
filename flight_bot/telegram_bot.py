@@ -570,10 +570,11 @@ class TelegramCoordinator:
             "error": "stopped with an error",
             "retry_wait": "queued for a safe retry",
             "quarantined": "quarantined pending reconciliation",
+            "held": "held to prevent a duplicate submission",
         }
         terminal = {
             "submitted", "accepted_pending_reference", "confirmation_unknown",
-            "needs_attention", "error", "retry_wait", "quarantined",
+            "needs_attention", "error", "retry_wait", "quarantined", "held",
         }
 
         def photo_key(status: str, message: str) -> str:
@@ -634,8 +635,47 @@ class TelegramCoordinator:
             current_label = labels.get(status, status.replace("_", " "))
             if status == "submitted":
                 heading = "✅ Finished: submitting the complaint\n✅ Result: complaint submitted"
-            elif status in {"needs_attention", "error"}:
-                heading = f"⚠️ Stage: {current_label}"
+            elif status == "accepted_pending_reference":
+                heading = (
+                    "✅ Result: the airline accepted the complaint\n"
+                    "⏳ Next: waiting for its official reference"
+                )
+            elif status == "confirmation_unknown":
+                heading = (
+                    "🔎 Result: the portal confirmation is not yet clear\n"
+                    "🛑 Duplicate protection: no new Submit will be attempted\n"
+                    "⏳ Next: reconcile email, SMS, and portal records"
+                )
+            elif status == "retry_wait":
+                heading = (
+                    "⏸️ Portal job paused\n"
+                    "Submitted: No confirmed submission\n"
+                    "Next: automatic retry is scheduled"
+                )
+            elif status == "quarantined":
+                heading = (
+                    "🛑 Portal job held for reconciliation\n"
+                    "Submitted: Uncertain; not counted as successful\n"
+                    "Next: check official records before any retry"
+                )
+            elif status == "held":
+                heading = (
+                    "🛑 Duplicate submission prevented\n"
+                    "Submitted now: No\n"
+                    "Next: match the existing official complaint record"
+                )
+            elif status == "needs_attention":
+                heading = (
+                    "⚠️ Portal needs your input\n"
+                    "Submitted: No confirmed submission\n"
+                    "Next: follow the request below"
+                )
+            elif status == "error":
+                heading = (
+                    "❌ Portal job stopped\n"
+                    "Submitted: No confirmed submission\n"
+                    "Next: the saved job remains available for diagnosis"
+                )
             elif previous and previous != status:
                 previous_label = labels.get(
                     previous, previous.replace("_", " "))
@@ -643,7 +683,8 @@ class TelegramCoordinator:
                            f"⏳ Doing now: {current_label}")
             else:
                 heading = f"⏳ Doing now: {current_label}"
-            text = f"{heading}\n{message}"[:1000]
+            detail_label = "Reason" if status in terminal else "Status"
+            text = f"{heading}\n{detail_label}: {message}"[:1000]
             state.update(stage=status, key=key)
             if not worker_started.is_set():
                 worker_started.set()
