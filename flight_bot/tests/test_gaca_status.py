@@ -88,6 +88,7 @@ def test_gaca_remediation_requires_explicit_verified_instruction():
 
 def test_gaca_checker_solves_captcha_relays_otp_and_reads_solution():
     session = Session([
+        Response({"message": "verification required"}, status=401),
         Response("otp-request-123"),
         Response(True),
         Response({
@@ -124,24 +125,60 @@ def test_gaca_checker_solves_captcha_relays_otp_and_reads_solution():
     assert "not a complaint number" in result.response_text
     assert challenges[0]["kind"] == "recaptcha"
     assert verifications[0]["kind"] == "otp"
-    assert session.requests[0][1] == (
+    assert session.requests[1][1] == (
         f"{GACA_API_ROOT}/PxpTicket/SendOtpToCaseOwner")
-    assert session.requests[0][2]["headers"]["reCAPTCHA-Token"] == (
+    assert session.requests[1][2]["headers"]["reCAPTCHA-Token"] == (
         "captcha-token")
-    assert session.requests[1][2]["json"] == {
+    assert session.requests[2][2]["json"] == {
         "id": "otp-request-123", "otp": "1234",
     }
-    assert session.requests[2][2]["params"] == {
+    assert session.requests[3][2]["params"] == {
         "phoneNumber": "+966599491494",
     }
     assert session.proxies == {}
     assert [item[0] for item in updates] == [
-        "verification", "otp", "checking",
+        "checking", "verification", "otp", "checking",
     ]
+
+
+def test_gaca_checker_uses_verified_read_only_record_without_otp():
+    session = Session([Response({
+        "status": 200,
+        "data": {
+            "title": "C076100",
+            "status": 850980013,
+            "statusDescription": "In Progress",
+            "ticketNumber": "CAS-514645-V1S6J8",
+            "category": "On Board Services",
+            "subCategory": "Entertainment Services",
+        },
+    })])
+    solved = []
+    verified = []
+
+    result = check_gaca_case(
+        "C076100",
+        "+966599491494",
+        captcha_solver=lambda challenge: solved.append(challenge),
+        verification_handler=lambda challenge: verified.append(challenge),
+        session=session,
+        proxy_url="http://127.0.0.1:18887",
+    )
+
+    assert result.status == "in_progress"
+    assert "CAS-514645-V1S6J8" in result.response_text
+    assert solved == []
+    assert verified == []
+    assert [item[0] for item in session.requests] == ["GET"]
+    assert session.proxies == {
+        "http": "http://127.0.0.1:18887",
+        "https": "http://127.0.0.1:18887",
+    }
 
 
 def test_gaca_checker_routes_all_api_calls_through_configured_proxy():
     session = Session([
+        Response({"message": "verification required"}, status=401),
         Response({"message": "under review"}, status=401),
     ])
     result = check_gaca_case(
@@ -160,7 +197,10 @@ def test_gaca_checker_routes_all_api_calls_through_configured_proxy():
 
 
 def test_gaca_checker_reports_under_review_without_requesting_otp():
-    session = Session([Response({"message": "under review"}, status=401)])
+    session = Session([
+        Response({"message": "verification required"}, status=401),
+        Response({"message": "under review"}, status=401),
+    ])
     verified = []
     result = check_gaca_case(
         "C076100",

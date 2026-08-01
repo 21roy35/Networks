@@ -15,6 +15,7 @@ GACA_API_ROOT = "https://pxpwebapi.gaca.gov.sa/webapi/api"
 GACA_RECAPTCHA_SITE_KEY = "6LeZeewrAAAAAJb5RDm3Awm39yKz0nflqGPPb5ER"
 
 _STATUS_LABELS = {
+    850980001: "in_progress",
     850980009: "rejected",
     850980008: "closed",
     850980004: "closed",
@@ -24,6 +25,7 @@ _STATUS_LABELS = {
     850980018: "opened",
     850980003: "needs_information",
     850980005: "directed_to_department",
+    850980013: "in_progress",
 }
 
 
@@ -223,8 +225,15 @@ def _status_label(value) -> str:
 
 
 def _case_response_text(data: dict, case_status: str) -> str:
+    stage = data.get("stage")
+    if isinstance(stage, dict):
+        stage = stage.get("name")
     fields = (
+        ("Official ticket", data.get("ticketNumber")),
         ("Case status", case_status),
+        ("Status description", data.get("statusDescription")),
+        ("Current stage", stage),
+        ("Submitted", data.get("createdOn")),
         ("Provided solution", data.get("standardReplyDetails")),
         ("GACA response", data.get("inquiryResponse")),
         ("Additional-information request",
@@ -236,6 +245,26 @@ def _case_response_text(data: dict, case_status: str) -> str:
         f"{label}: {' '.join(str(value).split())}"
         for label, value in fields
         if str(value or "").strip()
+    )
+
+
+def _case_result(reference: str, data: dict) -> GacaCaseResult:
+    case_status = _status_label(data.get("status"))
+    response_text = _case_response_text(data, case_status)
+    message = (
+        f"GACA case {reference} is {case_status.replace('_', ' ')}."
+        + (
+            f" {str(data.get('standardReplyDetails')).strip()}"
+            if str(data.get("standardReplyDetails") or "").strip()
+            else ""
+        )
+    )
+    return GacaCaseResult(
+        case_status,
+        case_status,
+        response_text,
+        message,
+        data,
     )
 
 
@@ -269,6 +298,30 @@ def check_gaca_case(
             "http": proxy_url,
             "https": proxy_url,
         })
+
+    # The official Details application currently exposes its case record as a
+    # read-only lookup when both the public reference and registered phone
+    # match. Use that verified response first. Some cases or future portal
+    # versions may still require the CAPTCHA + OTP workflow below.
+    update("checking", f"Reading GACA's official record for {reference}...")
+    try:
+        direct_response = session.get(
+            f"{GACA_API_ROOT}/PxpTicket/casebyid/{reference}",
+            params={"phoneNumber": phone},
+            timeout=45,
+        )
+        direct_payload = _response_json(direct_response)
+        direct_data = (
+            direct_payload.get("data")
+            if isinstance(direct_payload, dict) else None
+        )
+        if getattr(direct_response, "ok", False) and isinstance(
+                direct_data, dict):
+            return _case_result(reference, direct_data)
+    except requests.RequestException:
+        # A transient read-only lookup failure must not be mistaken for a
+        # missing case; continue with the complete verification workflow.
+        pass
     update("verification", f"Solving GACA verification for {reference}…")
     solved = captcha_solver({
         "kind": "recaptcha",
@@ -357,20 +410,4 @@ def check_gaca_case(
     if not isinstance(data, dict):
         raise GacaStatusError("GACA returned no case record for this reference.")
 
-    case_status = _status_label(data.get("status"))
-    response_text = _case_response_text(data, case_status)
-    message = (
-        f"GACA case {reference} is {case_status.replace('_', ' ')}."
-        + (
-            f" {str(data.get('standardReplyDetails')).strip()}"
-            if str(data.get("standardReplyDetails") or "").strip()
-            else ""
-        )
-    )
-    return GacaCaseResult(
-        case_status,
-        case_status,
-        response_text,
-        message,
-        data,
-    )
+    return _case_result(reference, data)
