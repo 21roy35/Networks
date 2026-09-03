@@ -1,0 +1,4 @@
+{
+  "name": "Networks — Cisco Packet Tracer coursework",
+  "install": "bash scripts/setup.sh"
+}

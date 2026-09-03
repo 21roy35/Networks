@@ -1,0 +1,11 @@
+# Generated environment artifacts
+/build/
+
+# Compiled native helper (rebuilt by scripts/setup.sh)
+tools/pka2xml/pka2xml/libtwofish.so
+tools/pka2xml/pka2xml/libtwofish.dylib
+tools/pka2xml/pka2xml/libtwofish.dll
+
+# Python caches
+__pycache__/
+*.pyc
